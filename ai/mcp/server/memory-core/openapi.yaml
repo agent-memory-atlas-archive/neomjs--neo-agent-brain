@@ -1327,7 +1327,7 @@ paths:
         - name: origin
           in: query
           required: false
-          description: "`owner/repo` of the tenant repository to read (for example `neomjs/neo-agent-brain`). The owner must be the plane's configured owner and the repository a corpus origin the plane holds (`<contentRoot>/<repo>/pulls`), or the configured repository itself; anything else is refused with `unknown-origin` naming the origin, never answered from the default. Absent, the configured repository applies, as before."
+          description: "`owner/repo` of the tenant repository to read (for example `neomjs/neo-agent-brain`). The owner must be the plane's configured owner and the repository an origin the plane's corpus catalog names (the `_index.json` slugs under the fleet content root, the catalog the fleet activity feed reads) or the configured repository itself; `.` and `..` are never repositories; anything else is refused with `unknown-origin` naming the origin, never answered from the default. Absent, the configured repository applies, as before. Every returned drill-down names its repository (`repo` on `get_conversation`), so a handle from one origin never opens another."
           schema:
             type: string
             pattern: "^[\\w.-]+/[\\w.-]+$"

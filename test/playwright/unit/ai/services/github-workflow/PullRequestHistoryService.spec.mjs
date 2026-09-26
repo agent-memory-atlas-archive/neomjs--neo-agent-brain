@@ -822,42 +822,82 @@ test.describe('Neo.ai.services.github-workflow.PullRequestHistoryService', () =>
         expect(before.sourceManifestHash).not.toBe(after.sourceManifestHash);
         expect(after.citations[0].drillDown).toEqual({
             operation: 'get_conversation',
-            arguments: {pr_number: 9}
+            arguments: {pr_number: 9, repo: 'neomjs/neo'}
         })
     });
 
-    test('an origin addresses another tenant repository: its live search and its per-slug corpus roots', async () => {
-        const seen = {queries: [], scans: []};
+    test('an origin reads its own catalogued corpus and hands back drill-downs naming its own repository', async () => {
+        const contentRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'neo-pr-history-origins-')),
+              pull        = pullRequest({number: 7, mergedAt: '2026-07-03T12:00:00.000Z'});
 
-        await explore({
-            options: {windowStart: START_ISO, windowEnd: END_ISO, origin: 'neomjs/neo-agent-brain'},
-            query  : async (document, variables) => {
-                seen.queries.push(variables);
-                return searchPage([])
-            },
-            generate  : async () => JSON.stringify({observations: []}),
-            scanCorpus: async args => {
-                seen.scans.push(args);
-                return completeCorpus()
-            },
-            deps: {
-                contentRoot : '/corpus',
-                originExists: candidate => candidate === '/corpus/neo-agent-brain/pulls'
-            }
-        });
+        async function run(origin) {
+            const searches = [], partitions = [],
+                  result   = await explore({
+                      options: {windowStart: START_ISO, windowEnd: END_ISO, origin},
+                      query  : async (document, variables) => {
+                          if (isCensusDocument(document)) {
+                              searches.push(variables.query.split(' ')[0]);
+                              return searchPage([pull])
+                          }
 
-        // The live search names the requested repository, not the configured one.
-        expect(seen.queries.some(variables => typeof variables?.query === 'string' &&
-            variables.query.includes('repo:neomjs/neo-agent-brain'))).toBe(true);
-        expect(seen.queries.some(variables => typeof variables?.query === 'string' &&
-            variables.query.includes('repo:neomjs/neo '))).toBe(false);
-        // The corpus, when read, is the slug's own directories.
-        for (const scan of seen.scans) {
-            expect(scan).toMatchObject({pullsDir: '/corpus/neo-agent-brain/pulls', archiveRoot: '/corpus/neo-agent-brain/archive'});
+                          expect(document).toBe(FETCH_PULL_REQUEST_HISTORY_CHILDREN);
+                          return {repository: {pullRequest: {updatedAt: pull.updatedAt}}}
+                      },
+                      generate  : inferenceFixture({sourceId: 'pull:7'}).generate,
+                      scanCorpus: scanPullRequestCorpus,
+                      deps      : {
+                          contentRoot,
+                          runTemporal: async args => {
+                              partitions.push(args.partition);
+                              return synthesizeTemporalBirdView(args)
+                          }
+                      }
+                  });
+
+            return {result, searches: [...new Set(searches)], partitions: [...new Set(partitions)]}
+        }
+
+        try {
+            // The catalog names three origins: two hold the same PR number, one has no tree yet. A fourth
+            // directory exists without an index row.
+            await fs.writeFile(path.join(contentRoot, '_index.json'), JSON.stringify([
+                {repoSlug: 'neo', type: 'pull', id: 7},
+                {repoSlug: 'neo-agent-brain', type: 'pull', id: 7},
+                {repoSlug: 'neo-agent-skills', type: 'pull', id: 7}
+            ]), 'utf8');
+            await writeCorpusPull(path.join(contentRoot, 'neo', 'pulls', 'pr-7.md'), 7);
+            await writeCorpusPull(path.join(contentRoot, 'neo-agent-brain', 'archive', 'pulls', '2026', '07', 'pr-7.md'), 7);
+            await writeCorpusPull(path.join(contentRoot, 'stray', 'pulls', 'pr-7.md'), 7);
+
+            const brain = await run('neomjs/neo-agent-brain'),
+                  home  = await run('neomjs/neo'),
+                  bare  = await run('neomjs/neo-agent-skills');
+
+            // Each view reads its own slug's tree, searches its own repository, caches under its own partition
+            // and hands back a handle that opens the cited repository, not the configured one.
+            expect(brain.result.coverage.corpus).toMatchObject({selectedActive: 0, selectedArchived: 1, missingIds: []});
+            expect(home.result.coverage.corpus).toMatchObject({selectedActive: 1, selectedArchived: 0, missingIds: []});
+            expect(brain.result.citations[0].drillDown).toEqual({operation: 'get_conversation', arguments: {pr_number: 7, repo: 'neomjs/neo-agent-brain'}});
+            expect(home.result.citations[0].drillDown).toEqual({operation: 'get_conversation', arguments: {pr_number: 7, repo: 'neomjs/neo'}});
+            expect(brain.searches).toEqual(['repo:neomjs/neo-agent-brain']);
+            expect(home.searches).toEqual(['repo:neomjs/neo']);
+            expect(brain.partitions).toEqual(['repository:neomjs/neo-agent-brain:all_resolved']);
+            expect(home.partitions).toEqual(['repository:neomjs/neo:all_resolved']);
+
+            // A catalogued origin without a tree is known: its read degrades by name instead of refusing.
+            expect(bare.result.coverage.corpus.missingRoots).toHaveLength(2);
+            expect(bare.result.coverage.corpus.missingRoots).toEqual(expect.arrayContaining([path.join(contentRoot, 'neo-agent-skills', 'pulls')]));
+            expect(bare.result.coverage.degradedReason).toContain('local-corpus-incomplete');
+            expect(bare.result.synthesisAvailable).toBe(false);
+
+            // A directory the catalog does not name is not an origin, however real its tree.
+            await expect(run('neomjs/stray')).rejects.toMatchObject({code: 'unknown-origin', origin: 'neomjs/stray'})
+        } finally {
+            await fs.rm(contentRoot, {recursive: true, force: true})
         }
     });
 
-    test('an origin outside the corpus is refused by name before any read; the default path is untouched', async () => {
+    test('an origin outside the corpus catalog is refused by name before any read', async () => {
         const seen = {queries: 0, scans: 0};
 
         await expect(explore({
@@ -865,30 +905,67 @@ test.describe('Neo.ai.services.github-workflow.PullRequestHistoryService', () =>
             query     : async () => { seen.queries++; return searchPage([]) },
             generate  : async () => JSON.stringify({observations: []}),
             scanCorpus: async () => { seen.scans++; return completeCorpus() },
-            deps      : {contentRoot: '/corpus', originExists: () => false}
+            deps      : {contentRoot: '/corpus', readContentOrigins: () => [{repoSlug: 'neo', pullsDir: '/corpus/neo/pulls'}]}
         })).rejects.toMatchObject({code: 'unknown-origin', origin: 'neomjs/not-a-tenant'});
 
-        expect(seen).toEqual({queries: 0, scans: 0});
-
-        // A foreign owner is unknown here too: the corpus holds one owner's repositories.
-        await expect(explore({
-            options : {windowStart: START_ISO, windowEnd: END_ISO, origin: 'someone-else/neo'},
-            query   : async () => searchPage([]),
-            generate: async () => JSON.stringify({observations: []}),
-            deps    : {contentRoot: '/corpus', originExists: () => true}
-        })).rejects.toMatchObject({code: 'unknown-origin'});
+        expect(seen).toEqual({queries: 0, scans: 0})
     });
 
-    test('resolvePullRequestOrigin: no origin keeps the configured roots; the configured repo resolves without a slug directory', () => {
-        const configured = {owner: 'neomjs', repo: 'neo', pullsDir: '/legacy/pulls', archiveRoot: '/legacy/archive', contentRoot: '/corpus'};
+    test('resolvePullRequestOrigin: admission is the catalog, never a path the request builds', () => {
+        const configured = {owner: 'neomjs', repo: 'neo', pullsDir: '/legacy/pulls', archiveRoot: '/legacy/archive', contentRoot: '/corpus'},
+              catalog    = [{repoSlug: 'neo', pullsDir: '/corpus/neo/pulls'}, {repoSlug: 'neo-agent-brain', pullsDir: '/corpus/neo-agent-brain/pulls'}],
+              unread     = () => { throw new Error('the catalog must not be read on this path') },
+              resolve    = (origin, entries = catalog) => resolvePullRequestOrigin({...configured, origin, readContentOrigins: () => entries});
 
-        expect(resolvePullRequestOrigin({...configured, exists: () => false}))
+        // No origin: the configured roots, without a catalog read.
+        expect(resolvePullRequestOrigin({...configured, readContentOrigins: unread}))
             .toEqual({owner: 'neomjs', repo: 'neo', pullsDir: '/legacy/pulls', archiveRoot: '/legacy/archive', origin: null});
-        expect(resolvePullRequestOrigin({...configured, origin: 'neomjs/neo', exists: () => false}))
-            .toEqual({owner: 'neomjs', repo: 'neo', pullsDir: '/legacy/pulls', archiveRoot: '/legacy/archive', origin: 'neomjs/neo'});
-        expect(resolvePullRequestOrigin({...configured, origin: 'neomjs/neo', exists: candidate => candidate === '/corpus/neo/pulls'}))
-            .toEqual({owner: 'neomjs', repo: 'neo', pullsDir: '/corpus/neo/pulls', archiveRoot: '/corpus/neo/archive', origin: 'neomjs/neo'});
-        expect(() => resolvePullRequestOrigin({...configured, origin: 'neo', exists: () => true})).toThrow(/unknown-origin/);
+        // A catalogued origin reads its own roots, in the per-slug and the pre-split layout alike.
+        expect(resolve('neomjs/neo-agent-brain'))
+            .toEqual({owner: 'neomjs', repo: 'neo-agent-brain', pullsDir: '/corpus/neo-agent-brain/pulls', archiveRoot: '/corpus/neo-agent-brain/archive', origin: 'neomjs/neo-agent-brain'});
+        expect(resolve('neomjs/neo')).toMatchObject({pullsDir: '/corpus/neo/pulls', archiveRoot: '/corpus/neo/archive'});
+        expect(resolve('neomjs/neo', [{repoSlug: 'neo', pullsDir: '/corpus/pulls'}])).toMatchObject({pullsDir: '/corpus/pulls', archiveRoot: '/corpus/archive'});
+        // The configured repository outside the catalog keeps the configured roots.
+        expect(resolve('neomjs/neo', [])).toEqual({owner: 'neomjs', repo: 'neo', pullsDir: '/legacy/pulls', archiveRoot: '/legacy/archive', origin: 'neomjs/neo'});
+
+        // Refused: a path segment (before the catalog is read), an unlisted name, a foreign owner, a bare name.
+        for (const origin of ['neomjs/..', 'neomjs/.']) {
+            expect(() => resolvePullRequestOrigin({...configured, origin, readContentOrigins: unread})).toThrow(/a path segment is not a repository/)
+        }
+        expect(() => resolve('neomjs/not-indexed')).toThrow(/unknown-origin/);
+        expect(() => resolve('someone-else/neo')).toThrow(/unknown-origin/);
+        expect(() => resolve('neo')).toThrow(/unknown-origin/)
+    });
+
+    test('the release preset resolves the tag against the requested origin, not the configured repository', async () => {
+        const releases = [
+                  {tagName: 'v0.3.0', publishedAt: '2026-06-01T10:00:00.000Z', createdAt: '2026-06-01T10:00:00.000Z', isDraft: false, isPrerelease: false},
+                  {tagName: 'v0.2.0', publishedAt: '2026-05-01T10:00:00.000Z', createdAt: '2026-05-01T10:00:00.000Z', isDraft: false, isPrerelease: false}
+              ],
+              seen = {releases: [], searches: []};
+
+        const result = await explore({
+            options: {preset: 'release', release: 'v0.3.0', origin: 'neomjs/neo-agent-brain'},
+            query  : async (document, variables) => {
+                if (document === FETCH_RELEASES_FOR_HISTORY) {
+                    seen.releases.push({owner: variables.owner, repo: variables.repo});
+                    return {repository: {releases: {totalCount: releases.length, pageInfo: {hasNextPage: false, endCursor: null}, nodes: releases}}}
+                }
+
+                expect(isCensusDocument(document)).toBe(true);
+                seen.searches.push(variables.query.split(' ')[0]);
+                return searchPage([])
+            },
+            generate: async () => JSON.stringify({observations: []}),
+            deps    : {contentRoot: '/corpus', readContentOrigins: () => [{repoSlug: 'neo-agent-brain', pullsDir: '/corpus/neo-agent-brain/pulls'}]}
+        });
+
+        expect(seen.releases).toEqual([{owner: 'neomjs', repo: 'neo-agent-brain'}]);
+        expect([...new Set(seen.searches)]).toEqual(['repo:neomjs/neo-agent-brain']);
+        expect(result.window).toMatchObject({
+            preset        : 'release', release: 'v0.3.0', previousRelease: 'v0.2.0',
+            windowStartIso: '2026-05-01T10:00:00.000Z', windowEndIso: '2026-06-01T10:00:00.000Z'
+        })
     });
 
     test('resolves a release preset as the exact previous-cut to selected-cut half-open window', async () => {
