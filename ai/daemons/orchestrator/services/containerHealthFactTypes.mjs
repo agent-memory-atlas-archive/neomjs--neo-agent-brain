@@ -15,6 +15,7 @@ export const CONTAINER_HEALTH_FACT_TYPES = Object.freeze({
     configDrift               : 'config-drift',
     containerDown             : 'container-down',
     containerUnhealthy        : 'container-unhealthy',
+    cpuThrottling             : 'cpu-throttling',
     endpointProbeFailed       : 'endpoint-probe-failed',
     evalContention            : 'ollama-eval-contention',
     heapObservationUnavailable: 'heap-observation-unavailable',
