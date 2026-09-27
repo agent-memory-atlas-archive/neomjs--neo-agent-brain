@@ -60,6 +60,28 @@ test.describe('planeDeploymentStateReader — the plane-mode deployment-state re
         expect(projection.ageMs).toBe(37856)
     });
 
+    // the plane aged the snapshot on ITS horizon; this process's leaf never re-ages the verdict
+    for (const [label, verdict, localHorizon, expected] of [
+        ['a plane STALE verdict stays stale under a longer local horizon',     {ok: false, status: 'stale', ageMs: 90000, staleAfterMs: 60000, reason: 'snapshot-stale'}, 120000, 'stale'],
+        ['a plane AVAILABLE verdict stays ok under a shorter local horizon',   {ageMs: 90000, staleAfterMs: 120000},                                                     60000, 'ok'],
+        ['a plane horizon of 0 (staleness disabled) keeps an old snapshot ok', {ageMs: 86400000, staleAfterMs: 0},                                                       60000, 'ok']
+    ]) {
+        test(label, async () => {
+            const source = createDeploymentStateReadSource({
+                path        : '',
+                staleAfterMs: localHorizon,
+                maxBytes    : 262144,
+                readImpl    : createPlaneDeploymentStateReader({callTool: () => Promise.resolve({...planeVerdict(), ...verdict})})
+            });
+
+            const projection = await source.produceDeploymentState();
+
+            expect(projection.state).toBe(DEPLOYMENT_STATE_PROJECTION_STATES[expected]);
+            expect(projection.ageMs).toBe(verdict.ageMs);
+            expect(projection.services).toHaveLength(2)
+        });
+    }
+
     test('a plane answer without a snapshot projects unavailable under the plane\'s own reason, never a fabricated plane', async () => {
         const source = createDeploymentStateReadSource({
             path    : '',

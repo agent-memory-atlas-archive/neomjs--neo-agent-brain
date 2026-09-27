@@ -10,8 +10,8 @@
  * projects as `null`, never as a guessed value. Pure and synchronous, so the redaction is unit-provable
  * in isolation (the red-first arm feeds a leaking fixture and asserts nothing survives).
  *
- * The plane-log surface is deliberately absent — neomjs/neo-agent-brain#27 owns bounded, redacted log
- * reads as its own verb. Observe-only: no actuator, no restart command, rides this shape.
+ * The plane-log surface is deliberately absent — bounded, redacted log reads are a verb of their own.
+ * Observe-only: no actuator, no restart command, rides this shape.
  */
 
 /**
@@ -32,7 +32,7 @@ const
 
 /**
  * @summary Project one per-service record (`recordType: 'deployment-service-state'`) to its card fields.
- * The shape authority is the WRITER, not a guess (#323): `DeploymentStateBridgeService#collectSnapshot`
+ * The shape authority is the WRITER, not a guess: `DeploymentStateBridgeService#collectSnapshot`
  * folds errors and memory pressure into ONE status word (`foldMemoryPressureIntoStatus`: `available` |
  * `degraded`), `classification` carries the class word beside its declared flag, and `diagnosis` is a
  * `container-health-diagnosis-decision` record — `{status, actionClass, diagnosis: {recoveryClass,
@@ -124,15 +124,15 @@ export function projectDeploymentMaintenanceForFleet(snapshot) {
 }
 
 /**
- * @summary Project a whole snapshot to the wire shape, aged against the staleness horizon.
+ * @summary Project a whole snapshot to the wire shape under the reader's freshness verdict.
  * @param {Object|null} snapshot             The parsed snapshot file, or `null` when there is none to project.
  * @param {Object}      [options={}]
- * @param {Number}      [options.ageMs]      How old the file is on the reader's clock; `>` `staleAfterMs` reads `stale`.
- * @param {Number}      [options.staleAfterMs] The staleness horizon (the resolved `staleAfterMs` leaf).
+ * @param {Number}      [options.ageMs]      How old the snapshot is on the reader's clock.
+ * @param {Boolean}     [options.stale=false] The reader's verdict — it aged the snapshot on its own horizon; never re-aged here.
  * @param {String}      [options.reason]     The reader's named reason when `snapshot` is absent.
  * @returns {Object} `{state, reason, generatedAt, ageMs, services, maintenance}` — always a fresh object.
  */
-export function projectDeploymentStateForFleet(snapshot, {ageMs = null, staleAfterMs = null, reason = null} = {}) {
+export function projectDeploymentStateForFleet(snapshot, {ageMs = null, stale = false, reason = null} = {}) {
     if (!isObject(snapshot)) {
         return {
             state      : DEPLOYMENT_STATE_PROJECTION_STATES.unavailable,
@@ -144,12 +144,10 @@ export function projectDeploymentStateForFleet(snapshot, {ageMs = null, staleAft
         };
     }
 
-    const
-        stale    = Number.isFinite(ageMs) && Number.isFinite(staleAfterMs) && ageMs > staleAfterMs,
-        services = Array.isArray(snapshot.services) ? snapshot.services : [];
+    const services = Array.isArray(snapshot.services) ? snapshot.services : [];
 
     return {
-        state      : stale ? DEPLOYMENT_STATE_PROJECTION_STATES.stale : DEPLOYMENT_STATE_PROJECTION_STATES.ok,
+        state      : stale === true ? DEPLOYMENT_STATE_PROJECTION_STATES.stale : DEPLOYMENT_STATE_PROJECTION_STATES.ok,
         reason     : null,
         generatedAt: fieldOf(snapshot, 'generatedAt'),
         ageMs      : Number.isFinite(ageMs) ? ageMs : null,

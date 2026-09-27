@@ -77,6 +77,18 @@ test.describe('createDeploymentStateReadSource — the fleet-server adapter over
         expect(projection.services).toHaveLength(1)
     });
 
+    test('a horizon of 0 disables staleness — the reader\'s AVAILABLE verdict on an old envelope projects OK, not re-aged here', async () => {
+        await writeDeploymentStateSnapshot({filePath, snapshot: producerSnapshot({generatedAt: NOW - 600_000})});
+
+        const
+            oracle     = await readDeploymentStateSnapshot({filePath, now: NOW, staleAfterMs: 0, maxBytes: MAX_BYTES}),
+            projection = await source({staleAfterMs: 0}).produceDeploymentState();
+
+        expect(oracle.status).toBe('available');
+        expect(projection.state).toBe('ok');
+        expect(projection.ageMs).toBe(600_000)
+    });
+
     test('an envelope missing its sections is the reader\'s DEGRADED verdict, projected as unavailable under that reason', async () => {
         await writeFile(filePath, '{}');
 

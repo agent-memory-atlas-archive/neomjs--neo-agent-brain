@@ -21,7 +21,7 @@ import {projectDeploymentStateForFleet} from './projectDeploymentStateForFleet.m
  * @summary Build a deployment-state read-source over the orchestrator's snapshot file.
  * @param {Object}   options
  * @param {String}   options.path          The resolved `snapshotPath` leaf value.
- * @param {Number}   options.staleAfterMs  The resolved `staleAfterMs` leaf value; a snapshot whose `generatedAt` is older reads `stale`.
+ * @param {Number}   options.staleAfterMs  The resolved `staleAfterMs` leaf value, handed to the reader, which ages the snapshot against it.
  * @param {Number}   options.maxBytes      The resolved `maxSnapshotBytes` leaf value; a larger file is refused unparsed.
  * @param {Function} [options.readImpl=readDeploymentStateSnapshot] The snapshot reader seam — the Memory Core's own (injected in specs).
  * @param {Function} [options.now=Date.now] The clock the snapshot's `generatedAt` is aged against (injected in specs).
@@ -41,12 +41,13 @@ export function createDeploymentStateReadSource({path, staleAfterMs, maxBytes, r
                 return projectDeploymentStateForFleet(null, {reason: 'snapshot-read-failed'});
             }
 
-            // `available` and `stale` both hand back the parsed snapshot with its `generatedAt` age; the
-            // projection spells the horizon verdict from those same numbers. Every other verdict — a degraded
+            // `available` and `stale` both hand back the parsed snapshot with its `generatedAt` age, and the
+            // verdict is carried as the reader decided it — a plane verdict on the plane's horizon, `0`
+            // disabling staleness — never re-aged against this process's leaf. Every other verdict — a degraded
             // schema, an absent file, a failed read, an oversized file, an unconfigured path — is projected as
             // `unavailable` under the reader's own reason code, never re-derived here.
             if (read && (read.status === 'available' || read.status === 'stale') && read.snapshot) {
-                return projectDeploymentStateForFleet(read.snapshot, {ageMs: read.ageMs, staleAfterMs});
+                return projectDeploymentStateForFleet(read.snapshot, {ageMs: read.ageMs, stale: read.status === 'stale'});
             }
 
             return projectDeploymentStateForFleet(null, {reason: read?.reason || 'snapshot-read-failed'});
