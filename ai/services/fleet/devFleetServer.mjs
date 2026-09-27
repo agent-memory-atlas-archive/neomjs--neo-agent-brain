@@ -398,15 +398,16 @@ async function boot() {
         })
     });
 
-    // The Golden Path view reads the synthesizer's own artifact — the computed-route.v1 sidecar
-    // beside the handoff — through the Memory Core's `get_computed_route`, because the handoff
-    // volume is the plane's and a fleet server on the host (the packaged shell's plane-attach
-    // mode) has no route file of its own; the admission rides the same answer, the REM pipeline
-    // state the same operation boundary as the sources above. Nothing is ranked here; the pane
-    // shows the producer's route as written.
+    // The Golden Path view reads both producer surfaces through Memory Core operations, because
+    // the handoff volume is the plane's and a fleet server on the host (the packaged shell's
+    // plane-attach mode) has no handoff file of its own. The route sidecar carries admission;
+    // `get_sandman_handoff` carries the complete human-readable strategic section and its own file
+    // update/freshness metadata. The two axes stay independent: handoff staleness does not alter
+    // route capability. Nothing is ranked here.
     wireFleetGoldenPathSource({
         getComputedRoute   : args => callHistoryOperation('get_computed_route', args),
-        getRemPipelineState: args => callHistoryOperation('get_rem_pipeline_state', args)
+        getRemPipelineState: args => callHistoryOperation('get_rem_pipeline_state', args),
+        getSandmanHandoff  : args => callHistoryOperation('get_sandman_handoff', args)
     });
 
     // The 3D graph's scene feed collects the neighbourhood the cockpit renders. Its seeds ride the

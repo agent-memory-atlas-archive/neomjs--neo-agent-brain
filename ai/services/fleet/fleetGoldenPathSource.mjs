@@ -4,15 +4,19 @@
  * synthesizer wrote (`computed-route.json`, the `computed-route.v1` sidecar beside the handoff),
  * passed through under the producer's own status and freshness, beside the corpus-projection
  * admission that says whether that route may be read as current, and the REM pipeline counts
- * that explain a withheld one. Nothing is ranked, merged or synthesized here: the pane renders
- * the producer's route under the producer's word, or the honest reason why there is none.
+ * that explain a withheld one. The handoff's producer-written strategic recommendation is an
+ * independent section-addressable axis: it is copied verbatim from the producer's Markdown and
+ * carries the file reader's own update time and freshness. Nothing is ranked, merged or synthesized
+ * here: the pane renders the producer's route under the producer's word, or the honest reason why
+ * there is none.
  *
- * Both reads cross the plane's operation boundary, like every other fleet source: the route and
+ * The reads cross the plane's operation boundary, like every other fleet source: the route and
  * its admission come from the Memory Core's `get_computed_route` (the process that mounts the
  * handoff volume; a fleet server on the host has no route file of its own), the REM state from
- * `get_rem_pipeline_state`. Each axis answers as itself — the operation's typed statuses
- * (missing / unreadable / invalid) become degraded reasons, a failed read is its own unavailable
- * axis with a redacted detail — never an empty route presented as "nothing to do".
+ * `get_rem_pipeline_state`, and the handoff content from `get_sandman_handoff`. Each axis answers
+ * as itself — the operation's typed statuses (missing / unreadable / invalid) become degraded
+ * reasons, a failed read is its own unavailable axis with a redacted detail — never an empty route
+ * presented as "nothing to do".
  */
 
 import {redactReadFailure} from './redactReadFailure.mjs';
@@ -94,14 +98,78 @@ export function reduceComputedRouteAnswer(payload, nowMs) {
 }
 
 /**
+ * @summary Extract the producer's complete strategic Golden Path section, preserving its exact
+ * heading and Markdown through (but not including) the next level-two heading.
+ * @param {*} markdown
+ * @returns {String|null}
+ * @private
+ */
+function extractGoldenPathHandoffSection(markdown) {
+    if (typeof markdown !== 'string') return null;
+
+    const heading = /^## Computed Golden Path \(Strategic Recommendation\)[ \t]*\r?$/m.exec(markdown);
+
+    if (!heading) return null;
+
+    const nextHeading = /^##(?!#)[ \t]+[^\r\n]*\r?$/gm;
+
+    nextHeading.lastIndex = heading.index + heading[0].length;
+
+    const next = nextHeading.exec(markdown);
+
+    return markdown.slice(heading.index, next ? next.index : markdown.length)
+}
+
+/**
+ * @summary Project the Memory Core handoff read onto its independent FM axis. Content without
+ * the producer-owned section is degraded explicitly; file absence, operation failure and missing
+ * wiring remain distinguishable, with no effect on the computed route or REM axes.
+ * @param {*} payload The `get_sandman_handoff` result.
+ * @returns {{markdown: (String|null), mtimeMs: (Number|null), ageMs: (Number|null), staleAfterMs: (Number|null), stale: (Boolean|null), reason: (String|null), state: String}}
+ * @private
+ */
+function projectSandmanHandoff(payload) {
+    const markdown = extractGoldenPathHandoffSection(payload?.content);
+    let reason = null;
+
+    if (!markdown) {
+        reason = typeof payload?.content === 'string'
+            ? 'handoff-section-not-found'
+            : (typeof payload?.reason === 'string' && payload.reason) || 'handoff-content-unavailable'
+    }
+
+    const
+        finiteOrNull = value => typeof value === 'number' && Number.isFinite(value) ? value : null,
+        stale         = typeof payload?.stale === 'boolean' ? payload.stale : null;
+    let state;
+
+    if (markdown) {
+        state = stale === true ? 'stale' : 'available'
+    } else {
+        state = reason === 'handoff-section-not-found' ? 'degraded' : 'unavailable'
+    }
+
+    return {
+        markdown,
+        mtimeMs     : finiteOrNull(payload?.mtimeMs),
+        ageMs       : finiteOrNull(payload?.ageMs),
+        staleAfterMs: finiteOrNull(payload?.staleAfterMs),
+        stale,
+        reason,
+        state
+    }
+}
+
+/**
  * @summary Create one process-lifetime Golden Path source.
  * @param {Object} options
  * @param {Function} options.getComputedRoute The Memory Core `get_computed_route` operation.
  * @param {Function} options.getRemPipelineState The Memory Core `get_rem_pipeline_state` operation.
+ * @param {Function} [options.getSandmanHandoff] The Memory Core `get_sandman_handoff` operation.
  * @param {Function} [options.now]
  * @returns {{readGoldenPath: Function}}
  */
-export function createFleetGoldenPathSource({getComputedRoute, getRemPipelineState, now = () => Date.now()} = {}) {
+export function createFleetGoldenPathSource({getComputedRoute, getRemPipelineState, getSandmanHandoff, now = () => Date.now()} = {}) {
     if (typeof getComputedRoute !== 'function') {
         throw new TypeError('fleet golden path: getComputedRoute must be a function')
     }
@@ -144,13 +212,31 @@ export function createFleetGoldenPathSource({getComputedRoute, getRemPipelineSta
         }
     };
 
+    const readHandoffAxis = async () => {
+        if (typeof getSandmanHandoff !== 'function') {
+            return projectSandmanHandoff({reason: 'handoff-source-unwired'})
+        }
+
+        try {
+            return projectSandmanHandoff(await getSandmanHandoff({}))
+        } catch (error) {
+            const detail = redactReadFailure(error);
+
+            console.warn(`[fleet] golden path handoff read failed: ${detail ?? 'no legible error'}`);
+
+            return projectSandmanHandoff({reason: 'handoff-read-failed'})
+        }
+    };
+
     return {
         /**
          * @summary Read the Golden Path picture: the route axis decides the envelope's
          * `capability` (`wired` when the operation served a validated route, `degraded` when it
          * answered with a typed reason, `unavailable` when the read itself failed); the admission
          * and the REM counts ride beside it so the pane can say current / last known good /
-         * withheld with the producer's own timestamps.
+         * withheld with the producer's own timestamps. The independent `handoff` field carries
+         * the complete human-readable Golden Path section plus the handoff file's update/freshness
+         * metadata; its staleness never changes the route capability.
          * @param {Object} [params] Reserved; the verb takes no caller input today.
          * @returns {Promise<Object>}
          */
@@ -162,9 +248,9 @@ export function createFleetGoldenPathSource({getComputedRoute, getRemPipelineSta
             }
 
             const
-                capturedAt        = new Date(nowMs).toISOString(),
-                [routeAxis, rem]  = await Promise.all([readRouteAxis(nowMs), readRemAxis()]),
-                admission         = routeAxis.admission;
+                capturedAt                 = new Date(nowMs).toISOString(),
+                [routeAxis, rem, handoff] = await Promise.all([readRouteAxis(nowMs), readRemAxis(), readHandoffAxis()]),
+                admission                  = routeAxis.admission;
 
             return {
                 capability: {
@@ -175,12 +261,21 @@ export function createFleetGoldenPathSource({getComputedRoute, getRemPipelineSta
                 admission,
                 route  : routeAxis.route,
                 rem    : rem.counts,
+                handoff: {
+                    markdown    : handoff.markdown,
+                    mtimeMs     : handoff.mtimeMs,
+                    ageMs       : handoff.ageMs,
+                    staleAfterMs: handoff.staleAfterMs,
+                    stale       : handoff.stale,
+                    reason      : handoff.reason
+                },
                 sources: {
                     route    : {state: routeAxis.state, reason: routeAxis.reason, ...(routeAxis.detail ? {detail: routeAxis.detail} : {})},
                     admission: admission
                         ? {state: admission.admitted ? 'current' : 'withheld', reason: admission.reasonCode ?? null}
                         : {state: 'unavailable', reason: routeAxis.reason},
-                    rem      : {state: rem.state, reason: rem.reason, ...(rem.detail ? {detail: rem.detail} : {})}
+                    rem      : {state: rem.state, reason: rem.reason, ...(rem.detail ? {detail: rem.detail} : {})},
+                    handoff  : {state: handoff.state, reason: handoff.reason}
                 }
             }
         }

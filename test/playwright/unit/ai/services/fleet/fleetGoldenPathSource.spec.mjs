@@ -1,4 +1,6 @@
 import {expect, test} from '@playwright/test';
+import Neo from 'neo.mjs/src/Neo.mjs';
+import * as core from 'neo.mjs/src/core/_export.mjs';
 import FleetControlBridge from '../../../../../../ai/services/fleet/FleetControlBridge.mjs';
 import {
     createFleetGoldenPathSource,
@@ -66,6 +68,41 @@ function answer(overrides = {}) {
  */
 function remState() {
     return {undigested: 990, digested: 1010, sessionNodes: 4769, topologyConflicts: 0, recentCycles: []}
+}
+
+/**
+ * @summary A handoff containing one strategic section followed by a separate level-two section.
+ * @param {Object} [overrides]
+ * @returns {Object}
+ */
+function handoffResult(overrides = {}) {
+    return {
+        content: [
+            '# Sandman handoff',
+            '',
+            'Opening context.',
+            '',
+            '## Computed Golden Path (Strategic Recommendation)',
+            '',
+            'Captured at: 2026-09-25 14:30 UTC',
+            '',
+            'This recommendation is human-readable producer output.',
+            '',
+            '### Evidence',
+            '',
+            '- issue:19220 — Keep this nested content.',
+            '',
+            '## Current Release / Incident Focus',
+            '',
+            'Do not include this next section.'
+        ].join('\n'),
+        mtimeMs     : NOW_MS - 120_000,
+        ageMs       : 120_000,
+        staleAfterMs: 3_600_000,
+        stale       : false,
+        reason      : null,
+        ...overrides
+    }
 }
 
 function createSource(overrides = {}) {
@@ -176,6 +213,76 @@ test.describe('fleet golden path source — the envelope', () => {
         expect(envelope.sources.rem.detail).not.toContain('abc123')
     });
 
+    test('the complete handoff section is preserved verbatim through nested headings and stops before the next level-two section', async () => {
+        const input = handoffResult(),
+              start = input.content.indexOf('## Computed Golden Path (Strategic Recommendation)'),
+              end   = input.content.indexOf('## Current Release / Incident Focus'),
+              expected = input.content.slice(start, end),
+              envelope = await createSource({getSandmanHandoff: async () => input}).readGoldenPath();
+
+        expect(envelope.handoff).toEqual({
+            markdown    : expected,
+            mtimeMs     : input.mtimeMs,
+            ageMs       : input.ageMs,
+            staleAfterMs: input.staleAfterMs,
+            stale       : false,
+            reason      : null
+        });
+        expect(envelope.handoff.markdown).toContain('### Evidence');
+        expect(envelope.handoff.markdown).not.toContain('Current Release / Incident Focus');
+        expect(envelope.sources.handoff).toEqual({state: 'available', reason: null})
+    });
+
+    test('handoff staleness is independent of the computed-route capability and preserves the producer file update time', async () => {
+        const envelope = await createSource({
+            getSandmanHandoff: async () => handoffResult({stale: true, ageMs: 4_000_000, staleAfterMs: 3_600_000})
+        }).readGoldenPath();
+
+        expect(envelope.capability.state).toBe('wired');
+        expect(envelope.route.items).toHaveLength(2);
+        expect(envelope.handoff).toMatchObject({mtimeMs: NOW_MS - 120_000, ageMs: 4_000_000, staleAfterMs: 3_600_000, stale: true, reason: null});
+        expect(envelope.sources.handoff).toEqual({state: 'stale', reason: null})
+    });
+
+    test('a missing section is explicit while route, admission, REM and file freshness remain available', async () => {
+        const envelope = await createSource({
+            getSandmanHandoff: async () => handoffResult({content: '# Legacy handoff without the strategic section'})
+        }).readGoldenPath();
+
+        expect(envelope.handoff).toEqual({
+            markdown    : null,
+            mtimeMs     : NOW_MS - 120_000,
+            ageMs       : 120_000,
+            staleAfterMs: 3_600_000,
+            stale       : false,
+            reason      : 'handoff-section-not-found'
+        });
+        expect(envelope.sources.handoff).toEqual({state: 'degraded', reason: 'handoff-section-not-found'});
+        expect(envelope.capability.state).toBe('wired');
+        expect(envelope.route.items).toHaveLength(2);
+        expect(envelope.rem.undigested).toBe(990)
+    });
+
+    test('unavailable and throwing handoff reads are explicit, and an older caller without the operation keeps route and REM alive', async () => {
+        const unavailable = await createSource({
+                  getSandmanHandoff: async () => ({content: null, mtimeMs: null, ageMs: null, staleAfterMs: 3_600_000, stale: true, reason: 'handoff-path-unconfigured'})
+              }).readGoldenPath(),
+              failed = await createSource({getSandmanHandoff: async () => {throw new Error('handoff unavailable')}}).readGoldenPath(),
+              legacy = await createSource().readGoldenPath();
+
+        expect(unavailable.handoff).toMatchObject({markdown: null, reason: 'handoff-path-unconfigured', stale: true});
+        expect(unavailable.sources.handoff).toEqual({state: 'unavailable', reason: 'handoff-path-unconfigured'});
+        expect(failed.handoff).toMatchObject({markdown: null, reason: 'handoff-read-failed'});
+        expect(failed.sources.handoff).toEqual({state: 'unavailable', reason: 'handoff-read-failed'});
+        expect(legacy.handoff).toMatchObject({markdown: null, reason: 'handoff-source-unwired'});
+        expect(legacy.sources.handoff).toEqual({state: 'unavailable', reason: 'handoff-source-unwired'});
+        for (const envelope of [unavailable, failed, legacy]) {
+            expect(envelope.capability.state).toBe('wired');
+            expect(envelope.route.items).toHaveLength(2);
+            expect(envelope.rem.undigested).toBe(990)
+        }
+    });
+
     test('the source refuses to exist without both operations', () => {
         expect(() => createFleetGoldenPathSource({getRemPipelineState: async () => ({})})).toThrow(/getComputedRoute/);
         expect(() => createFleetGoldenPathSource({getComputedRoute: async () => ({})})).toThrow(/getRemPipelineState/)
@@ -214,6 +321,40 @@ test.describe('fleet golden path — the bridge and the wire', () => {
         expect(wireFleetGoldenPathSource({getRemPipelineState: async () => ({}), bridge})).toBe(null);
         expect(wireFleetGoldenPathSource({getComputedRoute: async () => ({}), bridge})).toBe(null);
         expect(bridge.goldenPathSource).toBe(null)
+    });
+
+    test('handoff wiring forwards only its existing Memory Core operation and remains optional for legacy callers', async () => {
+        let receivedArgs;
+
+        const bridge = {goldenPathSource: null};
+
+        wireFleetGoldenPathSource({
+            getComputedRoute   : async () => answer(),
+            getRemPipelineState: async () => remState(),
+            getSandmanHandoff  : async args => {
+                receivedArgs = args;
+
+                return handoffResult()
+            },
+            now: () => NOW_MS,
+            bridge
+        });
+
+        await bridge.goldenPathSource.readGoldenPath();
+
+        expect(receivedArgs).toEqual({});
+
+        const legacyBridge = {goldenPathSource: null};
+
+        expect(wireFleetGoldenPathSource({
+            getComputedRoute   : async () => answer(),
+            getRemPipelineState: async () => remState(),
+            bridge: legacyBridge
+        })).toBe(legacyBridge.goldenPathSource);
+        await expect(legacyBridge.goldenPathSource.readGoldenPath()).resolves.toMatchObject({
+            capability: {state: 'wired'},
+            handoff   : {reason: 'handoff-source-unwired'}
+        })
     });
 
     test('fleetGoldenPath is a classified read-observe wire verb awaiting the S3 viewer projection, like fleetTasks', () => {
