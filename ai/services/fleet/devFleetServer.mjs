@@ -61,8 +61,9 @@ import {assertFleetPlaneAdmissionBearerClass,
 import {createPlaneMailboxClient}             from './planeMailboxClient.mjs';
 import {createPlaneWakeIdentitiesReader,
         createPlaneWakeObservationsReader}                               from './planeWakeIdentitiesReader.mjs';
-import {createFleetWakeSseConsumer}   from './fleetWakeSseConsumer.mjs';
-import {createPlaneWhoIsOnlineReader} from './planeWhoIsOnlineReader.mjs';
+import {createFleetWakeSseConsumer}       from './fleetWakeSseConsumer.mjs';
+import {createPlaneWhoIsOnlineReader}     from './planeWhoIsOnlineReader.mjs';
+import {createPlaneDeploymentStateReader} from './planeDeploymentStateReader.mjs';
 import {readActiveWakeSubscriptionIdentities,
         readActiveWakeSubscriptionObservations}                          from '../memory-core/readActiveWakeSubscriptionIdentities.mjs';
 import {createTerminalDeliveryFailuresFileReader, resolveDaemonLiveness} from './fleetWakeStateAdapter.mjs';
@@ -149,18 +150,24 @@ async function boot() {
     wireBootIdentityReadSource({dir: AiConfig.orchestrator.dataDir});
 
     // Wire the cross-process deployment-state reader the same way: fleetDeploymentState() then serves the
-    // bounded projection of the orchestrator's snapshot file instead of the honest unavailable fallback.
-    // The three leaves are read here because this entrypoint is where config resolution belongs; the
-    // wiring itself owns no default. Fail-soft — an empty path leaves the seam unwired, and the boot
-    // log says which.
+    // bounded projection of the orchestrator's snapshot instead of the honest unavailable fallback. The
+    // truth is read where it lives, like every other seam above: in plane mode through the admitted
+    // plane client (`get_deployment_state_snapshot` — the plane's own reader verdict, projected here
+    // unchanged; this process's data root has no orchestrator writing a file), in-process from the
+    // snapshot file. The three leaves are read here because this entrypoint is where config resolution
+    // belongs; the wiring itself owns no default. Fail-soft — an empty path with no plane leaves the seam
+    // unwired, and the boot log says which.
     const deploymentStateSource = wireDeploymentStateReadSource({
         path        : AiConfig.orchestrator.deploymentStateBridge.snapshotPath,
         staleAfterMs: AiConfig.orchestrator.deploymentStateBridge.staleAfterMs,
-        maxBytes    : AiConfig.orchestrator.deploymentStateBridge.maxSnapshotBytes
+        maxBytes    : AiConfig.orchestrator.deploymentStateBridge.maxSnapshotBytes,
+        ...(planeClient ? {readImpl: createPlaneDeploymentStateReader(planeClient)} : {})
     });
 
     console.log(deploymentStateSource
-        ? `[fleet] deployment-state read-source wired (${AiConfig.orchestrator.deploymentStateBridge.snapshotPath})`
+        ? planeClient
+            ? `[fleet] deployment-state read-source wired to the plane (get_deployment_state_snapshot via ${planeBase})`
+            : `[fleet] deployment-state read-source wired (${AiConfig.orchestrator.deploymentStateBridge.snapshotPath})`
         : '[fleet] deployment-state read-source unwired — fleetDeploymentState answers unavailable');
 
     // Wire the wake-telltale producer sources (the S2 axis). This entrypoint is where config

@@ -10,7 +10,7 @@ import {
 
 /**
  * A snapshot shaped like `DeploymentStateBridgeService#collectSnapshot`, deliberately LEAKING everything a
- * card must not carry. The row's shape is the WRITER's (#323): `status` is the folded string
+ * card must not carry. The row's shape is the WRITER's: `status` is the folded string
  * (`foldMemoryPressureIntoStatus`), `classification` carries the class word beside its declared flag, and
  * `diagnosis` is a `container-health-diagnosis-decision` record whose inner `diagnosis` block holds the
  * recovery class and confidence.
@@ -84,7 +84,7 @@ const leakingSnapshot = () => ({
 /**
  * One service row VERBATIM from the live plane (snapshot `generatedAt` 1788568958677, read 2026-09-05T00:42Z),
  * bounded to the fields the projection reads plus the record envelope — the shape the writer actually
- * emits, which the guessed fixture above never was (#323).
+ * emits, which an earlier guessed fixture never was.
  */
 const liveChromaRow = () => ({
     schemaVersion : 1,
@@ -113,7 +113,7 @@ const LEAK_MARKERS = ['/Users/', '/var/run', 'docker', 'sk-live', 'bearer-secret
 
 test.describe('projectDeploymentStateForFleet — the bounded, redacted wire shape of the deployment snapshot (#314)', () => {
     test('RED-FIRST on the leak: nothing a card must not carry survives projection', () => {
-        const serialized = JSON.stringify(projectDeploymentStateForFleet(leakingSnapshot(), {ageMs: 1000, staleAfterMs: 120000}));
+        const serialized = JSON.stringify(projectDeploymentStateForFleet(leakingSnapshot(), {ageMs: 1000}));
 
         for (const marker of LEAK_MARKERS) {
             expect(serialized, `leaked marker: ${marker}`).not.toContain(marker);
@@ -121,7 +121,7 @@ test.describe('projectDeploymentStateForFleet — the bounded, redacted wire sha
     });
 
     test('keeps exactly the card fields, under the snapshot\'s own names', () => {
-        const projection = projectDeploymentStateForFleet(leakingSnapshot(), {ageMs: 1000, staleAfterMs: 120000});
+        const projection = projectDeploymentStateForFleet(leakingSnapshot(), {ageMs: 1000});
 
         expect(projection.state).toBe(DEPLOYMENT_STATE_PROJECTION_STATES.ok);
         expect(projection.reason).toBeNull();
@@ -148,7 +148,7 @@ test.describe('projectDeploymentStateForFleet — the bounded, redacted wire sha
         });
     });
 
-    // #323, the maintenance half: the live plane writes no `retry` block until the lane has task state,
+    // the maintenance half: the live plane writes no `retry` block until the lane has task state,
     // the verdict rides `health`, and an unreadable receipt carries its status at the root
     test('a maintenance block without retry state projects a null phase, keeps the health verdict, and reads an unreadable receipt at its root', () => {
         expect(projectDeploymentMaintenanceForFleet({
@@ -168,7 +168,7 @@ test.describe('projectDeploymentStateForFleet — the bounded, redacted wire sha
         });
     });
 
-    // #323 RED-FIRST: the writer folds the status into ONE word and wraps the diagnosis in a decision
+    // RED-FIRST: the writer folds the status into ONE word and wraps the diagnosis in a decision
     // record; a projection written to a guessed block shape read every live service as unobserved
     test('a VERBATIM live row projects its folded status word, its class word and its healthy decision (#323)', () => {
         expect(projectDeploymentServiceForFleet(liveChromaRow())).toEqual({
@@ -182,8 +182,8 @@ test.describe('projectDeploymentStateForFleet — the bounded, redacted wire sha
         });
     });
 
-    test('an age beyond the horizon reads STALE and still carries the last known picture', () => {
-        const projection = projectDeploymentStateForFleet(leakingSnapshot(), {ageMs: 120001, staleAfterMs: 120000});
+    test('the reader\'s STALE verdict reads stale and still carries the last known picture', () => {
+        const projection = projectDeploymentStateForFleet(leakingSnapshot(), {ageMs: 120001, stale: true});
 
         expect(projection.state).toBe(DEPLOYMENT_STATE_PROJECTION_STATES.stale);
         expect(projection.ageMs).toBe(120001);
@@ -216,7 +216,7 @@ test.describe('projectDeploymentStateForFleet — the bounded, redacted wire sha
         // a decision without an inner diagnosis (the healthy arm) keeps its own status and action class
         expect(projectDeploymentServiceForFleet({serviceKey: 'kb-server', diagnosis: {status: 'healthy'}}).diagnosis)
             .toEqual({status: 'healthy', actionClass: null, recoveryClass: null, confidence: null});
-        // a status that is not the writer's word — the pre-#323 block shape included — is unknown, never a guess
+        // a status that is not the writer's word — the earlier block shape included — is unknown, never a guess
         expect(projectDeploymentServiceForFleet({serviceKey: 'kb-server', status: {status: 'degraded', disposition: 'at-cap'}}).status).toBeNull();
         expect(projectDeploymentMaintenanceForFleet({maintenance: {}})).toEqual({
             backup    : {phase: null, lastSuccessAt: null, lastSuccessAgeMs: null, health: null, lastBackup: null},
@@ -227,8 +227,8 @@ test.describe('projectDeploymentStateForFleet — the bounded, redacted wire sha
 
     test('non-record rows are dropped and the projection is a fresh object each call', () => {
         const snapshot = {generatedAt: 1, services: [null, 'x', {serviceKey: 'chroma'}]};
-        const a        = projectDeploymentStateForFleet(snapshot, {ageMs: 0, staleAfterMs: 1});
-        const b        = projectDeploymentStateForFleet(snapshot, {ageMs: 0, staleAfterMs: 1});
+        const a        = projectDeploymentStateForFleet(snapshot, {ageMs: 0});
+        const b        = projectDeploymentStateForFleet(snapshot, {ageMs: 0});
 
         expect(a.services.map(row => row.serviceKey)).toEqual(['chroma']);
         expect(a).not.toBe(b);
