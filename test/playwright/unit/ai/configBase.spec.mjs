@@ -246,10 +246,13 @@ test.describe('fleet.contentRoot — the activity feed reads a declared root, ne
         expect(contentRootLeaf().default).toBe(path.resolve(ConfigBase.config.data.projectRoot.default, 'resources/content'));
     });
 
-    test('both wiring sites in devFleetServer read the leaf at the use site — no content literal remains', () => {
+    test('the in-process wiring site reads the leaf at the use site, the plane branch reads the plane — no content literal remains', () => {
         const source = fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../ai/services/fleet/devFleetServer.mjs'), 'utf8');
 
-        expect(source.match(/AiConfig\.fleet\.contentRoot/g)?.length).toBe(2);
+        // A fleet process attached to a plane has no corpus of its own: its PR/lane slot is the
+        // plane's `get_pr_lane_activity`, so only the in-process branch reads the content root.
+        expect(source.match(/AiConfig\.fleet\.contentRoot/g)?.length).toBe(1);
+        expect(source).toMatch(/readPrLane\s*:\s*createPlanePrLaneActivityReader\(planeClient\)/);
         expect(source).not.toMatch(/resources\/content\//);
     })
 });
