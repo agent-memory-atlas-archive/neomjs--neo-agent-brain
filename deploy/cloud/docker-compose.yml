@@ -202,9 +202,14 @@ services:
     healthcheck:
       test        : ["CMD", "node", "./ai/scripts/diagnostics/mcpHealthcheck.mjs", "--url", "http://127.0.0.1:3000", "--client-name", "neo-kb-container-healthcheck"]
       # The probe is a full MCP client calling the `healthcheck` tool; at 10 s it was the
-      # service's largest caller. 30 s × 4 keeps the two-minute detection latency of 10 s × 12
-      # at a sixth of the calls; the timeout covers a probe whose interpreter start is inflated by
-      # CPU contention, which is what its startup timing separates from a stalled service.
+      # service's largest caller. 30 s × 4 runs a third of the 10 s × 12 probes. Docker starts the
+      # next interval after a check completes and reports `unhealthy` after `retries` consecutive
+      # failures, so a dead service is reported within 4 × (30 s + 15 s) = 180 s when every check
+      # runs to its timeout (12 × (10 s + 10 s) = 240 s before) and 4 × 30 s = 120 s when checks
+      # fail at once (unchanged). The timeout covers a probe whose interpreter start is inflated by
+      # CPU contention, which is what its startup timing separates from a stalled service. Cadence
+      # is the whole saving here: kb-server's `healthcheck` takes no `freshObservability` option
+      # and ignores the one the probe sends.
       interval    : 30s
       timeout     : 15s
       retries     : 4
@@ -376,7 +381,8 @@ services:
       test        : ["CMD", "node", "./ai/scripts/diagnostics/mcpHealthcheck.mjs", "--url", "http://127.0.0.1:3001", "--client-name", "neo-mc-container-healthcheck", "--expected-status", "healthy,degraded"]
       # Same cadence as kb-server, for the same reason: measured 2026-09-27, the 10 s probe was
       # ~270 of the 353 `healthcheck` calls mc-server served in 49 minutes, three of them at 63–83 s
-      # while the service booted.
+      # while the service booted. Here the probe's `freshObservability: false` also lets
+      # HealthService answer from its cached healthy payload; the tool's own state reads still run.
       interval    : 30s
       timeout     : 15s
       retries     : 4

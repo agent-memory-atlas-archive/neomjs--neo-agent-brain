@@ -304,9 +304,10 @@ test.describe('declared V8 heap ceilings', () => {
 /**
  * The MCP-probed API servers' container healthchecks are full MCP client sessions calling the
  * `healthcheck` tool. At `interval: 10s` the probe was the service's largest caller (about 270 of
- * the 353 calls mc-server served in 49 minutes on 2026-09-27). The cadence is pinned here so it
- * cannot drift back: a probe at least 30 s apart, a timeout that covers a contention-inflated
- * interpreter start, and a retry count that keeps detection within two minutes.
+ * the 353 calls mc-server served in 49 minutes on 2026-09-27). The declaration is pinned exactly
+ * so it cannot drift back, and the detection bound is computed the way Docker schedules checks:
+ * the next interval starts after a check completes and `unhealthy` follows `retries` consecutive
+ * failures, so a dead service is reported within retries × (interval + timeout) at worst.
  */
 test.describe('MCP container probes: cadence', () => {
     const
@@ -314,13 +315,16 @@ test.describe('MCP container probes: cadence', () => {
         MCP_PROBED = ['kb-server', 'mc-server'];
 
     for (const service of MCP_PROBED) {
-        test(`${service}'s probe runs no more often than every 30 s and still detects within two minutes`, () => {
-            const healthcheck = compose.services[service].healthcheck;
+        test(`${service}'s probe is declared 30s / 15s / 4 and reports a dead service within 180 s`, () => {
+            const
+                healthcheck = compose.services[service].healthcheck,
+                interval    = seconds(healthcheck.interval),
+                timeout     = seconds(healthcheck.timeout),
+                retries     = healthcheck.retries;
 
             expect(healthcheck.test.join(' '), 'the probe is the MCP healthcheck client').toContain('mcpHealthcheck.mjs');
-            expect(seconds(healthcheck.interval), 'interval').toBeGreaterThanOrEqual(30);
-            expect(seconds(healthcheck.timeout), 'timeout covers a contention-inflated interpreter start').toBeGreaterThanOrEqual(15);
-            expect(seconds(healthcheck.interval) * healthcheck.retries, 'detection latency stays within two minutes').toBeLessThanOrEqual(120);
+            expect({interval, timeout, retries}, 'the declared cadence').toEqual({interval: 30, timeout: 15, retries: 4});
+            expect(retries * (interval + timeout), 'worst case: every failing check runs to its timeout').toBeLessThanOrEqual(180);
         });
     }
 });

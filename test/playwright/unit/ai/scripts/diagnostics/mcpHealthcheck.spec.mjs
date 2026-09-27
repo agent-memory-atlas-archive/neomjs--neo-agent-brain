@@ -209,8 +209,8 @@ test.describe('ai/scripts/diagnostics/mcpHealthcheck (#11725)', () => {
         expect(calls).toEqual([
             {type: 'client', identity: {name: 'neo-container-healthcheck', version: '1.0.0'}, options: {capabilities: {}}},
             {type: 'connect', url: 'http://127.0.0.1:3000/mcp', headers: {'X-PREFERRED-USERNAME': 'probe', Authorization: 'Bearer token'}},
-            // The probe asks for the serving verdict only: a cached healthy payload answers it, so
-            // the container runtime's cadence does not re-run every diagnostic probe each tick.
+            // The one argument the probe sends: mc-server's HealthService answers it from its cached
+            // healthy payload; kb-server's `healthcheck` takes no option and ignores it.
             {type: 'callTool', request: {name: 'healthcheck', arguments: {freshObservability: false}}},
             {type: 'close'}
         ]);
