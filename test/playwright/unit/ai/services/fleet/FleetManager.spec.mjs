@@ -88,6 +88,24 @@ test.describe('Neo.ai.services.fleet.FleetManager — fleet-authority definition
         expect(calls, 'the registry was never touched').toEqual([])
     });
 
+    test('a refusal names the rule, never the value it refused: a secret in the input stays out of the message', () => {
+        for (const payload of [
+            {repoSlug: 'x/y', cloneUrl: 'https://user:ghp_SECRET1@github.com/x/y.git'},
+            {repoSlug: 'https://user:ghp_SECRET2@github.com/x/y.git'}
+        ]) {
+            let message = '';
+
+            try {
+                FleetManager.setRepo({id: 'alice', ...payload})
+            } catch (error) {
+                message = error.message
+            }
+
+            expect(message).toMatch(/^FleetManager\.setRepo: /);
+            expect(message).not.toMatch(/SECRET/)
+        }
+    });
+
     test('with no coordinates sets an empty metadata.repo (a safe no-op, not a wipe of other metadata)', () => {
         FleetManager.setRepo({id: 'alice'});
 

@@ -412,16 +412,25 @@ class FleetManager extends Base {
         const repo = {};
 
         if (repoSlug != null || cloneUrl != null) {
+            // A refusal names the rule, never the refused value: a caller's string may be a URL with a
+            // credential in it, and an error message travels to logs and panes.
+            let owner, name;
+
+            try {
+                [owner, name] = assertRepoSlug(repoSlug, 'FleetManager.setRepo')
+            } catch {
+                throw new Error("FleetManager.setRepo: repoSlug must be '<owner>/<repo>' in lowercase seat segments, never the 'harness' owner.")
+            }
+
             const
-                [owner, name] = assertRepoSlug(repoSlug, 'FleetManager.setRepo'),
-                escaped       = `${owner}/${name}`.replace(/\./g, '\\.'),
-                remote        = new RegExp(`^(?:https://[^/@\\s]+/|ssh://(?:[\\w.-]+@)?[^/@\\s:]+(?::\\d+)?/|[\\w.-]+@[\\w.-]+:)${escaped}(?:\\.git)?$`, 'i');
+                escaped = `${owner}/${name}`.replace(/\./g, '\\.'),
+                remote  = new RegExp(`^(?:https://[^/@\\s]+/|ssh://(?:[\\w.-]+@)?[^/@\\s:]+(?::\\d+)?/|[\\w.-]+@[\\w.-]+:)${escaped}(?:\\.git)?$`, 'i');
 
             repo.repoSlug = repoSlug;
             repo.cloneUrl = cloneUrl ?? `https://github.com/${repoSlug}.git`;
 
             if (!remote.test(repo.cloneUrl)) {
-                throw new Error(`FleetManager.setRepo: the clone URL must be a remote naming ${repoSlug}, received ${JSON.stringify(cloneUrl)}.`)
+                throw new Error(`FleetManager.setRepo: the clone URL must be an https, ssh or SCP-like remote naming ${repoSlug}, with no credentials and no local source.`)
             }
         }
 
