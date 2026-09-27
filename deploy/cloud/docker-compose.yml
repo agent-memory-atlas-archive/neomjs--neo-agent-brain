@@ -199,11 +199,22 @@ services:
     # If this deployment opts into NEO_AUTH_MODE=gitlab-pat, the in-container MCP
     # self-probe must authenticate too. Ensure NEO_MCP_HEALTHCHECK_TOKEN is present
     # in the container environment; mcpHealthcheck.mjs sends it as a bearer token.
+    #
+    # The probe is a full MCP client calling the `healthcheck` tool; at 10 s it was the service's
+    # largest caller. 30 s × 4 runs a third of the 10 s × 12 probes. Docker starts the next
+    # interval after a check completes and reports `unhealthy` after `retries` consecutive
+    # failures, so a dead service is reported within 4 × (30 s + 15 s) = 180 s when every check
+    # runs to its timeout (12 × (10 s + 10 s) = 240 s before) and 4 × 30 s = 120 s when checks
+    # fail at once (unchanged). The timeout covers a probe whose interpreter start is inflated by
+    # CPU contention, which is what its startup timing separates from a stalled service. Cadence
+    # is the whole saving here: kb-server's `healthcheck` takes no `freshObservability` option
+    # and ignores the one the probe sends. (The rationale sits above the key on purpose: the
+    # bridge spec's cross-artifact arm reads `timeout` within 400 characters of the probe's path.)
     healthcheck:
       test        : ["CMD", "node", "./ai/scripts/diagnostics/mcpHealthcheck.mjs", "--url", "http://127.0.0.1:3000", "--client-name", "neo-kb-container-healthcheck"]
-      interval    : 10s
-      timeout     : 10s
-      retries     : 12
+      interval    : 30s
+      timeout     : 15s
+      retries     : 4
       start_period: 45s
     deploy:
       resources:
@@ -368,11 +379,16 @@ services:
     #
     # `unhealthy` is still failing, and is still the only failing verdict. The point is to
     # distinguish the two, not to erase both.
+    #
+    # Same cadence as kb-server, for the same reason: measured 2026-09-27, the 10 s probe was
+    # ~270 of the 353 `healthcheck` calls mc-server served in 49 minutes, three of them at 63–83 s
+    # while the service booted. Here the probe's `freshObservability: false` also lets
+    # HealthService answer from its cached healthy payload; the tool's own state reads still run.
     healthcheck:
       test        : ["CMD", "node", "./ai/scripts/diagnostics/mcpHealthcheck.mjs", "--url", "http://127.0.0.1:3001", "--client-name", "neo-mc-container-healthcheck", "--expected-status", "healthy,degraded"]
-      interval    : 10s
-      timeout     : 10s
-      retries     : 12
+      interval    : 30s
+      timeout     : 15s
+      retries     : 4
       start_period: 45s
     deploy:
       resources:

@@ -130,7 +130,18 @@ test.describe('Neo.ai.mcp.server.knowledge-base.Server', () => {
         expect(schema.required).toEqual(['status', 'record'])
     });
 
-    // Grace's RA-1, mirrored from the Memory Core spec: a bare `null` answers both "could not read"
+    test('the Knowledge Base healthcheck advertises no `freshObservability` input — the container probe\'s option belongs to mc-server alone', async () => {
+        const {tools} = await (await import('../../../../../../../ai/mcp/server/knowledge-base/toolService.mjs')).listTools(),
+              schema  = tools.find(item => item.name === 'healthcheck').inputSchema;
+
+        // The shared probe (`mcpHealthcheck.mjs`) sends `{freshObservability: false}` to both servers.
+        // mc-server declares the option (`McpServerToolLimits.spec`) and answers from its cached
+        // healthy payload; here the handler is zero-argument, so the field is ignored and the
+        // probe's saving is its cadence alone.
+        expect(Object.keys(schema?.properties || {})).not.toContain('freshObservability');
+    });
+
+    // Mirrored from the Memory Core spec: a bare `null` answers both "could not read"
     // and "read it, nothing died". Both healthchecks carry the same projection, and both are pinned
     // separately — a guard proven on one lane and assumed on the other is how the two drift.
     test.describe('the Knowledge Base last-death projection keeps the states apart (#466 RA-1)', () => {
