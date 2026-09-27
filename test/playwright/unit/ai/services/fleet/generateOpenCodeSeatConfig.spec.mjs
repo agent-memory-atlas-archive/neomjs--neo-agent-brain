@@ -111,7 +111,7 @@ test.describe('generateOpenCodeSeatConfig (OpenCode seat scaffold emission)', ()
         // hook content is precisely what this digest exists to surface, so it is bumped, not relaxed.
         // Bumped 2026-08-24: AgentOS runtime and target-repository roots became explicit, and Neural
         // Link's package cwd moved to the runtime authority.
-        // Bumped 2026-09-27 (#532): the hook stopped carrying the wake-envelope plant. It had inlined
+        // Bumped 2026-09-27: the hook stopped carrying the wake-envelope plant. It had inlined
         // ~26 KB of base64 and installed it behind an `XDG_CONFIG_HOME` guard the production caller does
         // not pass, so on a real Fleet seat the branch always skipped; the plant is now its own emitted
         // file at a caller-resolved path. Sole differing artifact: `/seat/write-wake-envelope.mjs`.
