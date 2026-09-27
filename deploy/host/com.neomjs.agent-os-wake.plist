@@ -35,8 +35,11 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <!-- Declared, never the installing shell's PATH, which names a seat and session.
+             The receiver runs ps and osascript by bare name (the runbook asserts both).
+             The optional tmux adapter also needs tmux here, which the runbook does not assert. -->
         <key>PATH</key>
-        <string>__NEO_PATH__</string>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 
     <key>RunAtLoad</key>

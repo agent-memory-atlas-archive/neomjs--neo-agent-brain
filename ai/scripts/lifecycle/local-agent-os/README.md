@@ -453,13 +453,25 @@ plutil -replace ProgramArguments -json "[
   \"--port\",      \"3199\"
 ]" "${NEO_WAKE_PLIST}"
 plutil -replace WorkingDirectory -string "${AGENTOS_RUNTIME_ROOT}" "${NEO_WAKE_PLIST}"
-plutil -replace EnvironmentVariables.PATH -string "${PATH}" "${NEO_WAKE_PLIST}"
 plutil -replace StandardOutPath -string "${NEO_WAKE_RECEIVER_STATE_DIR}/launchd.out.log" "${NEO_WAKE_PLIST}"
 plutil -replace StandardErrorPath -string "${NEO_WAKE_RECEIVER_STATE_DIR}/launchd.err.log" "${NEO_WAKE_PLIST}"
 plutil -lint "${NEO_WAKE_PLIST}"
 
 # `lint` is NOT sufficient here — see the note after this block. Assert no placeholder survived.
 plutil -p "${NEO_WAKE_PLIST}" | grep -q '__' && { echo 'FAIL: placeholder survived in wake plist'; exit 1; }
+
+# The template declares PATH: an interactive shell's names whichever seat and session installs.
+# Assert it names nothing under /Users/ and resolves each command the agent runs by bare name,
+# in a fresh sh — a shell function or alias satisfies `command -v` with no binary behind it.
+assert_daemon_path() {  # $1 = installed plist, then the commands its agent runs
+  daemon_path="$(plutil -extract EnvironmentVariables.PATH raw "$1")" || return 1
+  case ":${daemon_path}:" in *:/Users/*) echo "FAIL: $1 PATH names a directory under /Users/"; return 1;; esac
+  plist="$1"; shift
+  for c in "$@"; do
+    env PATH="${daemon_path}" /bin/sh -c 'command -v "$1" >/dev/null' _ "$c" || { echo "FAIL: ${c} does not resolve on the PATH of ${plist}"; return 1; }
+  done
+}
+assert_daemon_path "${NEO_WAKE_PLIST}" ps osascript || exit 1
 
 # Same class of silent failure, a different dimension: a substituted root that does not
 # carry the entrypoint passes both `lint` and the placeholder check, and the agent then
@@ -491,12 +503,12 @@ otherwise.
 cp deploy/host/com.neomjs.agent-os-host-edge.plist "${NEO_HOST_EDGE_PLIST}"
 plutil -replace ProgramArguments -json "[\"$(command -v node)\", \"ai/daemons/orchestrator/hostEdge.mjs\"]" "${NEO_HOST_EDGE_PLIST}"
 plutil -replace WorkingDirectory -string "${AGENTOS_RUNTIME_ROOT}" "${NEO_HOST_EDGE_PLIST}"
-plutil -replace EnvironmentVariables.PATH -string "${PATH}" "${NEO_HOST_EDGE_PLIST}"
 plutil -replace EnvironmentVariables.NEO_AI_ORCHESTRATOR_DIR -string "${NEO_HOST_EDGE_STATE_DIR}" "${NEO_HOST_EDGE_PLIST}"
 plutil -replace StandardOutPath -string "${NEO_HOST_EDGE_STATE_DIR}/launchd.out.log" "${NEO_HOST_EDGE_PLIST}"
 plutil -replace StandardErrorPath -string "${NEO_HOST_EDGE_STATE_DIR}/launchd.err.log" "${NEO_HOST_EDGE_PLIST}"
 plutil -lint "${NEO_HOST_EDGE_PLIST}"
 plutil -p "${NEO_HOST_EDGE_PLIST}" | grep -q '__' && { echo 'FAIL: placeholder survived in host-edge plist'; exit 1; }
+assert_daemon_path "${NEO_HOST_EDGE_PLIST}" ps lsof osascript git gh node || exit 1
 [ -f "${AGENTOS_RUNTIME_ROOT}/ai/daemons/orchestrator/hostEdge.mjs" ] || { echo "FAIL: AGENTOS_RUNTIME_ROOT=${AGENTOS_RUNTIME_ROOT} carries no ai/daemons/orchestrator/hostEdge.mjs — point it at the Brain runtime root, not the Engine clone"; exit 1; }
 
 launchctl bootstrap "gui/$(id -u)" "${NEO_WAKE_PLIST}"
@@ -513,6 +525,17 @@ generation/embedding model IDs. Changing a `NEO_LOCAL_AGENT_OS_*` provider
 selection still requires a reviewed matching LaunchAgent change. It no longer
 carries the role, the deployment mode, or the lane closure, so the supervised
 path and the portable one cannot drift apart.
+
+Both agents run on the `PATH` their template declares, and `assert_daemon_path`
+fails the install when a command either one runs is missing from it. Each list
+copies its daemon's bare-name invocations (the wake receiver's, `hostEdge.mjs`'s),
+so a commit adding one adds it to the list. `tmux` is on neither: the tmux
+adapter is optional, and a host that selects it must have `tmux` on the declared
+`PATH` itself. The host
+edge takes its environment from the plist, the `hostEdgeProfile.mjs` posture and
+an optional `.env` in `AGENTOS_RUNTIME_ROOT` (dotenv's working-directory
+default). It carries no `DOTENV_CONFIG_PATH` and no seat identity: a machine
+daemon runs as no seat.
 
 ## Prove authority and health
 
