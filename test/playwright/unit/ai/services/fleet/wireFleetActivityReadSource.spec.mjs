@@ -2,8 +2,8 @@ import {setup}                       from '../../../../setup.mjs';
 import {test, expect}                from '@playwright/test';
 import Neo                           from 'neo.mjs/src/Neo.mjs';
 import * as core                     from 'neo.mjs/src/core/_export.mjs';
-import {resolveContentOrigins,
-        wireFleetActivityReadSource} from '../../../../../../ai/services/fleet/wireFleetActivityReadSource.mjs';
+import {wireFleetActivityReadSource} from '../../../../../../ai/services/fleet/wireFleetActivityReadSource.mjs';
+import {resolveContentOrigins}       from '../../../../../../ai/services/graph/contentOrigins.mjs';
 import {FLEET_COCKPIT_SOURCES}       from '../../../../../../src/fleet/contract/cockpit.mjs';
 import fs                            from 'node:fs';
 import os                            from 'node:os';
