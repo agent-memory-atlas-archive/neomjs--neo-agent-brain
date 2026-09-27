@@ -299,6 +299,7 @@ const expectedMemoryCoreToolTiers = {
     get_neighbors                 : 'read',
     search_nodes                  : 'read',
     query_hybrid_graph            : 'read',
+    get_graph_scene               : 'read',
     grant_permission              : 'admin',
     revoke_permission             : 'admin',
     list_permissions              : 'extended',

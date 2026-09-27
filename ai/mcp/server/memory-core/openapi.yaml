@@ -2099,6 +2099,51 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /graph/scene:
+    post:
+      summary: Get Graph Scene
+      operationId: get_graph_scene
+      x-neo-tool-tier: read
+      x-pass-as-object: true
+      x-annotations:
+        readOnlyHint: true
+      x-neo-tool-summary: Read the whole graph the caller may see, in display fields only (the Fleet Observatory's scene).
+      description: >-
+        Reads every node the caller may see, and every relation between two of them, under the graph's
+        row-level security. Answers columnar data, `{kinds, types, nodes: {ids, kinds, labels}, edges, counts,
+        budget, truncated}`, where `edges` is a flat `[source, target, type, …]` list of indices into `nodes` and
+        `types`. It carries display fields only, never property bags. `counts.unlinked` names the answered nodes
+        with no visible relation. A budget keeps the best-connected nodes, and `truncated` reports only a budget cut.
+      tags: [Graph]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                maxNodes:
+                  type: integer
+                  description: Node budget; a cut keeps the best-connected nodes.
+                  default: 250000
+                maxEdges:
+                  type: integer
+                  description: Edge budget over the kept nodes.
+                  default: 500000
+      responses:
+        '200':
+          description: The columnar scene.
+          content:
+            application/json:
+              schema:
+                type: object
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /permissions/grant:
     post:
       summary: Grant Permission

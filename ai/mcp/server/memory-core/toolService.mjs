@@ -533,6 +533,7 @@ const serviceMapping = {
     get_all_summaries          : SummaryService         .listSummaries           .bind(SummaryService),
     get_community_source_health: getCommunitySourceHealth,
     get_context_frontier       : MemoryService          .getContextFrontier      .bind(MemoryService),
+    get_graph_scene            : GraphService           .readSceneGraph          .bind(GraphService),
     get_neighbors              : GraphService           .getNeighbors            .bind(GraphService),
     get_node                   : GraphService           .getNode                 .bind(GraphService),
     get_session_memories       : MemoryService          .listMemories            .bind(MemoryService),

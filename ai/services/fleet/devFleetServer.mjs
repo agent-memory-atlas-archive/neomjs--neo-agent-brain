@@ -410,18 +410,12 @@ async function boot() {
         getSandmanHandoff  : args => callHistoryOperation('get_sandman_handoff', args)
     });
 
-    // The 3D graph's scene feed collects the neighbourhood the cockpit renders. Its seeds ride the
-    // same `get_computed_route` answer the Golden Path view above already reads, so the scene and the
-    // path it grows from cannot disagree about which route is current. Collection rides the two graph
-    // operations the plane already exposes — `get_node` per row, `get_neighbors` per hop. Both are
-    // RLS-filtered by the projection's own gate, so a withheld row or edge is absent because the
-    // graph decided the reader may not see it, not because this feed reinvents a filter; the source
-    // states what that means for `completeness`. The lambdas name their parameter because the two
-    // operations take an id object, not a passthrough argument list.
+    // The Observatory's scene: the whole graph the viewer may see, in one `get_graph_scene` read, with the
+    // route the Golden Path view above reads as its overlay, so the two cannot disagree about which route
+    // is current. The graph's own RLS decides what is absent; this feed reinvents no filter.
     wireFleetGraphSceneSource({
         getComputedRoute: args => callHistoryOperation('get_computed_route', args),
-        getNode         : id => callHistoryOperation('get_node', {id}),
-        getNeighbors    : id => callHistoryOperation('get_neighbors', {id})
+        getGraphScene   : args => callHistoryOperation('get_graph_scene', args)
     });
 
     // The memories DRILL-IN rides the same operation boundary one level deeper: the single
