@@ -51,10 +51,59 @@ test.describe('Neo.ai.services.fleet.FleetManager — fleet-authority definition
         expect(result.metadata.repo).toEqual({cloneUrl: 'https://github.com/x/y.git', repoSlug: 'x/y'});
     });
 
-    test('omits an unset coordinate — no null/undefined leaks into metadata.repo', () => {
-        FleetManager.setRepo({id: 'alice', cloneUrl: 'https://github.com/x/y.git'});
+    test('a slug alone stores the clone URL derived from it', () => {
+        FleetManager.setRepo({id: 'alice', repoSlug: 'neomjs/neo-agent-brain'});
 
-        expect(calls).toEqual([['updateAgent', 'alice', {metadata: {repo: {cloneUrl: 'https://github.com/x/y.git'}}}]]);
+        expect(calls).toEqual([['updateAgent', 'alice', {metadata: {repo: {repoSlug: 'neomjs/neo-agent-brain', cloneUrl: 'https://github.com/neomjs/neo-agent-brain.git'}}}]]);
+    });
+
+    test('a remote naming the slug\'s repo is accepted over https, ssh and the SCP-like form, on any host', () => {
+        for (const cloneUrl of ['git@gitlab.example:x/y.git', 'ssh://git@host.example:2222/x/y.git', 'https://GitHub.com/X/Y']) {
+            FleetManager.setRepo({id: 'alice', repoSlug: 'x/y', cloneUrl})
+        }
+
+        expect(calls.map(([, , patch]) => patch.metadata.repo.cloneUrl)).toEqual(['git@gitlab.example:x/y.git', 'ssh://git@host.example:2222/x/y.git', 'https://GitHub.com/X/Y'])
+    });
+
+    test('no caller points a seat at a source or a path it chose: everything else is refused before the registry', () => {
+        const refused = [
+            {repoSlug: 'x/y', cloneUrl: 'file:///tmp/y'},                         // a local source
+            {repoSlug: 'x/y', cloneUrl: '/tmp/y'},
+            {repoSlug: 'x/y', cloneUrl: 'http://github.com/x/y.git'},             // no plain http
+            {repoSlug: 'x/y', cloneUrl: 'https://user:token@github.com/x/y.git'}, // no embedded credentials
+            {repoSlug: 'x/y', cloneUrl: 'https://github.com/x/other.git'},        // a remote for another repo
+            {repoSlug: 'x/y', cloneUrl: 'https://github.com/x/y.git?ref=main'},
+            {cloneUrl: 'https://github.com/x/y.git'},                             // a URL with no slug
+            {repoSlug: 'x/..'},                                                   // a checkout path out of the root
+            {repoSlug: '../y'},
+            {repoSlug: 'x/y/z'},
+            {repoSlug: 'X/Y'},                                                    // the checkout path is lowercase
+            {repoSlug: 'harness/y'}                                               // the harness homes' segment
+        ];
+
+        for (const payload of refused) {
+            expect(() => FleetManager.setRepo({id: 'alice', ...payload}), JSON.stringify(payload)).toThrow(/FleetManager\.setRepo/)
+        }
+
+        expect(calls, 'the registry was never touched').toEqual([])
+    });
+
+    test('a refusal names the rule, never the value it refused: a secret in the input stays out of the message', () => {
+        for (const payload of [
+            {repoSlug: 'x/y', cloneUrl: 'https://user:ghp_SECRET1@github.com/x/y.git'},
+            {repoSlug: 'https://user:ghp_SECRET2@github.com/x/y.git'}
+        ]) {
+            let message = '';
+
+            try {
+                FleetManager.setRepo({id: 'alice', ...payload})
+            } catch (error) {
+                message = error.message
+            }
+
+            expect(message).toMatch(/^FleetManager\.setRepo: /);
+            expect(message).not.toMatch(/SECRET/)
+        }
     });
 
     test('with no coordinates sets an empty metadata.repo (a safe no-op, not a wipe of other metadata)', () => {
@@ -66,7 +115,7 @@ test.describe('Neo.ai.services.fleet.FleetManager — fleet-authority definition
     test('forwards the registry null (unknown agent) verbatim — no partial definition invented', () => {
         registryStub.updateAgent = (id, patch) => { calls.push(['updateAgent', id, patch]); return null; };
 
-        expect(FleetManager.setRepo({id: 'ghost', cloneUrl: 'https://github.com/x/y.git'})).toBeNull();
+        expect(FleetManager.setRepo({id: 'ghost', repoSlug: 'x/y'})).toBeNull();
     });
 
     test('setAvatar sets metadata.avatarUrl from the single payload (sibling fleet-authority verb)', () => {
