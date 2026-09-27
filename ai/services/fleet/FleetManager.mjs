@@ -1,5 +1,6 @@
 import Base                             from 'neo.mjs/src/core/Base.mjs';
 import FleetLifecycleService            from './FleetLifecycleService.mjs';
+import {assertRepoSlug}                 from './deriveAgentRepoPath.mjs';
 import {inspectFleetRepos}              from './inspectFleetRepos.mjs';
 import {launchRefusalOf}                from '../../../src/fleet/contract/launchAuthority.mjs';
 import {readFleetPresenceSnapshot}      from './fleetPresenceStateAdapter.mjs';
@@ -394,16 +395,35 @@ class FleetManager extends Base {
      * reuse, never clobber), and reconciling a now-stale old checkout is a Memory-Core policy, not
      * orphaned here. Replaces `metadata.repo` wholesale (a repo is set as a unit); other metadata keys
      * survive the merge.
+     *
+     * The verb is the boundary, not its callers. The slug must pass the checkout path's own rule
+     * ({@link assertRepoSlug}). The clone URL must be a remote that names that repo: https, ssh or the
+     * SCP-like `git@host:owner/repo`, with no embedded credentials and never a local source, so no caller
+     * points a seat's harness at a directory it chose. Without one it is the GitHub URL of the slug.
+     * `{id}` alone clears the repo.
      * @param {Object}  payload
      * @param {String}  payload.id        Registry agent id.
-     * @param {String} [payload.cloneUrl] The clone URL the provisioner clones from.
-     * @param {String} [payload.repoSlug] The repo slug (checkout-dir naming under the managed root).
+     * @param {String} [payload.repoSlug] `owner/repo`: the checkout dir under the agents root.
+     * @param {String} [payload.cloneUrl] A remote naming that repo; defaults to `https://github.com/<repoSlug>.git`.
      * @returns {Object|null} The updated public definition, or `null` if the agent doesn't exist.
+     * @throws {Error} On a malformed slug, or a clone URL that is not a remote naming the slug's repo.
      */
     setRepo({id, cloneUrl, repoSlug} = {}) {
         const repo = {};
-        if (cloneUrl != null) repo.cloneUrl = cloneUrl;
-        if (repoSlug != null) repo.repoSlug = repoSlug;
+
+        if (repoSlug != null || cloneUrl != null) {
+            const
+                [owner, name] = assertRepoSlug(repoSlug, 'FleetManager.setRepo'),
+                escaped       = `${owner}/${name}`.replace(/\./g, '\\.'),
+                remote        = new RegExp(`^(?:https://[^/@\\s]+/|ssh://(?:[\\w.-]+@)?[^/@\\s:]+(?::\\d+)?/|[\\w.-]+@[\\w.-]+:)${escaped}(?:\\.git)?$`, 'i');
+
+            repo.repoSlug = repoSlug;
+            repo.cloneUrl = cloneUrl ?? `https://github.com/${repoSlug}.git`;
+
+            if (!remote.test(repo.cloneUrl)) {
+                throw new Error(`FleetManager.setRepo: the clone URL must be a remote naming ${repoSlug}, received ${JSON.stringify(cloneUrl)}.`)
+            }
+        }
 
         return this.getLifecycleService().getRegistry().updateAgent(id, {metadata: {repo}});
     }

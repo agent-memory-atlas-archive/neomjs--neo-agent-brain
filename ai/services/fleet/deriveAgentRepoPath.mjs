@@ -49,20 +49,35 @@ export function deriveAgentRepoPath({managedRoot, agentId, repoSlug} = {}) {
 
     assertSeatSegment(agentId, 'agentId', 'deriveAgentRepoPath');
 
+    const [owner, repo] = assertRepoSlug(repoSlug, 'deriveAgentRepoPath');
+
+    return assertContained(root, path.resolve(root, agentId, owner, repo), 'deriveAgentRepoPath')
+}
+
+/**
+ * @summary Refuse any repo slug that could not name a seat's checkout: exactly `<owner>/<repo>`, both
+ * seat segments, and never the {@link HARNESS_SEGMENT} owner. The one rule for the checkout path and for
+ * the verb that records a seat's repo.
+ * @param {*} repoSlug
+ * @param {String} caller For the error message
+ * @returns {String[]} `[owner, repo]`
+ * @throws {Error} On any other shape.
+ */
+export function assertRepoSlug(repoSlug, caller) {
     if (typeof repoSlug !== 'string' || repoSlug.split('/').length !== 2) {
-        throw new Error(`deriveAgentRepoPath: 'repoSlug' must be '<owner>/<repo>', received '${repoSlug}'.`);
+        throw new Error(`${caller}: 'repoSlug' must be '<owner>/<repo>', received '${repoSlug}'.`);
     }
 
     const [owner, repo] = repoSlug.split('/');
 
-    assertSeatSegment(owner,   'owner',   'deriveAgentRepoPath');
-    assertSeatSegment(repo,    'repo',    'deriveAgentRepoPath');
+    assertSeatSegment(owner, 'owner', caller);
+    assertSeatSegment(repo,  'repo',  caller);
 
     if (owner === HARNESS_SEGMENT) {
-        throw new Error(`deriveAgentRepoPath: the owner '${HARNESS_SEGMENT}' is reserved for an agent's harness homes.`);
+        throw new Error(`${caller}: the owner '${HARNESS_SEGMENT}' is reserved for an agent's harness homes.`);
     }
 
-    return assertContained(root, path.resolve(root, agentId, owner, repo), 'deriveAgentRepoPath')
+    return [owner, repo]
 }
 
 /**
