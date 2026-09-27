@@ -20,7 +20,7 @@ import path              from 'path';
 
 import Neo                          from 'neo.mjs/src/Neo.mjs';
 import * as core                    from 'neo.mjs/src/core/_export.mjs';
-import AiConfig                     from '../../../../ai/config.mjs';
+import AiConfig                     from '../../../../ai/config.template.mjs';
 import FleetLifecycleService        from '../../../../ai/services/fleet/FleetLifecycleService.mjs';
 import {generateOpenCodeSeatConfig} from '../../../../ai/services/fleet/generateOpenCodeSeatConfig.mjs';
 
