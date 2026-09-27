@@ -590,7 +590,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService — launch ownership',
         expect(() => FleetRegistryService.setLaunchOwner('seat', 'everyone')).toThrow(/invalid launchOwner 'everyone'/)
     });
 
-    test('launchRefusalOf: only a release through setLaunchOwner refuses a start, and an adoption lifts it', () => {
+    test('launchRefusalOf: a row with no ownership act and a fleet-owned row start as before; a release through setLaunchOwner refuses, and an adoption lifts it', () => {
         FleetRegistryService.dataDir = tmpDir;
         FleetRegistryService.defineAgent({githubUsername: 'default', harnessType: 'codex'});
         FleetRegistryService.defineAgent({githubUsername: 'born',    harnessType: 'codex', launchOwner: 'fleet'});
@@ -629,8 +629,13 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService — launch ownership',
         expect(external.launchOwnerSince).toBe(external.createdAt);
         expect(refusalOf('external')).toBe('released to its own harness: adopt it to start it here');
 
-        // the persisted row carries the fact, not only the returned projection
+        // the persisted row carries the fact: a fresh hydration from registry.json, not the in-memory map
+        const otherDir = fs.mkdtempSync(path.join(os.tmpdir(), 'neo-fleet-reg-other-'));
+        FleetRegistryService.dataDir = otherDir;
+        expect(FleetRegistryService.getAgent('external')).toBeNull();
+        FleetRegistryService.dataDir = tmpDir;
         expect(FleetRegistryService.getAgent('external').launchOwnerSince).toBe(external.createdAt);
+        fs.rmSync(otherDir, {recursive: true, force: true});
 
         FleetRegistryService.setLaunchOwner('external', 'fleet');
         expect(refusalOf('external')).toBeNull()
