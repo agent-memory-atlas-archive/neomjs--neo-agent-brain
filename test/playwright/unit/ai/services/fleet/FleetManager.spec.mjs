@@ -318,7 +318,9 @@ test.describe('Neo.ai.services.fleet.FleetManager — an explicit release is sta
     });
 
     test('a seat CREATED external — the roster pilot\'s row — is refused by the real registry before anything is spawned, and an adoption lifts it', async () => {
-        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'neo-fleet-manager-born-'));
+        const
+            tmpDir       = fs.mkdtempSync(path.join(os.tmpdir(), 'neo-fleet-manager-born-')),
+            priorDataDir = FleetRegistryService.dataDir;
 
         try {
             FleetRegistryService.dataDir = tmpDir;
@@ -336,8 +338,13 @@ test.describe('Neo.ai.services.fleet.FleetManager — an explicit release is sta
             await FleetManager.startAgent('born-external');
             expect(calls).toEqual([['start', 'born-external']])
         } finally {
+            // The registry is a singleton: hand its root back before the directory goes, or
+            // `ensureLoaded` keeps serving this arm's row to a later case from a deleted root.
+            FleetRegistryService.dataDir = priorDataDir;
             fs.rmSync(tmpDir, {recursive: true, force: true})
         }
+
+        expect(FleetRegistryService.getAgent('born-external'), 'a fresh read on the restored root no longer sees the row').toBeNull()
     });
 });
 
