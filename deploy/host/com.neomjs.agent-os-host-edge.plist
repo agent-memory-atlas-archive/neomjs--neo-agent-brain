@@ -34,8 +34,12 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <!-- Declared, never the installing shell's PATH, which names a seat and session.
+             The host edge runs ps, lsof, osascript, git, gh and node by bare name (the
+             runbook asserts each), tmux only for the tmux adapter; lms and antigravity
+             resolve without PATH. -->
         <key>PATH</key>
-        <string>__NEO_PATH__</string>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <!-- The one posture coordinate a supervisor legitimately supplies: this
              machine's Application Support root. Every other posture key comes
              from hostEdgeProfile.mjs and is asserted absent here. -->
