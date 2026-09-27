@@ -250,12 +250,12 @@ class FleetControlBridge extends Base {
 
     /**
      * @summary Create an agent. Existing ids reject so established residents can change only through
-     * scoped update authorities. A supplied `credential` (PAT) is stored encrypted Node-side and is
-     * **never** echoed back — the return is the public definition.
+     * scoped update authorities. The `credential` (PAT) every agent holds is stored encrypted
+     * Node-side and is **never** echoed back — the return is the public definition.
      * @param {Object}  definition
      * @param {String}  definition.githubUsername    The agent's GitHub username (required).
      * @param {String}  definition.harnessType       A supported harness type (required).
-     * @param {String} [definition.credential]       The GitHub PAT — stored encrypted, never returned.
+     * @param {String}  definition.credential        The GitHub PAT (required) — stored encrypted, never returned.
      * @param {String} [definition.id]               Stable id; defaults to `githubUsername`.
      * @param {Object} [definition.metadata]         Free-form non-secret metadata.
      * @param {String} [definition.modelProvider]    The agent's model-provider login; resolves via the AiConfig SSOT leaf when omitted.

@@ -154,6 +154,8 @@ jobs:
                   test/playwright/unit/ai/deriveAgentRepoPath.spec.mjs
                   test/playwright/unit/ai/services/fleet/deriveAgentInstanceHome.spec.mjs
                   test/playwright/unit/ai/planeConfig.spec.mjs
+                  test/playwright/unit/ai/FleetRegistryService.spec.mjs
+                  test/playwright/unit/ai/startAgentProvisioned.spec.mjs
 
             - name: Verify community host authority boundary
               run: >-

@@ -258,13 +258,15 @@ class FleetRegistryService extends Base {
     // ---- public API ---------------------------------------------------------
 
     /**
-     * Create an agent and, optionally, store its credential. Existing ids reject: every edit of an
-     * established resident must use a scoped authority (`configureAgent`, `setRepo`, `setAvatar`,
-     * or the Brain-only launch override), never replay this credential-bearing creation surface.
+     * Create an agent and store its credential. Every agent holds its GitHub PAT: a seat started
+     * without one runs `gh` untokened, and `gh` falls back to the machine's keyring account. Existing
+     * ids reject: every edit of an established resident must use a scoped authority
+     * (`configureAgent`, `setRepo`, `setAvatar`, or the Brain-only launch override), never replay this
+     * credential-bearing creation surface.
      * @param {Object}  opts
      * @param {String}  opts.githubUsername     The agent's GitHub username (required).
      * @param {String}  opts.harnessType        One of {@link harnessTypes} (required).
-     * @param {String} [opts.credential]        The GitHub PAT — stored Node-side encrypted; never echoed back.
+     * @param {String}  opts.credential         The GitHub PAT (required) — stored Node-side encrypted; never echoed back.
      * @param {String} [opts.id=githubUsername] Stable id; pass an explicit id to register multiple instances per user.
      * @param {Object} [opts.metadata={}]       Free-form non-secret metadata.
      * @param {String} [opts.modelProvider]     The agent's model-provider login (e.g. `openAiCompatible`, `ollama`). Resolves via the AiConfig `modelProvider` SSOT leaf when omitted — no service-local default shadow. Non-secret; carried in the public definition.
@@ -338,15 +340,11 @@ class FleetRegistryService extends Base {
             throw new Error(`FleetRegistryService.defineAgent: MCP tenant '${target.tenantId}' is already assigned to agent '${tenantAssignee}'.`)
         }
 
-        const previousCredentials = this.readCredentials();
-
-        // A process crash or failed rollback can leave a credential without its registry row.
-        // Credentialless creation MUST NOT silently adopt that orphan for a later caller. An
-        // explicit credential-bearing retry is the recovery authority: it overwrites the orphan
-        // before the public row publishes.
-        if (credential == null && Object.hasOwn(previousCredentials, agentId)) {
-            throw new Error(`FleetRegistryService.defineAgent: orphan credential exists for id '${agentId}'; credentialless creation refused. Retry with an explicit credential.`)
+        if (typeof credential !== 'string' || credential.trim() === '') {
+            throw new Error("FleetRegistryService.defineAgent: 'credential' is required — every agent holds its GitHub PAT.")
         }
+
+        const previousCredentials = this.readCredentials();
 
         const
             def        = {
@@ -363,34 +361,27 @@ class FleetRegistryService extends Base {
                 // an explicit owner is an ownership act, the fact `launchRefusalOf` keys on; the omitted
                 // default records none, so the process record stays that seat's only start gate
                 ...((options || {}).launchOwner != null ? {launchOwnerSince: now} : {}),
-                createdAt    : now,
-                updatedAt    : now
+                createdAt: now,
+                updatedAt: now
             },
             nextAgents = new Map(this.agents);
 
         nextAgents.set(agentId, def);
 
-        if (credential != null) {
-            const nextCredentials = Object.assign(Object.create(null), previousCredentials, {[agentId]: credential});
+        // Two-store create transaction: credential first, registry row last. A credential failure
+        // cannot strand an unrecoverable create-only resident. If registry publish fails, restore the
+        // prior credential snapshot. If rollback itself fails or the process dies between files, the
+        // next create for the id carries a credential of its own and overwrites the orphan.
+        this.writeCredentials(Object.assign(Object.create(null), previousCredentials, {[agentId]: credential}));
 
-            // Two-store create transaction: credential first, registry row last. A credential
-            // failure cannot strand an unrecoverable create-only resident. If registry publish
-            // fails, restore the prior credential snapshot. If rollback itself fails or the
-            // process dies between files, the orphan guard above refuses credentialless adoption;
-            // an explicit credential-bearing retry remains recoverable.
-            this.writeCredentials(nextCredentials);
-
-            try {
-                this.writeRegistry(nextAgents)
-            } catch (error) {
-                try {
-                    this.writeCredentials(previousCredentials)
-                } catch (rollbackError) {}
-
-                throw error
-            }
-        } else {
+        try {
             this.writeRegistry(nextAgents)
+        } catch (error) {
+            try {
+                this.writeCredentials(previousCredentials)
+            } catch (rollbackError) {}
+
+            throw error
         }
 
         this.agents = nextAgents;

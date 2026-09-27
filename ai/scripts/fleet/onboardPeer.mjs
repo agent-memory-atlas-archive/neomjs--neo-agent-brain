@@ -18,7 +18,8 @@ import {normalizeAgentIdentityNodeId}                 from '../../graph/normaliz
  *
  * **Phase A — before the roster merge (addressability intent):**
  *   1. `define`  — the Fleet registry agent definition (curated intent: githubUsername +
- *      harnessType + id; the raw-launch stop-line stays untouched).
+ *      harnessType + id, and the agent's GitHub PAT read from the `--credential-env` variable; the
+ *      raw-launch stop-line stays untouched).
  *   2. `repo`    — `metadata.repo` coordinates on the definition (`setRepo`), so the launch
  *      provisions the agent's own checkout.
  *   3. `roster`  — PRINT the roster-generator invocation. The roster PR + its cross-family
@@ -38,8 +39,9 @@ import {normalizeAgentIdentityNodeId}                 from '../../graph/normaliz
  *      its isolated instance home via the curated per-family template).
  *   6. `auth`      — use the long-lived lifecycle owner's auth-mode/status projection to hand off
  *      the operator step: marker families receive the exact per-home login line; GUI families sign
- *      in inside the Fleet-launched window and return to Fleet for any restart. Secrets never touch
- *      this script.
+ *      in inside the Fleet-launched window and return to Fleet for any restart. The one secret this
+ *      script carries is the agent's GitHub PAT: read from the `--credential-env` variable, handed to
+ *      `defineAgent`, never printed.
  *
  * Idempotent per segment because every underlying contract already is (definition conflicts refuse,
  * repo drift reconciles through `setRepo`, repo ensure-or-reuse, start short-circuits when running,
@@ -50,6 +52,7 @@ import {normalizeAgentIdentityNodeId}                 from '../../graph/normaliz
  * **Usage**:
  *   node ai/scripts/fleet/onboardPeer.mjs --resident-id <s> --github-username <s>
  *       --harness-type <antigravity|claude-code|claude-desktop|codex|codex-desktop> # dry-run;
+ *           [--credential-env <NAME>]                  # required for a new resident: the PAT's variable
  *           [--clone-url <s> --repo-slug <s>]          # pair required unless repo already exists
  *   node ai/scripts/fleet/onboardPeer.mjs ... --commit                          # execute phase delta
  *   node ai/scripts/fleet/onboardPeer.mjs --help
@@ -276,6 +279,8 @@ export function normalizeToken(value, label) {
  * @param {String} options.harnessType One of {@link CURATED_HARNESS_TYPES}
  * @param {String} [options.cloneUrl] Working-repo clone URL (with repoSlug ⇒ the repo segment)
  * @param {String} [options.repoSlug] Working-repo slug (e.g. 'neomjs/neo')
+ * @param {String} [options.credentialEnv] NAME of the environment variable holding the agent's GitHub
+ *     PAT. The intent carries the name only; a new agent cannot be defined without it.
  * @returns {{valid: Boolean, reason: String|null, intent: Object|null}}
  */
 export function buildOnboardingIntent(options = {}) {
@@ -291,6 +296,10 @@ export function buildOnboardingIntent(options = {}) {
 
     const hasCloneUrl = typeof options.cloneUrl === 'string' && options.cloneUrl.trim() !== '',
           hasRepoSlug = typeof options.repoSlug === 'string' && options.repoSlug.trim() !== '';
+
+    if (options.credentialEnv !== undefined && !/^[A-Z_][A-Z0-9_]*$/.test(options.credentialEnv)) {
+        return {valid: false, reason: '--credential-env takes the NAME of an environment variable (e.g. NEO_ONBOARD_PAT), never the token itself', intent: null};
+    }
 
     if (hasCloneUrl !== hasRepoSlug) {
         return {valid: false, reason: '--clone-url and --repo-slug come together or not at all (one without the other cannot provision a checkout)', intent: null};
@@ -329,10 +338,27 @@ export function buildOnboardingIntent(options = {}) {
             agentId       : resident.token,
             githubUsername: github.token,
             harnessType   : options.harnessType,
+            credentialEnv : options.credentialEnv ?? null,
             repo          : hasCloneUrl
                 ? Object.freeze({cloneUrl: options.cloneUrl.trim(), repoSlug: options.repoSlug.trim()})
                 : null
         })
+    }
+}
+
+/**
+ * @summary The registry `defineAgent` request for a new resident: the curated intent plus the PAT,
+ * read from the variable the intent names and passed straight through, never logged.
+ * @param {Object} intent A valid intent from {@link buildOnboardingIntent}
+ * @param {Object} [env=process.env] The environment the PAT is read from.
+ * @returns {{id: String, githubUsername: String, harnessType: String, credential: (String|undefined)}}
+ */
+export function defineRequestOf(intent, env = process.env) {
+    return {
+        id            : intent.agentId,
+        githubUsername: intent.githubUsername,
+        harnessType   : intent.harnessType,
+        credential    : intent.credentialEnv ? env[intent.credentialEnv] : undefined
     }
 }
 
@@ -342,7 +368,8 @@ export function buildOnboardingIntent(options = {}) {
  * tests inject them) so the planner stays side-effect-free: `agent` (the registry's public
  * definition, or null), `rosterHasResident` (the merged `origin/dev` roster),
  * `expectedParticipationStatus` (literal merged-roster status), `graphNodeSeeded` and
- * `graphParticipationStatus` (read-only graph probe; `null` reachability remains explicit), and
+ * `graphParticipationStatus` (read-only graph probe; `null` reachability remains explicit),
+ * `credentialPresent` (whether the intent's PAT variable is set, never its value), and
  * `running` / `authRequired` (lifecycle status).
  * @param {Object} options
  * @param {Object} options.intent A valid intent from {@link buildOnboardingIntent}
@@ -358,9 +385,17 @@ export function planOnboarding({intent, facts = {}} = {}) {
         statusGateRequested = Object.hasOwn(facts, 'expectedParticipationStatus');
 
     // --- Phase A segments (always evaluated: re-runs report EXISTS honestly) -----------------
-    if (!agent) {
+    // A new agent is defined with its GitHub PAT or not at all: the plan names the variable that
+    // holds it and whether it is set, never the value.
+    if (!agent && !intent.credentialEnv) {
+        push('define', 'REFUSE',
+            `fleet agent '${intent.agentId}' needs its GitHub PAT — pass --credential-env <NAME> naming the environment variable that holds it`);
+    } else if (!agent && facts.credentialPresent !== true) {
+        push('define', 'REFUSE',
+            `fleet agent '${intent.agentId}' needs its GitHub PAT — the environment variable '${intent.credentialEnv}' is unset or empty`);
+    } else if (!agent) {
         push('define', 'CREATE',
-            `fleet agent '${intent.agentId}' (githubUsername '${intent.githubUsername}', harnessType '${intent.harnessType}')`);
+            `fleet agent '${intent.agentId}' (githubUsername '${intent.githubUsername}', harnessType '${intent.harnessType}', PAT from '${intent.credentialEnv}')`);
     } else if (agent.githubUsername === intent.githubUsername && agent.harnessType === intent.harnessType) {
         push('define', 'EXISTS',
             `fleet agent '${intent.agentId}' matches githubUsername '${intent.githubUsername}' + harnessType '${intent.harnessType}'`);
@@ -582,6 +617,7 @@ export function deriveAuthHandoff({harnessType, status} = {}) {
 export function parseOnboardArgs(argv = []) {
     const valueFlags = {
         '--clone-url'      : 'cloneUrl',
+        '--credential-env' : 'credentialEnv',
         '--github-username': 'githubUsername',
         '--harness-type'   : 'harnessType',
         '--repo-slug'      : 'repoSlug',
@@ -627,11 +663,13 @@ export function parseOnboardArgs(argv = []) {
  */
 function printUsage() {
     console.log('Usage: node ai/scripts/fleet/onboardPeer.mjs --resident-id <s> --github-username <s>');
-    console.log(`           --harness-type <${CURATED_HARNESS_TYPES.join('|')}> [--clone-url <s> --repo-slug <s>] [--commit]`);
+    console.log(`           --harness-type <${CURATED_HARNESS_TYPES.join('|')}> [--credential-env <NAME>] [--clone-url <s> --repo-slug <s>] [--commit]`);
     console.log('');
-    console.log('  (no flags)  Dry-run — print the two-phase segment delta without touching anything.');
-    console.log('  --commit    Execute the CURRENT phase\'s delta through the owning fleet services.');
-    console.log('  repo pair   Required for a new resident; omission reuses an existing metadata.repo only.');
+    console.log('  (no flags)        Dry-run — print the two-phase segment delta without touching anything.');
+    console.log('  --commit          Execute the CURRENT phase\'s delta through the owning fleet services.');
+    console.log('  --credential-env  NAME of the environment variable holding the agent\'s GitHub PAT; required');
+    console.log('                    for a new resident. The token is read from the env, never from argv or printed.');
+    console.log('  repo pair         Required for a new resident; omission reuses an existing metadata.repo only.');
     console.log('');
     console.log('  There is deliberately NO --model flag (engine truth is observation-owned) and NO');
     console.log('  name flag (Social Names are the post-boot peer ritual). Identity + wake substrate');
@@ -717,6 +755,7 @@ async function main() {
         expectedParticipationStatus: rosterIdentity?.participationStatus ?? null,
         graphNodeSeeded,
         graphParticipationStatus,
+        credentialPresent          : Boolean(intent.credentialEnv && process.env[intent.credentialEnv]?.trim()),
         running                    : Boolean(runtimeRows.find(row => row.agentId === intent.agentId)?.running),
         authRequired               : null
     };
@@ -740,11 +779,7 @@ async function main() {
         if (!['CREATE', 'UPDATE'].includes(segment.action)) continue;
 
         if (segment.key === 'define' && segment.action === 'CREATE') {
-            await fleet.defineAgent({
-                id            : intent.agentId,
-                githubUsername: intent.githubUsername,
-                harnessType   : intent.harnessType
-            });
+            await fleet.defineAgent(defineRequestOf(intent));
             console.log(`  [DONE] define — '${intent.agentId}'`);
         }
 

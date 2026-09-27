@@ -13,14 +13,14 @@ setup({
     }
 });
 
-import {test, expect} from '@playwright/test';
-import Neo            from 'neo.mjs/src/Neo.mjs';
-import * as core      from 'neo.mjs/src/core/_export.mjs';
-import FleetManager   from '../../../../../../ai/services/fleet/FleetManager.mjs';
+import {test, expect}       from '@playwright/test';
+import Neo                  from 'neo.mjs/src/Neo.mjs';
+import * as core            from 'neo.mjs/src/core/_export.mjs';
+import FleetManager         from '../../../../../../ai/services/fleet/FleetManager.mjs';
 import FleetRegistryService from '../../../../../../ai/services/fleet/FleetRegistryService.mjs';
-import fs             from 'fs';
-import os             from 'os';
-import path           from 'path';
+import fs                   from 'fs';
+import os                   from 'os';
+import path                 from 'path';
 
 // FleetManager is a singleton; `lifecycleService` is a plain injectable seam (default =
 // FleetLifecycleService). Each test swaps in a stub whose getRegistry() returns a recording registry
@@ -324,7 +324,7 @@ test.describe('Neo.ai.services.fleet.FleetManager — an explicit release is sta
 
         try {
             FleetRegistryService.dataDir = tmpDir;
-            FleetRegistryService.defineAgent({githubUsername: 'born-external', harnessType: 'codex', launchOwner: 'external'});
+            FleetRegistryService.defineAgent({githubUsername: 'born-external', harnessType: 'codex', credential: 'ghp_fixture_only', launchOwner: 'external'});
             FleetManager.lifecycleService = {
                 getRegistry: () => FleetRegistryService,
                 stop       : async id => { calls.push(['stop', id]); return {success: true, id, state: 'stopped'}; }
