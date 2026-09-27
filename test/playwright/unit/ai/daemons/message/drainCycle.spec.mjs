@@ -76,6 +76,39 @@ test.describe('Neo.ai.daemons.message.drainCycle', () => {
         expect(calls, 'past the interval it runs again').toHaveLength(2);
     });
 
+    test('clean passes are silent but counted: the digest folds every pass since the last digest, and a stamped cohort counts as a change', async () => {
+        const
+            logs      = [],
+            clock     = {now: 10_000},
+            summaries = [
+                {scanned: 3, intact: 3, repaired: 0, failed: 0, cohortStamped: 0, deferredCandidateCount: 0},
+                {scanned: 3, intact: 3, repaired: 0, failed: 0, cohortStamped: 0, deferredCandidateCount: 2},
+                {scanned: 3, intact: 2, repaired: 0, failed: 0, cohortStamped: 1, deferredCandidateCount: 0}
+            ],
+            hook      = createMessageGraphIntegrityRepairCadence({
+                async repairMessageGraphIntegrity() {
+                    return summaries.shift()
+                }
+            }, {intervalMs: 100, digestMs: 1_000, now: () => clock.now, log: (level, message) => logs.push(`${level} ${message}`)});
+
+        await hook({drained: 0});
+        expect(logs, 'the first pass is logged even when clean — the boot receipt').toHaveLength(1);
+
+        clock.now += 100;
+        await hook({drained: 0});
+        expect(logs, 'a deferred-only pass past the first is silent').toHaveLength(1);
+        expect(hook.getDigest(), 'but counted').toMatchObject({passes: 2, clean: 2, changed: 0, deferred: 2});
+
+        clock.now += 900;
+        await hook({drained: 0});
+        expect(logs, 'a stamped cohort is a change, and the hour is up').toHaveLength(3);
+        expect(logs[1]).toContain('"cohortStamped":1');
+        expect(logs[2]).toMatch(/^INFO Message graph integrity repair digest: /);
+        expect(JSON.parse(logs[2].replace(/^INFO Message graph integrity repair digest: /, '')))
+            .toMatchObject({passes: 3, clean: 2, changed: 1, errors: 0, scanned: 9, cohortStamped: 1, deferred: 2, sinceAt: 10_000, untilAt: 11_000});
+        expect(hook.getDigest(), 'a fresh digest starts at the line').toMatchObject({sinceAt: 11_000, passes: 0});
+    });
+
     test('the loop host runs the after-cycle hook once per completed cycle', async () => {
         const summaries = [];
         const loop      = startMessageDrainLoop({
