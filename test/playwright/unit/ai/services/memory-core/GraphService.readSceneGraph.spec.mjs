@@ -133,7 +133,7 @@ test.describe('GraphService.readSceneGraph — the whole graph one viewer may se
         const answer = await GraphService.readSceneGraph({maxEdges: 1});
 
         expect(rowsOf(answer).edges).toEqual(['shared-a -REL-> own-x']);
-        expect(answer.counts.nodes).toBe(5);
+        expect(answer.counts, 'unlinked counts the answer: the nodes no answered edge names').toEqual({nodes: 5, edges: 1, unlinked: 3});
         expect(answer.truncated).toEqual({nodes: false, edges: true})
     });
 

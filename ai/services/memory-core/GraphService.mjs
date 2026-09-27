@@ -1333,8 +1333,8 @@ class GraphService extends Base {
      * One pass per table under the SQL RLS clause of {@link GraphService#listNodeRecordsByType}, with the
      * `isRlsVisible` recheck at the return boundary. A node carries its id, kind and label, never its
      * property bag. An edge counts only when both endpoints are visible, and parallel edges of one type
-     * collapse to one. `counts.unlinked` names the answered nodes without such an edge, which a view drawn
-     * by relations may want to place apart.
+     * collapse to one. `counts.unlinked` names the answered nodes without an answered edge, which a view
+     * drawn by relations may want to place apart.
      *
      * A budget keeps the best-connected nodes (degree, then id), so the unlinked go first, and the edges
      * among them. `truncated` names a budget cut only: a row the viewer may not see is absent, not cut.
@@ -1432,12 +1432,14 @@ class GraphService extends Base {
             kinds      = dictionary(),
             types      = dictionary(),
             position   = new Map(nodes.map((node, index) => [node.id, index])),
-            flat       = new Array(edges.length * 3);
+            flat       = new Array(edges.length * 3),
+            linked     = new Set();
 
         edges.forEach(({source, target, type}, index) => {
             flat[index * 3]     = position.get(source);
             flat[index * 3 + 1] = position.get(target);
-            flat[index * 3 + 2] = types.code(type)
+            flat[index * 3 + 2] = types.code(type);
+            linked.add(source).add(target)
         });
 
         return {
@@ -1449,7 +1451,7 @@ class GraphService extends Base {
                 labels: nodes.map(node => node.label)
             },
             edges    : flat,
-            counts   : {nodes: nodes.length, edges: edges.length, unlinked: nodes.filter(node => !degree.has(node.id)).length},
+            counts   : {nodes: nodes.length, edges: edges.length, unlinked: nodes.length - linked.size},
             budget,
             truncated: {nodes: nodes.length < visible.size, edges: edges.length < links.size}
         };

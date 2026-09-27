@@ -194,12 +194,24 @@ test.describe('fleetGraphSceneSource — pure projection', () => {
         expect(trimmed.edges, 'the last edge goes first').toEqual(whole.edges.slice(0, 1));
         expect(trimmed.nodes).toEqual(whole.nodes);
         expect(trimmed.completeness).toBe('truncated');
-        expect(trimmed.counts.edges).toBe(1);
+        expect(trimmed.counts, 'the node that lost its only edge counts as unlinked in the scene it arrives in')
+            .toEqual({nodes: 3, edges: 1, seeds: 0, unlinked: 1});
         expect(Buffer.byteLength(JSON.stringify(trimmed))).toBeLessThanOrEqual(budget);
 
         expect(starved.edges, 'nodes go only once no edge is left').toEqual([]);
         expect(starved.nodes.length).toBeLessThan(whole.nodes.length);
         expect(Buffer.byteLength(JSON.stringify(starved))).toBeLessThanOrEqual(300)
+    });
+
+    test('after a byte cut the counts still describe the scene: unlinked never exceeds the nodes left', () => {
+        const
+            files = ['a', 'b', 'c', 'd'].map(id => ({id: `file-${id}`, kind: 'FILE', label: id})),
+            whole = projectScene({graph: answerOf(files, [])}),
+            cut   = projectScene({graph: answerOf(files, []), maxBytes: 300});
+
+        expect(whole.counts).toEqual({nodes: 4, edges: 0, seeds: 0, unlinked: 4});
+        expect(cut.nodes.length).toBeLessThan(4);
+        expect(cut.counts).toEqual({nodes: cut.nodes.length, edges: 0, seeds: 0, unlinked: cut.nodes.length})
     });
 });
 

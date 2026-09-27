@@ -58,6 +58,19 @@ export function qualifyNodeId(id, origin = DEFAULT_ORIGIN) {
 }
 
 /**
+ * @summary Count what a scene holds, in place, so its counts never disagree with its lists: the nodes, the
+ * edges, and the nodes that no edge in the scene names.
+ * @param {Object} scene
+ */
+function countScene(scene) {
+    const linked = new Set();
+
+    scene.edges.forEach(({from, to}) => linked.add(from).add(to));
+
+    Object.assign(scene.counts, {nodes: scene.nodes.length, edges: scene.edges.length, unlinked: scene.nodes.length - linked.size})
+}
+
+/**
  * @summary Hold a scene to its byte budget, in place. Edges go first, then nodes, from the end of the sorted
  * lists, so the cut is deterministic; nodes only go once no edge is left to name them. A cut is a budget cut.
  * @param {Object} scene
@@ -76,15 +89,13 @@ function trimToBytes(scene, maxBytes) {
     while (over > 0 && scene.edges.length) over -= size(scene.edges.pop()) + 1;
     while (over > 0 && scene.nodes.length) over -= size(scene.nodes.pop()) + 1;
 
-    scene.counts.nodes  = scene.nodes.length;
-    scene.counts.edges  = scene.edges.length;
-    scene.completeness  = 'truncated';
+    countScene(scene);
+    scene.completeness = 'truncated';
 
     // the comma estimate is one byte generous for the last entry of a list: settle on the measured size
     while (size(scene) > maxBytes && (scene.edges.length || scene.nodes.length)) {
         scene.edges.length ? scene.edges.pop() : scene.nodes.pop();
-        scene.counts.nodes = scene.nodes.length;
-        scene.counts.edges = scene.edges.length
+        countScene(scene)
     }
 }
 
@@ -129,11 +140,12 @@ export function projectScene({graph, route = [], maxBytes = DEFAULT_MAX_BYTES, o
         route,
         nodes,
         edges,
-        counts      : {nodes: nodes.length, edges: edges.length, seeds: route.length, unlinked: graph.counts?.unlinked ?? 0},
+        counts      : {nodes: 0, edges: 0, seeds: route.length, unlinked: 0},
         budget      : {maxNodes: graph.budget?.maxNodes ?? null, maxEdges: graph.budget?.maxEdges ?? null, maxBytes},
         completeness: graph.truncated?.nodes || graph.truncated?.edges ? 'truncated' : 'complete'
     };
 
+    countScene(scene);
     trimToBytes(scene, maxBytes);
 
     return scene
