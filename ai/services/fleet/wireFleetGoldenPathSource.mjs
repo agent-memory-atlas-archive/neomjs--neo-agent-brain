@@ -7,9 +7,11 @@ import {createFleetGoldenPathSource} from './fleetGoldenPathSource.mjs';
  * server entry. Both operations are resolved at that use site through the same operation
  * boundary the tasks source rides (the `wireFleetTasksSource` shape): the route and its admission
  * from the Memory Core's `get_computed_route`, the REM state from `get_rem_pipeline_state`. This
- * wiring imports neither MCP tool service nor request context, and a caller that cannot resolve
- * its operations leaves the slot unwired, so the bridge keeps answering its honest `unavailable`
- * default instead of a fabricated route.
+ * wiring also accepts the independent human-readable handoff via `get_sandman_handoff`, imports
+ * neither MCP tool service nor request context, and a caller that cannot resolve the required route
+ * and REM operations leaves the slot unwired, so the bridge keeps answering its honest
+ * `unavailable` default instead of a fabricated route. An absent handoff operation degrades only
+ * that added axis, preserving existing callers.
  */
 
 /**
@@ -17,6 +19,7 @@ import {createFleetGoldenPathSource} from './fleetGoldenPathSource.mjs';
  * @param {Object} options
  * @param {Function} options.getComputedRoute
  * @param {Function} options.getRemPipelineState
+ * @param {Function} [options.getSandmanHandoff]
  * @param {Function} [options.now]
  * @param {Object} [options.bridge=FleetControlBridge]
  * @param {Function} [options.createSource=createFleetGoldenPathSource]
@@ -25,6 +28,7 @@ import {createFleetGoldenPathSource} from './fleetGoldenPathSource.mjs';
 export function wireFleetGoldenPathSource({
     getComputedRoute,
     getRemPipelineState,
+    getSandmanHandoff,
     now,
     bridge       = FleetControlBridge,
     createSource = createFleetGoldenPathSource
@@ -36,6 +40,7 @@ export function wireFleetGoldenPathSource({
     bridge.goldenPathSource = createSource({
         getComputedRoute,
         getRemPipelineState,
+        ...(typeof getSandmanHandoff === 'function' ? {getSandmanHandoff} : {}),
         ...(now ? {now} : {})
     });
 
