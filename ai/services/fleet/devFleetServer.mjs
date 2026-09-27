@@ -64,6 +64,7 @@ import {createPlaneWakeIdentitiesReader,
 import {createFleetWakeSseConsumer}       from './fleetWakeSseConsumer.mjs';
 import {createPlaneWhoIsOnlineReader}     from './planeWhoIsOnlineReader.mjs';
 import {createPlaneDeploymentStateReader} from './planeDeploymentStateReader.mjs';
+import {createPlanePrLaneActivityReader}  from './planePrLaneActivityReader.mjs';
 import {readActiveWakeSubscriptionIdentities,
         readActiveWakeSubscriptionObservations}                          from '../memory-core/readActiveWakeSubscriptionIdentities.mjs';
 import {createTerminalDeliveryFailuresFileReader, resolveDaemonLiveness} from './fleetWakeStateAdapter.mjs';
@@ -300,14 +301,13 @@ async function boot() {
     // events (opens/reviews/merges) alongside issues + lane-claims + stall. Fail-soft: an unavailable
     // singleton leaves activitySource unwired.
     if (planeClient) {
-        // Plane mode: both seams ride the verified client — no in-process memory-core spin-up at
-        // all (opening the host graph/mailbox is the split-brain read this mode exists to end).
-        // The PR/lane slot's OPTIONAL graphService is deliberately absent: its stall
-        // defer-disposition degrades per that slot's own fail-soft contract while issues/pulls
-        // keep reading the git-synced local trees (correctly host-local, ticket Out of Scope).
+        // Plane mode: every seam rides the verified client — no in-process memory-core spin-up at
+        // all (opening the host graph/mailbox is the split-brain read this mode exists to end). The
+        // PR/lane slot too: this process has no corpus, so the plane serves the slot from the corpus
+        // its orchestrator materializes (`get_pr_lane_activity`), stall findings included.
         wireFleetActivityReadSource({
-            contentRoot : AiConfig.fleet.contentRoot,
-            listMessages: args => planeClient.listMessages(args)
+            listMessages: args => planeClient.listMessages(args),
+            readPrLane  : createPlanePrLaneActivityReader(planeClient)
         });
 
         wireOperatorComposeWriter({

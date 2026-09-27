@@ -113,6 +113,7 @@ jobs:
                   test/playwright/unit/ai/services/fleet/wireFleetActivityReadSource.spec.mjs
                   test/playwright/unit/ai/services/fleet/wireDeploymentStateReadSource.spec.mjs
                   test/playwright/unit/ai/services/fleet/planeDeploymentStateReader.spec.mjs
+                  test/playwright/unit/ai/services/fleet/planePrLaneActivityReader.spec.mjs
                   test/playwright/unit/ai/services/graph/readSyncedPullRecords.spec.mjs
                   test/playwright/unit/ai/services/graph/readWorkGraphIssueRecords.spec.mjs
                   test/playwright/unit/ai/daemons/orchestrator/scheduling/heavyMaintenanceStarvationWatchdog.spec.mjs
@@ -150,6 +151,7 @@ jobs:
                   test/playwright/unit/ai/daemons/wake/localWakeAdapters.spec.mjs
                   test/playwright/unit/ai/daemons/wake/opencodeSeatEnvelopeParity.spec.mjs
                   test/playwright/unit/ai/services/memory-core/helpers/computedRouteStore.spec.mjs
+                  test/playwright/unit/ai/services/memory-core/helpers/prLaneActivityStore.spec.mjs
                   test/playwright/unit/ai/FleetLifecycleService.spec.mjs
                   test/playwright/unit/ai/deriveAgentRepoPath.spec.mjs
                   test/playwright/unit/ai/services/fleet/deriveAgentInstanceHome.spec.mjs

@@ -49,6 +49,21 @@ test.describe('Neo.ai.services.fleet.wireFleetActivityReadSource', () => {
         expect(captured.limit).toBe(25);
     });
 
+    test('an injected readPrLane IS the PR/lane slot — plane mode reads the plane, and the content root is never read', () => {
+        const readPrLane = async () => ({capability: {state: 'wired'}, counts: [], events: []});
+        let   captured   = null;
+
+        const result = wireFleetActivityReadSource({
+            contentRoot : '/a/tree/this/process/does/not/have',
+            readPrLane,
+            bridge      : stubBridge(),
+            createSource: opts => { captured = opts; return {readActivitySnapshot() {}} }
+        });
+
+        expect(result).not.toBeNull();
+        expect(captured.readPrLaneSnapshot).toBe(readPrLane)
+    });
+
     test('an ABSENT slot source degrades honestly — its reader throws (contained by the composer), never a fabricated read', async () => {
         // Only the PR/lane source is present; the A2A slot has no listMessages.
         let captured = null;

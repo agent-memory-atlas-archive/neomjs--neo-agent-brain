@@ -340,6 +340,11 @@ services:
       # READ half of the REM run-state channel: `get_rem_pipeline_state` lists the orchestrator's
       # cycle receipts from here. Read-only on purpose: this service never authors a cycle.
       - shared-rem-runs-data:/app/.neo-ai-data/rem-runs:ro
+      # READ half of the corpus the orchestrator materializes: `get_pr_lane_activity` serves the Fleet's
+      # PR/lane slot from `orchestrator.corpusProjection.materializedRoot`, which resolves beneath this
+      # mount. The whole state directory, read-only: the projector swaps the tree in by rename, and a
+      # bind of the tree alone would keep the renamed-away copy. This service writes nothing here.
+      - orchestrator-state:/app/.neo-ai-data/orchestrator-daemon:ro
       # Read-only half of the orchestrator -> public MCP deployment-state bridge, and the mount the
       # recovery actuator publishes its config overlay onto.
       - shared-deployment-state-data:/app/.neo-ai-data/deployment-state:ro
