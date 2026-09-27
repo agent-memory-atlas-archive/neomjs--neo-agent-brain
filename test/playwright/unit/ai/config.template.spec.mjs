@@ -453,7 +453,7 @@ test.describe('Tier 1 Config Immutability', () => {
             readConcurrency            : 8,
             fullRematerializeIntervalMs: 7 * 24 * 60 * 60 * 1000,
             mirrorRoot                 : path.resolve(Config.orchestrator.dataDir, 'core-corpus-mirror'),
-            materializedRoot           : path.resolve(Config.orchestrator.dataDir, 'core-corpus-materialized'),
+            materializedRoot           : path.resolve(path.dirname(Config.orchestrator.deploymentStateBridge.snapshotPath), 'core-corpus-materialized'),
             receiptPath                : path.resolve(
                 path.dirname(Config.orchestrator.deploymentStateBridge.snapshotPath),
                 'core-corpus-projection.json'
