@@ -31,6 +31,7 @@ import {
 } from '../../../services/memory-core/helpers/nlTransactionArchiveStore.mjs';
 import {readSandmanHandoff}              from '../../../services/memory-core/helpers/sandmanHandoffStore.mjs';
 import {readComputedRoute}               from '../../../services/memory-core/helpers/computedRouteStore.mjs';
+import {createPrLaneActivityStore}       from '../../../services/memory-core/helpers/prLaneActivityStore.mjs';
 import {COMPUTED_ROUTE_SIDECAR_FILENAME} from '../../../services/graph/computedRouteResult.mjs';
 import {exploreLaneLandscape}            from '../../../services/graph/exploreLaneLandscape.mjs';
 import {exploreMemoryHistory}            from '../../../services/memory-core/helpers/exploreMemoryHistory.mjs';
@@ -114,6 +115,22 @@ const readComputedRouteTool = () => readComputedRoute({
     receiptPath      : AiConfig.orchestrator.corpusProjection.receiptPath,
     sourceRepository : AiConfig.orchestrator.corpusProjection.sourceRepository,
     sourceRef        : AiConfig.orchestrator.corpusProjection.sourceRef
+});
+
+const prLaneActivityStore = createPrLaneActivityStore();
+
+/**
+ * @summary Serves the Fleet activity feed's PR/lane slot from the corpus the orchestrator materializes —
+ * the plane's answer for a Fleet that carries no corpus of its own. The root leaf is read here, at the
+ * use site, and handed on as a value.
+ * @param {Object} [args]
+ * @param {Number} [args.limit] Maximum events; the slot's default when omitted.
+ * @returns {Promise<Object>} `{capability, counts, events, corpusIndexedAt}`
+ */
+const readPrLaneActivityTool = args => prLaneActivityStore.read({
+    root        : AiConfig.orchestrator.corpusProjection.materializedRoot,
+    graphService: GraphService,
+    limit       : args?.limit
 });
 
 // `explore_memory_history` — the Memory/session temporal Bird View runtime op. The pure composition
@@ -574,6 +591,7 @@ const serviceMapping = {
     inspect_deployment           : inspectDeployment,
     get_sandman_handoff          : readSandmanHandoffTool,
     get_computed_route           : readComputedRouteTool,
+    get_pr_lane_activity         : readPrLaneActivityTool,
     mark_read                    : MailboxService         .markRead                .bind(MailboxService),
     archive_message              : MailboxService         .archiveMessage          .bind(MailboxService),
     delete_message               : MailboxService         .deleteMessage           .bind(MailboxService),

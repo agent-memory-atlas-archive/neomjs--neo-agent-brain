@@ -511,6 +511,36 @@ paths:
               schema:
                 type: object
 
+  /fleet/pr-lane-activity:
+    post:
+      summary: Get PR Lane Activity
+      operationId: get_pr_lane_activity
+      x-neo-tool-tier: read
+      x-pass-as-object: true
+      x-annotations:
+        readOnlyHint: true
+      x-neo-tool-summary: Read the Fleet activity feed's PR/lane slot from the corpus the orchestrator materializes.
+      description: Serves the Fleet activity feed's PR/lane slot (PR, issue, lane-claim and stall-finding events) from the corpus the orchestrator materializes (`orchestrator.corpusProjection.materializedRoot`), for a Fleet attached to this plane that carries no corpus of its own. Returns the slot's own snapshot `{capability, counts, events, corpusIndexedAt}` with at most `limit` events. `capability.state` is `wired`, or `degraded` with the reader's reason when the tree is absent, mid-swap or unreadable — never an empty success. The tree is read once per materialization (`_index.json` write), not per call. Read-only, team-visible.
+      tags: [Diagnostics]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                limit:
+                  type: integer
+                  minimum: 1
+                  description: Maximum events to return; the slot's default when omitted.
+      responses:
+        '200':
+          description: The PR/lane activity snapshot, or a degraded one naming the failure.
+          content:
+            application/json:
+              schema:
+                type: object
+
   /rem/pipeline-state:
     post:
       summary: Get REM Pipeline State

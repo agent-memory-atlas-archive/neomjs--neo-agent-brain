@@ -2697,9 +2697,12 @@ class ConfigBase extends ConfigProvider {
             'orchestrator.corpusProjection.mirrorRoot': data =>
                 data.orchestrator.corpusProjection.mirrorRootOverride ??
                 path.resolve(data.orchestrator.dataDir, 'core-corpus-mirror'),
+            // Beside the receipt on the deployment-state bridge, never in the orchestrator's sole-owner
+            // state directory: Memory Core serves the Fleet's PR/lane slot from this tree, and the
+            // projector's rename swap stays inside one volume.
             'orchestrator.corpusProjection.materializedRoot': data =>
                 data.orchestrator.corpusProjection.materializedRootOverride ??
-                path.resolve(data.orchestrator.dataDir, 'core-corpus-materialized'),
+                path.resolve(path.dirname(data.orchestrator.deploymentStateBridge.snapshotPath), 'core-corpus-materialized'),
             'orchestrator.corpusProjection.receiptPath': data =>
                 data.orchestrator.corpusProjection.receiptPathOverride ??
                 path.resolve(path.dirname(data.orchestrator.deploymentStateBridge.snapshotPath), 'core-corpus-projection.json'),

@@ -1,13 +1,9 @@
-import path                                from 'node:path';
-import FleetControlBridge                  from './FleetControlBridge.mjs';
-import {createFleetActivityReadSource}     from './fleetActivityComposer.mjs';
-import {readFleetA2AActivitySnapshot}      from './fleetA2AActivityAdapter.mjs';
-import {createFleetPrLaneActivitySnapshot} from './fleetPrLaneActivityAdapter.mjs';
-import {resolveContentOrigins}             from '../graph/contentOrigins.mjs';
-import {CORPUS_PROJECTION_ORIGIN}          from '../graph/corpusProjectionContract.mjs';
-import {buildWorkGraphStallFindings,
-        readSyncedPullRecords,
-        readWorkGraphIssueRecords}           from '../graph/issueFocusSections.mjs';
+import FleetControlBridge              from './FleetControlBridge.mjs';
+import {createFleetActivityReadSource} from './fleetActivityComposer.mjs';
+import {readFleetA2AActivitySnapshot}  from './fleetA2AActivityAdapter.mjs';
+import {makeReadPrLaneSnapshot}        from './readPrLaneActivitySnapshot.mjs';
+import {resolveContentOrigins}         from '../graph/contentOrigins.mjs';
+import {CORPUS_PROJECTION_ORIGIN}      from '../graph/corpusProjectionContract.mjs';
 
 /**
  * @module ai/services/fleet/wireFleetActivityReadSource
@@ -26,10 +22,10 @@ import {buildWorkGraphStallFindings,
  *  - **A2A** — `readFleetA2AActivitySnapshot` over the **injected** `listMessages`. The caller binds
  *    the `MailboxService` singleton (lazily imported at the entry, like `readActiveWakeSubscriptionIdentities`
  *    binds `GraphService`); this module never imports it, so identity/permission binding stays at the boundary.
- *  - **PR/lane** — the *pure builder* `createFleetPrLaneActivitySnapshot` over facts THIS module reads:
- *    local-synced issue records (`readWorkGraphIssueRecords` — the same records the stall inference walks,
- *    so the two stay graph-consistent) + work-graph stall findings (`buildWorkGraphStallFindings`) +
- *    injected PR payloads. The reading is the substantive work of this leaf, not a passthrough.
+ *  - **PR/lane** — `makeReadPrLaneSnapshot` over the origins resolved under the caller's content root
+ *    (synced issue + pull records, work-graph stall findings, the pure builder), or an **injected**
+ *    `readPrLane` in its place: a Fleet attached to a plane has no corpus of its own, so its reader is
+ *    the plane's `get_pr_lane_activity` (`planePrLaneActivityReader`), the same slot served remotely.
  *
  * @see ai/services/fleet/wireBootIdentityReadSource.mjs — the wire-shape precedent
  * @see ai/services/memory-core/readActiveWakeSubscriptionIdentities.mjs — the lazy-singleton cross-process precedent
@@ -45,63 +41,6 @@ import {buildWorkGraphStallFindings,
  */
 function makeReadA2ASnapshot(listMessages) {
     return params => readFleetA2AActivitySnapshot({listMessages, limit: params.limit})
-}
-
-/**
- * @summary The PR/lane slot reader — reads local-synced issue + pull records per origin, plus the
- * work-graph stall findings for the Graph's origin, then hands them to the pure builder.
- *
- * Every origin is read inside its own containment: one unreadable origin degrades the slot naming
- * that origin while the rows of the others are kept (the builder's `partialFailures` path), and only
- * when no origin at all could be read does the slot take the builder's `error` path. The readers
- * receive the origin and answer origin-qualified records, so the builder keys them apart. Stall inference joins
- * the Native Edge Graph by bare `issue-N`, and the Graph carries ONE origin by contract
- * (`CORPUS_PROJECTION_ORIGIN`) — a foreign origin's number would join a stranger's node — so only
- * the Graph's origin is inferred; the others contribute PR, issue and lane-claim rows.
- * @param {Object} options
- * @param {Array<{repoSlug: String, issuesDir: String, pullsDir?: String}>} options.origins Resolved origins.
- * @param {Object} [options.graphService] memory-core GraphService for stall-finding defer disposition.
- * @returns {Function} `params => Promise<{capability, events}>`
- * @private
- */
-function makeReadPrLaneSnapshot({origins, graphService}) {
-    return async params => {
-        const capturedAt    = new Date(),
-              prs           = [],
-              issues        = [],
-              stallFindings = [],
-              failures      = [];
-
-        for (const origin of origins) {
-            try {
-                // The readers own the identity: with `origin` every record carries `repoSlug` and an
-                // origin-qualified id, so the same number from two repositories is two records here,
-                // not only two events downstream.
-                const originPrs = (typeof origin.pullsDir === 'string' && origin.pullsDir.length > 0)
-                          ? readSyncedPullRecords(origin.pullsDir, {limit: params.limit, origin: origin.repoSlug})
-                          : [],
-                      originIssues = readWorkGraphIssueRecords(origin.issuesDir, {origin: origin.repoSlug});
-
-                prs.push(...originPrs);
-                issues.push(...originIssues);
-
-                if (origin.repoSlug === CORPUS_PROJECTION_ORIGIN) {
-                    stallFindings.push(...buildWorkGraphStallFindings({issuesDir: origin.issuesDir, prs: originPrs, now: capturedAt, graphService})
-                        .map(finding => ({...finding, subject: finding.subject ? {...finding.subject, repoSlug: origin.repoSlug} : finding.subject})))
-                }
-            } catch (error) {
-                // Contained per origin — an unreadable tree names its origin, never the whole slot,
-                // unless it was the only origin there was.
-                failures.push(`${origin.repoSlug}: ${error?.message ?? error}`)
-            }
-        }
-
-        if (failures.length === origins.length) {
-            return createFleetPrLaneActivitySnapshot({error: failures.join(' · '), limit: params.limit, capturedAt})
-        }
-
-        return createFleetPrLaneActivitySnapshot({prs, issues, stallFindings, partialFailures: failures, limit: params.limit, capturedAt})
-    }
 }
 
 /**
@@ -123,6 +62,8 @@ function makeReadPrLaneSnapshot({origins, graphService}) {
  *     (injected; the caller lazily imports the singleton).
  * @param {String} [options.pullsDir] Local synced pulls directory of the Graph's origin, read at the
  *     caller's use site. Absent → the PR/lane slot emits no pr-activity events (honest-empty).
+ * @param {Function} [options.readPrLane] A PR/lane slot reader in place of a local tree (plane mode:
+ *     `planePrLaneActivityReader`); with one, no content root is read.
  * @param {Number} [options.limit] Default event bound forwarded to the composer.
  * @param {Object} [options.bridge=FleetControlBridge] The control bridge to wire (a stub in specs).
  * @param {Function} [options.createSource=createFleetActivityReadSource] The composer factory (injected in specs).
@@ -134,16 +75,18 @@ export function wireFleetActivityReadSource({
     listMessages,
     graphService,
     pullsDir,
+    readPrLane,
     limit,
     bridge       = FleetControlBridge,
     createSource = createFleetActivityReadSource
 } = {}) {
-    const origins = typeof contentRoot === 'string' && contentRoot.length > 0
-        ? resolveContentOrigins(contentRoot)
-        : (typeof issuesDir === 'string' && issuesDir.length > 0 ? [{repoSlug: CORPUS_PROJECTION_ORIGIN, issuesDir, pullsDir}] : []);
+    const injected = typeof readPrLane === 'function',
+          origins  = injected ? [] : typeof contentRoot === 'string' && contentRoot.length > 0
+              ? resolveContentOrigins(contentRoot)
+              : (typeof issuesDir === 'string' && issuesDir.length > 0 ? [{repoSlug: CORPUS_PROJECTION_ORIGIN, issuesDir, pullsDir}] : []);
 
     const hasA2A    = typeof listMessages === 'function',
-          hasPrLane = origins.length > 0;
+          hasPrLane = injected || origins.length > 0;
 
     // No readable slot at all → leave the seam unwired (honest not-wired), never fabricate a source.
     if (!hasA2A && !hasPrLane) {
@@ -156,7 +99,7 @@ export function wireFleetActivityReadSource({
         ? makeReadA2ASnapshot(listMessages)
         : () => { throw new Error('a2a activity source not wired — no listMessages bound') };
 
-    const readPrLaneSnapshot = hasPrLane
+    const readPrLaneSnapshot = injected ? readPrLane : hasPrLane
         ? makeReadPrLaneSnapshot({origins, graphService})
         : () => { throw new Error('pr-lane activity source not wired — no contentRoot or issuesDir') };
 
