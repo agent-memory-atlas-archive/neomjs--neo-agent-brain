@@ -134,6 +134,9 @@ jobs:
                   test/playwright/unit/ai/services/ingestion/IssueIngestor.spec.mjs
                   test/playwright/unit/ai/services/memory-core/FileSystemIngestor.spec.mjs
                   test/playwright/unit/ai/services/fleet/fleetServer.spec.mjs
+                  test/playwright/unit/ai/services/fleet/FleetRegistryService.spec.mjs
+                  test/playwright/unit/ai/services/fleet/FleetManager.spec.mjs
+                  test/playwright/unit/ai/services/fleet/FleetControlBridge.spec.mjs
                   test/playwright/unit/ai/services/fleet/opencodeWakeEnvelopePlugin.spec.mjs
                   test/playwright/unit/ai/daemons/wake/localWakeAdapters.spec.mjs
                   test/playwright/unit/ai/daemons/wake/opencodeSeatEnvelopeParity.spec.mjs

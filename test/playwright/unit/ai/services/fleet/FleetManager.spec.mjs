@@ -17,6 +17,10 @@ import {test, expect} from '@playwright/test';
 import Neo            from 'neo.mjs/src/Neo.mjs';
 import * as core      from 'neo.mjs/src/core/_export.mjs';
 import FleetManager   from '../../../../../../ai/services/fleet/FleetManager.mjs';
+import FleetRegistryService from '../../../../../../ai/services/fleet/FleetRegistryService.mjs';
+import fs             from 'fs';
+import os             from 'os';
+import path           from 'path';
 
 // FleetManager is a singleton; `lifecycleService` is a plain injectable seam (default =
 // FleetLifecycleService). Each test swaps in a stub whose getRegistry() returns a recording registry
@@ -311,6 +315,36 @@ test.describe('Neo.ai.services.fleet.FleetManager — an explicit release is sta
         await FleetManager.startAgent('ghost');
 
         expect(calls).toEqual([['start', 'default'], ['stop', 'adopted'], ['start', 'adopted'], ['start', 'ghost']]);
+    });
+
+    test('a seat CREATED external — the roster pilot\'s row — is refused by the real registry before anything is spawned, and an adoption lifts it', async () => {
+        const
+            tmpDir       = fs.mkdtempSync(path.join(os.tmpdir(), 'neo-fleet-manager-born-')),
+            priorDataDir = FleetRegistryService.dataDir;
+
+        try {
+            FleetRegistryService.dataDir = tmpDir;
+            FleetRegistryService.defineAgent({githubUsername: 'born-external', harnessType: 'codex', launchOwner: 'external'});
+            FleetManager.lifecycleService = {
+                getRegistry: () => FleetRegistryService,
+                stop       : async id => { calls.push(['stop', id]); return {success: true, id, state: 'stopped'}; }
+            };
+
+            await expect(FleetManager.startAgent('born-external'))
+                .rejects.toThrow("FleetManager.startAgent: agent 'born-external' was released to its own harness: adopt it to start it here.");
+            expect(calls).toEqual([]);
+
+            FleetRegistryService.setLaunchOwner('born-external', 'fleet');
+            await FleetManager.startAgent('born-external');
+            expect(calls).toEqual([['start', 'born-external']])
+        } finally {
+            // The registry is a singleton: hand its root back before the directory goes, or
+            // `ensureLoaded` keeps serving this arm's row to a later case from a deleted root.
+            FleetRegistryService.dataDir = priorDataDir;
+            fs.rmSync(tmpDir, {recursive: true, force: true})
+        }
+
+        expect(FleetRegistryService.getAgent('born-external'), 'a fresh read on the restored root no longer sees the row').toBeNull()
     });
 });
 
