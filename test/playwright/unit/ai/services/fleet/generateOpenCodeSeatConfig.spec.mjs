@@ -1,9 +1,18 @@
 import {expect, test}                                      from '@playwright/test';
 import {createHash}                                        from 'node:crypto';
-import {OPENCODE_SEAT_SERVERS, generateOpenCodeSeatConfig} from '../../../../../../ai/services/fleet/generateOpenCodeSeatConfig.mjs';
+import {existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync} from 'node:fs';
+import {tmpdir}                                           from 'node:os';
+import {dirname, join}                                    from 'node:path';
 
-// Pure function — imported directly (no fs / spawn / env / Neo runtime), so the suite has no
-// host-runtime side effects and each case is fully isolated. Mirrors deriveHarnessLaunchSpec.spec.
+const PLANT_SOURCE  = '../../../../../../ai/services/fleet/opencodeWakeEnvelopePlugin.mjs';
+import {OPENCODE_SEAT_SERVERS, generateOpenCodeSeatConfig, isUnmodifiedGeneration, stampWakeEnvelopePlant} from '../../../../../../ai/services/fleet/generateOpenCodeSeatConfig.mjs';
+
+// Imported directly — no Neo runtime — so the suite has no host side effects and each case is
+// isolated. NOT fs-free or env-free, and the header no longer claims to be: the generator reads ONE
+// file from its own package at module load (the plant source it must emit byte-identically), and the
+// caller's-env arm below deliberately deletes `XDG_*` from `process.env` to reproduce the production
+// launcher's shape. That read is intra-package and per-seat-path-free; it is documented on the
+// generator's module JSDoc. Mirrors deriveHarnessLaunchSpec.spec.
 
 const PARAMS = {
     agentosRuntimeRoot: '/agentos/runtime',
@@ -102,7 +111,14 @@ test.describe('generateOpenCodeSeatConfig (OpenCode seat scaffold emission)', ()
         // hook content is precisely what this digest exists to surface, so it is bumped, not relaxed.
         // Bumped 2026-08-24: AgentOS runtime and target-repository roots became explicit, and Neural
         // Link's package cwd moved to the runtime authority.
-        expect(digest).toBe('bea77518dd1af0f6603c1ab794a7f71a8e8a34914dde9275664e47504bde4f6c')
+        // Bumped 2026-09-27: the hook stopped carrying the wake-envelope plant. It had inlined
+        // ~26 KB of base64 and installed it behind an `XDG_CONFIG_HOME` guard the production caller does
+        // not pass, so on a real Fleet seat the branch always skipped; the plant is now its own emitted
+        // file at a caller-resolved path. Sole differing artifact: `/seat/write-wake-envelope.mjs`.
+        // Verified against `origin/dev` at `bea77518…` before rebasing, so this bump is attributable to
+        // the hook and not to inherited drift. This spec is now on the `brain-unit.yml` run list, which
+        // is the only reason the earlier bumps were ever checked.
+        expect(digest).toBe('73cfb2a6599bcab0c4b5d02954517ee9021fc206cb6114a2d42303e003490f57')
     });
 
     test('remote map replaces only selected servers with the exact OpenCode HTTP adapter grammar', () => {
@@ -246,5 +262,135 @@ test.describe('generateOpenCodeSeatConfig (OpenCode seat scaffold emission)', ()
             'neo-mjs-memory-core', 'neo-mjs-github-workflow', 'neo-mjs-knowledge-base', 'neo-mjs-neural-link'
         ]);
         OPENCODE_SEAT_SERVERS.forEach(server => expect(server.script.startsWith('ai/mcp/server/')).toBe(true));
+    });
+});
+
+test.describe('the wake-envelope plant is emitted as a SIBLING of the boot hook', () => {
+    const
+        plantSource = readFileSync(new URL(PLANT_SOURCE, import.meta.url)),
+        seatHome    = () => mkdtempSync(join(tmpdir(), 'seat-home-')),
+        plantIn     = home => join(home, 'opencode', 'plugins', 'neo-wake-envelope.mjs');
+
+    /**
+     * @summary Emit for a seat, writing the files the way the composer does, under the PRODUCTION
+     * caller's env shape: `AMBIENT_ENV_ALLOWLIST` plus the server credential pair, and deliberately
+     * NO `XDG_CONFIG_HOME` / `XDG_DATA_HOME` — because `bootstrapOpenCodeWakeRoute` does not pass them.
+     * A delivery path that needs an env var the only production caller never supplies is the defect
+     * this whole shape exists to remove, so the arms assert the emission never reads one.
+     * @param {String} home
+     * @returns {{files: Array, written: String[]}}
+     */
+    function provision(home) {
+        const
+            {files} = generateOpenCodeSeatConfig({...PARAMS,
+                wakeHookPath : join(home, 'write-wake-envelope.mjs'),
+                wakePlantPath: plantIn(home)
+            }),
+            // Only the instance-home artifacts are written: the repo-root `opencode.jsonc` points at a
+            // fixture path that does not exist, and these arms are about what lands in the seat home.
+            written = files
+                .filter(file => file.path.startsWith(home))
+                .map(file => {
+                    mkdirSync(dirname(file.path), {recursive: true});
+                    writeFileSync(file.path, file.content);
+
+                    return file.path
+                });
+
+        return {files, written}
+    }
+
+    test('the caller-resolved path carries the plant, stamped and otherwise byte-equivalent to its source', () => {
+        const home = seatHome(),
+              {files} = provision(home),
+              plant  = files.find(file => file.path === plantIn(home));
+
+        expect(plant, 'the plant is emitted at the caller-resolved path, not left to the hook').toBeTruthy();
+        expect(
+            plant.content.replace(/^\/\* GENERATED by generateOpenCodeSeatConfig — plant generation sha256:[0-9a-f]{64} \*\/\n/, ''),
+            'and apart from its generation marker its bytes are the source bytes'
+        ).toBe(plantSource.toString('utf8'));
+        expect(isUnmodifiedGeneration(plant.content), 'the marker agrees with the body it stamps').toBe(true)
+    });
+
+    test('the generation marker is what separates an earlier generation from a hand edit', () => {
+        // Provenance is a CLAIM about a file, and a bare marker cannot carry it: anyone can keep the word
+        // and edit underneath it. So the marker holds a hash of the body it precedes, which makes
+        // "unmodified generation" checkable rather than promised.
+        const body = 'export const x = 1;\n';
+
+        expect(isUnmodifiedGeneration(stampWakeEnvelopePlant(body)), 'a stamped body is a generation').toBe(true);
+        expect(isUnmodifiedGeneration(body), 'an unstamped file is nobody\'s generation').toBe(false);
+        expect(
+            isUnmodifiedGeneration(`${stampWakeEnvelopePlant(body)}\n// edited underneath the marker\n`),
+            'marker kept, body changed: still not a generation'
+        ).toBe(false);
+        expect(
+            isUnmodifiedGeneration(stampWakeEnvelopePlant(body).replace(body, 'export const x = 2;\n')),
+            'and a forged body under a real marker does not pass either'
+        ).toBe(false)
+    });
+
+    test('the boot hook carries no plant bytes — the inlined-payload shape cannot return', () => {
+        // The regression guard for the shape that was removed. A base64 plant inside the hook is not
+        // merely untidy: it makes every plant edit a divergence on each seat's boot hook, and it can
+        // only ever be installed by a LATER process than the one that boot created.
+        const home    = seatHome(),
+              {files}  = provision(home),
+              hook    = files.find(file => file.path.endsWith('write-wake-envelope.mjs')).content,
+              base64  = hook.match(/[A-Za-z0-9+/]{500,}={0,2}/);
+
+        expect(base64, 'no base64 payload in the hook').toBeNull();
+        expect(hook, 'no installer left behind in the hook').not.toContain('pluginsDir');
+        expect(hook, 'and the hook no longer gates on the env var the caller omits').not.toContain('XDG_CONFIG_HOME')
+    });
+
+    test("the caller's env shape is irrelevant: neither XDG var is set, and the plant still lands in the seat's own plugins dir", () => {
+        // THE arm this shape exists for. `bootstrapOpenCodeWakeRoute` runs the hook with
+        // `AMBIENT_ENV_ALLOWLIST` + the credential pair and passes NEITHER `XDG_CONFIG_HOME` NOR
+        // `XDG_DATA_HOME`. The previous shape installed the plant from inside that hook behind an
+        // `XDG_CONFIG_HOME` guard, so on a real Fleet-managed seat the branch always skipped: the hook
+        // reported nothing, the plant was never installed, and every arm that injected the variable
+        // itself passed. This arm runs the emission under an env that has neither, and asserts the plant
+        // is on disk — which is false for the old shape by construction, not by accident of setup.
+        const home = seatHome(),
+              // The caller's shape, asserted rather than assumed: a test that injects the env its own
+              // code needs proves the code, not the caller.
+              callerEnv = {
+                NEO_AGENT_IDENTITY      : 'neo-preview',
+                OPENCODE_SERVER_USERNAME: 'u',
+                OPENCODE_SERVER_PASSWORD: 'p'
+              };
+
+        expect(callerEnv.XDG_CONFIG_HOME, 'the production caller really does not pass it').toBeUndefined();
+        expect(callerEnv.XDG_DATA_HOME,  'nor the data home').toBeUndefined();
+
+        const previous = {XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME, XDG_DATA_HOME: process.env.XDG_DATA_HOME};
+
+        delete process.env.XDG_CONFIG_HOME;
+        delete process.env.XDG_DATA_HOME;
+
+        try {
+            provision(home);
+
+            expect(existsSync(plantIn(home)), 'the plant is in the seat\'s own plugins dir, with no XDG var anywhere').toBe(true)
+        } finally {
+            Object.assign(process.env, previous)
+        }
+    });
+
+    test('an empty wakePlantPath is refused rather than silently skipped', () => {
+        // The generator's contract for every optional path: a blank one is a caller bug, and a silent
+        // skip would look exactly like a healthy provision — the failure this ticket exists to remove.
+        expect(() => generateOpenCodeSeatConfig({...PARAMS, wakePlantPath: ''})).toThrow(/wakePlantPath/)
+    });
+
+    test('omitting wakePlantPath emits no plant, and the hook is unaffected', () => {
+        const home    = seatHome(),
+              {files}  = generateOpenCodeSeatConfig({...PARAMS, wakeHookPath: join(home, 'write-wake-envelope.mjs')}),
+              paths   = files.map(file => file.path);
+
+        expect(paths.some(path => /plugins/.test(path)), 'no plugins path when the caller asks for none').toBe(false);
+        expect(paths.some(path => path.endsWith('write-wake-envelope.mjs')), 'the hook is still emitted').toBe(true)
     });
 });

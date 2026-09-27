@@ -126,6 +126,37 @@ test.describe('opencodeWakeEnvelopePlugin (#15394)', () => {
         expect(fs.existsSync(path.join(os.homedir(), '.local', 'share', 'opencode', 'wake-envelope.json.tmp'))).toBe(false);
     });
 
+    test('an unset XDG_DATA_HOME refuses to publish rather than falling back to the shared home', async () => {
+        // The fallback was `~/.local/share`, which is the one path that is NOT per-seat — and one
+        // process can instantiate this plant for several project directories at once, so the fallback
+        // made the route fail by COLLISION (last writer wins, nothing records which) instead of by
+        // absence. Observed on a live seat: the plant loaded, reported itself armed, and wrote nothing,
+        // while a sibling instance for another seat's project reported the same directory. Refusing is
+        // the honest failure — loud, immediate, and it leaves any prior envelope untouched.
+        delete process.env.XDG_DATA_HOME;
+
+        // Point HOME at a scratch dir so the second assertion cannot depend on the developer's real
+        // `~/.local/share` — an arm that reads the host's home is a host-dependent arm, and this file's
+        // whole premise is that it has no host side effects.
+        const realHome = process.env.HOME,
+              fakeHome = path.join(tmpRoot, 'fake-home');
+
+        fs.ensureDirSync(fakeHome);
+        process.env.HOME = fakeHome;
+
+        try {
+            await expect(NeoWakeEnvelope(mockCtx({lsofPorts: [41003]}))).rejects.toThrow(/XDG_DATA_HOME/);
+
+            expect(
+                fs.existsSync(path.join(fakeHome, '.local', 'share', 'opencode', 'wake-envelope.json')),
+                'and nothing was written under a home it made up'
+            ).toBe(false)
+        } finally {
+            if (realHome === undefined) delete process.env.HOME;
+            else process.env.HOME = realHome
+        }
+    });
+
     test('a pre-existing 0644 envelope ends up 0600 (explicit chmod after the atomic rename)', async () => {
         process.env.XDG_DATA_HOME = path.join(tmpRoot, 'seatA');
 

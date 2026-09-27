@@ -1,3 +1,5 @@
+import {createHash} from 'node:crypto';
+import {readFileSync}                                                                          from 'node:fs';
 import path                                                                                     from 'node:path';
 import {REMOTE_MCP_CREDENTIAL_ENV_VAR}                                                          from './mcpServers.mjs';
 import {MEMORY_LAYER_BOOT_FILES, renderAboutThisLayerMd, renderIdentityMd, renderMemoryIndexMd} from './seatMemoryLayerTemplate.mjs';
@@ -19,9 +21,18 @@ export const OPENCODE_SEAT_SERVERS = Object.freeze([
 
 /**
  * Generate every config/scaffold file an OpenCode seat boots from, as a PURE params→files
- * emission (the AiConfig SSOT purity discipline: no config imports, no env reads, no fs access,
- * no hidden defaults — callers resolve every path). The launch path (`prepareManagedAgentWorkspace`)
+ * emission (the AiConfig SSOT purity discipline: no config imports, no env reads, no hidden
+ * defaults — callers resolve every path). The launch path (`prepareManagedAgentWorkspace`)
  * writes the returned files; this module only decides their content.
+ *
+ * **One declared exception to "pure", and it is a file read, not a config or env read:**
+ * `WAKE_ENVELOPE_PLANT_SOURCE` is `readFileSync` of the sibling plant module at load time, so the
+ * emitted plant is byte-identical to the Brain's copy. The reason it lives here rather than arriving as
+ * a parameter: this module is the one surface that knows a seat's artifact paths, and the alternative
+ * makes the caller read a file whose location is this module's knowledge — splitting it in two. The read
+ * is of a file inside this package, resolved through `import.meta.url`, so it introduces no ambient
+ * dependency: no env, no user path, no network, and nothing that varies per seat. Callers still resolve
+ * every PATH, which is the part of the contract that carries the isolation weight.
  *
  * The three load-bearing seat constraints this productizes (verified live on the first OpenCode
  * seat, `@neo-kimi-phoebe`, 2026-07-18):
@@ -35,6 +46,25 @@ export const OPENCODE_SEAT_SERVERS = Object.freeze([
  * 2. **Seat personal.** Identity + credentials load via `--env-file` from the seat's OWN `.env`
  *    (`NEO_AGENT_IDENTITY`, `GH_TOKEN`, provider keys). Node's `--env-file` never overwrites
  *    already-set vars, so explicit `environment` entries win where a caller needs them to.
+ *
+ *    **This generator emits TWO artifacts that install the wake lane, not one — and they are SIBLINGS.**
+ *    The first is the `write-wake-envelope` hook, emitted whenever `wakeHookPath` is given; it writes the
+ *    envelope once the bound port is known. The second is the wake-envelope PLANT —
+ *    `ai/services/fleet/opencodeWakeEnvelopePlugin.mjs` — emitted verbatim as its own file at
+ *    `wakePlantPath`, so the seat's FIRST OpenCode process loads it and republishes the envelope on every
+ *    new top-level session. Without it the hook writes a file nothing ever reads again.
+ *
+ *    They are siblings, not a hook and its payload, for a delivery reason rather than a tidiness one: the
+ *    hook runs at the boot boundary AFTER the server is listening, so a plant the hook installs can only
+ *    ever be loaded by a LATER process — and the hook's environment is the caller's `hookEnv`, which does
+ *    not carry `XDG_CONFIG_HOME` at all. An earlier shape inlined the plant into the hook as base64 and
+ *    installed it from there; it could only ever be late, and it made every plant edit a divergence on
+ *    every seat's boot hook. Moving the plant to its own `files` entry fixes both at once, because the
+ *    caller now converges it under its own policy row (see `prepareOpenCodeArtifacts`).
+ *
+ *    The generated-artifact posture is unchanged and is NOT this module's to soften: the caller creates
+ *    absent files, converges owned ones, and refuses divergence. A hand edit to a Fleet-owned file is a
+ *    person's decision to reconcile, so it is reported, never silently clobbered.
  *
  *    **`XDG_DATA_HOME` is the seat-separation seam — not the OpenCode project list.** Provisioning a
  *    second seat on one machine means giving it its own data home, because that is what separates the
@@ -101,13 +131,19 @@ export const OPENCODE_SEAT_SERVERS = Object.freeze([
  *                                        ({@link OPENCODE_SEAT_SERVERS}) — same entry shape.
  * @param {Object} [options.remoteServers] Per-server remote grammar keyed by server name:
  *                                        `{url, credentialEnvVar}`. The value is non-secret.
+ * @param {String} [options.wakePlantPath] When set, also emit the wake-envelope PLANT at this path —
+ * the OpenCode plugin that republishes the envelope on every new top-level session. The CALLER
+ * resolves the path from `instanceHome`, so the plant lands in the seat's OWN config home before
+ * OpenCode's first process starts. Emitted as a sibling file rather than installed by the boot hook
+ * because the hook runs after the server is listening: a plant the hook installs cannot be loaded by
+ * the session that boot created.
  * @returns {{files: Array<{path: String, content: String}>}} the emission list — callers own
  * writing (mode, atomicity, divergence policy).
  * @throws {Error} naming the offending argument on missing/invalid input, and
  * `generateOpenCodeSeatConfig: island guard` when a server script resolves outside
  * `agentosRuntimeRoot`.
  */
-export function generateOpenCodeSeatConfig({agentosRuntimeRoot, targetRepoRoot, seatEnvFile, memoryDir, nodeBinary, environment = {}, extraAllowedPaths = [], wakeHookPath, servers = OPENCODE_SEAT_SERVERS, seatHome, remoteServers = {}} = {}) {
+export function generateOpenCodeSeatConfig({agentosRuntimeRoot, targetRepoRoot, seatEnvFile, memoryDir, nodeBinary, environment = {}, extraAllowedPaths = [], wakeHookPath, wakePlantPath, servers = OPENCODE_SEAT_SERVERS, seatHome, remoteServers = {}} = {}) {
     assertNonEmptyString(agentosRuntimeRoot, 'agentosRuntimeRoot');
     assertNonEmptyString(targetRepoRoot,     'targetRepoRoot');
     assertNonEmptyString(seatEnvFile,        'seatEnvFile');
@@ -144,6 +180,15 @@ export function generateOpenCodeSeatConfig({agentosRuntimeRoot, targetRepoRoot, 
     if (wakeHookPath !== undefined) {
         assertNonEmptyString(wakeHookPath, 'wakeHookPath');
         files.push({path: wakeHookPath, content: renderWakeHook()});
+    }
+
+    // Sibling of the hook, not a payload inside it: the caller converges this under its OWN policy
+    // row, so a plant update reports divergence on the plant instead of on the hook that merely
+    // mentioned it. The hook carries no plant bytes, so editing the plant cannot make every seat's
+    // boot hook divergent.
+    if (wakePlantPath !== undefined) {
+        assertNonEmptyString(wakePlantPath, 'wakePlantPath');
+        files.push({path: wakePlantPath, content: stampWakeEnvelopePlant(WAKE_ENVELOPE_PLANT_SOURCE)});
     }
 
     return {files};
@@ -254,9 +299,97 @@ function renderSeatPointersMd() {
 }
 
 /**
+ * @summary The seat-side wake-envelope PLANT source, read from disk once at module load and emitted as
+ * its OWN generated file at the caller-resolved `wakePlantPath`.
+ *
+ * The plant is the OpenCode plugin that republishes the envelope on every new top-level session, so
+ * without it a seat publishes once per hand-copied file and never again. It is a sibling emission
+ * rather than a payload inside the hook because the install has to happen BEFORE OpenCode's first
+ * process — the hook runs after the server is listening, so a plant the hook installs is a plant the
+ * seat's first session never loads. See the module JSDoc for the delivery argument.
+ *
+ * Raw source rather than base64: the emitted file must be byte-identical to the Brain's copy apart
+ * from its GENERATION MARKER, because a base64 payload inside a generated hook makes every plant edit
+ * a divergence on the WRONG artifact.
+ * @type {String}
+ */
+const WAKE_ENVELOPE_PLANT_SOURCE = readFileSync(
+    new URL('./opencodeWakeEnvelopePlugin.mjs', import.meta.url),
+    'utf8'
+);
+
+/**
+ * @summary The marker the emitted plant carries, naming the generation it came from.
+ *
+ * Provenance is the whole point: the Fleet's convergence for a text artifact is create-or-refuse, so a
+ * plant that is merely Fleet-owned would be UNREPLACEABLE — the first plant edit would be refused on
+ * every provisioned seat, because the file on disk is an earlier generation rather than a hand edit,
+ * and nothing on disk could tell those two apart. A marker alone cannot: anyone can keep a marker and
+ * still edit the body. So the marker carries a **content hash of the body it stamps**, which makes
+ * "unmodified generation" a checkable claim rather than a promise — see {@link isUnmodifiedGeneration}.
+ * @type {RegExp}
+ */
+const PLANT_GENERATION_MARKER = /^\/\* GENERATED by generateOpenCodeSeatConfig — plant generation sha256:([0-9a-f]{64}) \*\/[ \t]*\r?\n/m;
+
+/**
+ * @summary Stamp the plant source with its generation marker. The hash covers the BODY ONLY, never the
+ * marker, so the two cannot disagree about the file they describe.
+ * @param {String} source The plant source, unstamped.
+ * @returns {String} the emitted plant, marker first.
+ */
+export function stampWakeEnvelopePlant(source) {
+    return `${plantGenerationMarker(source)}\n${source}`;
+}
+
+/**
+ * @summary The marker line for a plant body, hashing the body the marker will precede.
+ * @param {String} body
+ * @returns {String}
+ */
+function plantGenerationMarker(body) {
+    return `/* GENERATED by generateOpenCodeSeatConfig — plant generation sha256:${createHash('sha256').update(body).digest('hex')} */`;
+}
+
+/**
+ * @summary Whether a plant on disk is an UNMODIFIED EARLIER GENERATION and may therefore be replaced,
+ * as opposed to a hand edit, which is refused.
+ *
+ * Both halves are required. The marker must be present, so a file a person wrote has no provenance at
+ * all; and the hash it carries must match a fresh hash of its own body, so a person who kept the marker
+ * while editing underneath it is caught too. A file that fails either test is treated as a person's and
+ * is never overwritten.
+ * @param {String} content The plant as it exists on disk.
+ * @returns {Boolean} true when the file is a pristine generation of some earlier (or current) emission
+ */
+export function isUnmodifiedGeneration(content) {
+    const stamped = String(content ?? '').match(PLANT_GENERATION_MARKER);
+
+    if (!stamped) {
+        return false
+    }
+
+    const body = String(content).replace(PLANT_GENERATION_MARKER, '');
+
+    return createHash('sha256').update(body).digest('hex') === stamped[1];
+}
+
+/**
+ * @summary The file name OpenCode auto-loads a wake-envelope plant from, under
+ * `<configHome>/opencode/plugins/`. Exported so the caller resolves the seat path from this module
+ * rather than re-deriving the name in a second place.
+ * @type {String}
+ */
+export const WAKE_ENVELOPE_PLANT_FILE_NAME = 'neo-wake-envelope.mjs';
+
+/**
  * The wake-envelope boot hook — a STANDALONE node script (no Neo imports, C1-clean) the seat's
  * boot boundary runs once the bound port is known. Writes the daemon-consumed envelope
  * atomically, mode 0600. Credentials come ONLY from the process env.
+ *
+ * It writes the envelope and nothing else. An earlier shape also installed the plant here; that was
+ * removed because the hook runs after OpenCode has started, so the plant it installed could only ever
+ * be loaded by a LATER process, and only if the hook's environment happened to carry `XDG_CONFIG_HOME`
+ * — which the production caller does not pass. The plant is now a sibling `files` entry instead.
  * @returns {String}
  * @private
  */
@@ -333,6 +466,7 @@ function renderWakeHook() {
         'await fs.chmod(envelopePath, 0o600);',
         '',
         'console.log(`write-wake-envelope: envelope written for session ${envelope.sessionId} (port ${envelope.port})`);',
+        '',
         ''
     ].join('\n');
 }

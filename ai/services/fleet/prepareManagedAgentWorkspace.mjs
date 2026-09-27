@@ -12,7 +12,7 @@ import {
     MANAGED_WORKSPACE_MCP_SERVER_DESCRIPTORS as MCP_SERVER_DESCRIPTORS,
     createManagedAgentWorkspacePlan
 } from './managedAgentWorkspacePlan.mjs';
-import {OPENCODE_SEAT_SERVERS, generateOpenCodeSeatConfig} from './generateOpenCodeSeatConfig.mjs';
+import {OPENCODE_SEAT_SERVERS, WAKE_ENVELOPE_PLANT_FILE_NAME, generateOpenCodeSeatConfig, isUnmodifiedGeneration} from './generateOpenCodeSeatConfig.mjs';
 
 export {createManagedAgentWorkspacePlan} from './managedAgentWorkspacePlan.mjs';
 
@@ -928,20 +928,105 @@ async function prepareOpenCodeArtifacts({targetRepoRoot, instanceHome, agentosRu
             nodeBinary  : plan[0].command,
             seatHome    : instanceHome,
             wakeHookPath: path.join(instanceHome, 'write-wake-envelope.mjs'),
+            // The seat's OWN OpenCode plugins dir, resolved here rather than inside the boot hook:
+            // `deriveHarnessLaunchSpec` points `XDG_CONFIG_HOME` at this same `instanceHome`, so the plant
+            // lands where that seat's first OpenCode process looks for it — before the hook ever runs.
+            // The hook runs after the server is listening, so a plant IT installed could only be loaded by
+            // a later process, and `hookEnv` does not carry `XDG_CONFIG_HOME` at all.
+            wakePlantPath: path.join(instanceHome, 'opencode', 'plugins', WAKE_ENVELOPE_PLANT_FILE_NAME),
             servers
         },
         {files}       = generateOpenCodeSeatConfig({...options, remoteServers}),
         {files: legacyFiles} = generateOpenCodeSeatConfig(options);
 
-    return convergeSeatConfigFiles({files, legacyFiles, repoPath: targetRepoRoot, instanceHome, fileSystem, policies: [
-        {
-            match          : /opencode\.jsonc$/,
-            ownedProjection: opencodeJsoncOwnedProjection,
-            ownedLabel     : 'mcp."neo-mjs-*",instructions',
-            transport      : {adapter: 'opencode', containerName: 'mcp'}
-        },
-        {match: /write-wake-envelope\.mjs$/, ownedProjection: wholeFileOwnedProjection,     ownedLabel: 'generated wake-envelope boot hook'}
-    ]});
+    // The plant is WITHHELD from the generic text-artifact pass rather than given a policy row, because
+    // `convergeTextArtifact` cannot replace and the plant has to be replaceable: the file already on a
+    // provisioned seat is an earlier GENERATION, not a hand edit, and only the generation marker can
+    // tell those apart. Its own convergence owns the file, and the rule is scoped to it alone.
+    const
+        plantFile = files.find(file => file.path === options.wakePlantPath),
+        rest      = files.filter(file => file.path !== options.wakePlantPath),
+        legacyRest= legacyFiles.filter(file => file.path !== options.wakePlantPath);
+
+    return [
+        ...await convergeSeatConfigFiles({
+            files: rest, legacyFiles: legacyRest, repoPath: targetRepoRoot, instanceHome, fileSystem,
+            policies: [
+                {
+                    match          : /opencode\.jsonc$/,
+                    ownedProjection: opencodeJsoncOwnedProjection,
+                    ownedLabel     : 'mcp."neo-mjs-*",instructions',
+                    transport      : {adapter: 'opencode', containerName: 'mcp'}
+                },
+                {match: /write-wake-envelope\.mjs$/, ownedProjection: wholeFileOwnedProjection, ownedLabel: 'generated wake-envelope boot hook'}
+            ]
+        }),
+        ...await convergeWakeEnvelopePlant({plantFile, instanceHome, fileSystem})
+    ];
+}
+
+/**
+ * @summary Converge the wake-envelope plant under its OWN rule, because the general text-artifact rule
+ * cannot express provenance.
+ *
+ * `convergeTextArtifact` is create-or-refuse: it replaces nothing. That is right for a config a person
+ * edits and wrong for the plant, which the Fleet owns outright and rewrites whenever the Brain's copy
+ * changes — so without this, the FIRST plant edit after provisioning is refused on every seat, because
+ * the file on disk is an earlier generation and a bare byte-compare cannot tell an earlier generation
+ * from a hand edit. Nothing is clobbered here either: a file that is not a pristine generation (see
+ * `isUnmodifiedGeneration`) is refused exactly as any other divergent Fleet-owned content is, and the
+ * refusal names the file. The two outcomes are distinguishable in the receipt, which is the point —
+ * `UPDATED` says "the Fleet moved its own file forward", `DIVERGENT` says "a person did".
+ * @private
+ */
+async function convergeWakeEnvelopePlant({plantFile, instanceHome, fileSystem}) {
+    if (!plantFile) {
+        return []
+    }
+
+    const plant = plantFile,
+          label = 'generated wake-envelope plant';
+
+    await assertNoSymlinkSegments({rootPath: instanceHome, targetPath: plant.path, fileSystem, label});
+
+    let existing = null;
+
+    try {
+        existing = await fileSystem.readFile(plant.path, 'utf8')
+    } catch (error) {
+        if (error?.code !== 'ENOENT') throw error
+    }
+
+    if (existing === plant.content) {
+        return [{path: plant.path, status: WORKSPACE_ARTIFACT_STATES.MATCH, ownedKeys: label}]
+    }
+
+    if (existing !== null && !isUnmodifiedGeneration(existing)) {
+        throw new ManagedWorkspacePreparationError(
+            `prepareManagedAgentWorkspace: refusing to overwrite a hand-edited wake-envelope plant at '${plant.path}'. ` +
+            'A plant carrying a generation marker that matches its own body is an earlier Fleet generation and is replaced; ' +
+            'one without is a person\'s, and reconciling it is theirs to do.',
+            {
+                code   : 'FLEET_WORKSPACE_DIVERGENT',
+                artifact: {
+                    path     : plant.path,
+                    status   : WORKSPACE_ARTIFACT_STATES.DIVERGENT,
+                    ownedKeys: label,
+                    reason   : 'hand-edited plant: no generation marker, or its marker does not match its body'
+                }
+            }
+        )
+    }
+
+    await fileSystem.mkdir(path.dirname(plant.path), {recursive: true});
+
+    await publishTextAtomically({filePath: plant.path, content: plant.content, fileSystem});
+
+    return [{
+        path    : plant.path,
+        status  : existing === null ? WORKSPACE_ARTIFACT_STATES.CREATED : WORKSPACE_ARTIFACT_STATES.UPDATED,
+        ownedKeys: label
+    }];
 }
 
 /**
