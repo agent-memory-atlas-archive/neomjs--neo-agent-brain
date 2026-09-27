@@ -237,9 +237,13 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
     });
 
     test('an agent without a GitHub PAT is refused before any checkout, preparation or spawn', async () => {
-        for (const agents of [repoAgent('a'), {a: {id: 'a', metadata: {launch: {command: 'h'}}}}]) {
+        // a blank value stored before the requirement is no PAT either
+        for (const [agents, stored] of [
+            [repoAgent('a'), null], [repoAgent('a'), ''], [repoAgent('a'), '   '],
+            [{a: {id: 'a', metadata: {launch: {command: 'h'}}}}, null], [{a: {id: 'a', metadata: {launch: {command: 'h'}}}}, '  ']
+        ]) {
             const events           = [],
-                  lifecycle        = makeLifecycle({agents, credentials: {a: null}, events}),
+                  lifecycle        = makeLifecycle({agents, credentials: {a: stored}, events}),
                   ensureRepo       = makeEnsureRepo('/managed/a/neomjs-neo', events),
                   prepareWorkspace = makePrepareWorkspace(events);
 

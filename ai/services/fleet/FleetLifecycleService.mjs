@@ -429,12 +429,12 @@ class FleetLifecycleService extends Base {
             }
         }
 
-        // Child env: the MINIMAL allowlisted base — never a full parent-env copy. A tokenless
-        // instance must not silently inherit the parent's `GH_TOKEN` or provider secrets; only
-        // benign process-runtime vars cross the boundary (see AMBIENT_ENV_ALLOWLIST). The launch
-        // env (the isolation home var, plus any Brain-set compat extras) merges BEFORE the reserved
-        // injections so the reserved keys always win, then the PAT — if any — lands under
-        // credentialEnvVar. Absent credential → start without it (a tokenless agent is valid).
+        // Child env: the MINIMAL allowlisted base — never a full parent-env copy. An instance must
+        // not silently inherit the parent's `GH_TOKEN` or provider secrets; only benign
+        // process-runtime vars cross the boundary (see AMBIENT_ENV_ALLOWLIST). The launch env (the
+        // isolation home var, plus any Brain-set compat extras) merges BEFORE the reserved
+        // injections so the reserved keys always win, then the agent's own PAT lands under
+        // credentialEnvVar; an agent without one is refused below, before the spawn.
         const env = {};
         for (const key of AMBIENT_ENV_ALLOWLIST) {
             if (process.env[key] !== undefined) env[key] = process.env[key];
@@ -491,8 +491,9 @@ class FleetLifecycleService extends Base {
             : this.getRegistry().resolveCredential(id);
 
         // Every agent holds its GitHub PAT: without one the seat's `gh` falls back to the machine's
-        // keyring account, someone else's identity. Every spawn passes here, restarts included.
-        if (pat == null) {
+        // keyring account, someone else's identity. Every spawn passes here, restarts included, and a
+        // blank value stored before the requirement is no PAT either.
+        if (typeof pat !== 'string' || pat.trim() === '') {
             throw new Error(`FleetLifecycleService.start: agent '${id}' has no GitHub PAT stored; store one before starting it.`)
         }
 

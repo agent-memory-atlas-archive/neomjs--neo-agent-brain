@@ -163,7 +163,9 @@ export async function startAgentProvisioned({
     // handed to the spawn so it uses this exact value rather than a second read.
     const resolvedCredential = registry.resolveCredential(agentId);
 
-    if (resolvedCredential == null) {
+    // the creation test, applied to what is stored: a blank value written before the requirement
+    // is no PAT either
+    if (typeof resolvedCredential !== 'string' || resolvedCredential.trim() === '') {
         throw new Error(`startAgentProvisioned: agent '${agentId}' has no GitHub PAT stored; store one before starting it.`)
     }
 

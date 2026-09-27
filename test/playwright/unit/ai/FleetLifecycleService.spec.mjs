@@ -246,13 +246,15 @@ test.describe('Neo.ai.services.fleet.FleetLifecycleService', () => {
     });
 
     test('an agent without a GitHub PAT is refused before the spawn — it never runs on the parent\'s ambient token', () => {
-        const spawn = install({agents: {a: agentDef('a')}, creds: {a: null}});
-
         // untokened, the seat's `gh` would fall back to the machine's keyring account: refused, not
-        // spawned with an empty slot
-        expect(() => FleetLifecycleService.start('a')).toThrow(/agent 'a' has no GitHub PAT stored/);
-        expect(spawn.calls).toHaveLength(0);
-        expect(FleetLifecycleService.isRunning('a')).toBe(false);
+        // spawned with an empty slot. A blank value stored before the requirement is no PAT either.
+        for (const stored of [null, '', '   ']) {
+            const spawn = install({agents: {a: agentDef('a')}, creds: {a: stored}});
+
+            expect(() => FleetLifecycleService.start('a')).toThrow(/agent 'a' has no GitHub PAT stored/);
+            expect(spawn.calls).toHaveLength(0);
+            expect(FleetLifecycleService.isRunning('a')).toBe(false)
+        }
     });
 
     test('start refuses an unknown agent', () => {

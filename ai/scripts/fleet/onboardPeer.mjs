@@ -39,8 +39,9 @@ import {normalizeAgentIdentityNodeId}                 from '../../graph/normaliz
  *      its isolated instance home via the curated per-family template).
  *   6. `auth`      — use the long-lived lifecycle owner's auth-mode/status projection to hand off
  *      the operator step: marker families receive the exact per-home login line; GUI families sign
- *      in inside the Fleet-launched window and return to Fleet for any restart. Secrets never touch
- *      this script.
+ *      in inside the Fleet-launched window and return to Fleet for any restart. The one secret this
+ *      script carries is the agent's GitHub PAT: read from the `--credential-env` variable, handed to
+ *      `defineAgent`, never printed.
  *
  * Idempotent per segment because every underlying contract already is (definition conflicts refuse,
  * repo drift reconciles through `setRepo`, repo ensure-or-reuse, start short-circuits when running,
@@ -51,6 +52,7 @@ import {normalizeAgentIdentityNodeId}                 from '../../graph/normaliz
  * **Usage**:
  *   node ai/scripts/fleet/onboardPeer.mjs --resident-id <s> --github-username <s>
  *       --harness-type <antigravity|claude-code|claude-desktop|codex|codex-desktop> # dry-run;
+ *           [--credential-env <NAME>]                  # required for a new resident: the PAT's variable
  *           [--clone-url <s> --repo-slug <s>]          # pair required unless repo already exists
  *   node ai/scripts/fleet/onboardPeer.mjs ... --commit                          # execute phase delta
  *   node ai/scripts/fleet/onboardPeer.mjs --help
