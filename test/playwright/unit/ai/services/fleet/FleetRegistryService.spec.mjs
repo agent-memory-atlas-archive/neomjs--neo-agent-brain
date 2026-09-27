@@ -38,8 +38,10 @@ function sourceFiles(directory) {
 }
 
 // FleetRegistryService is a singleton. Pointing `dataDir` at a fresh temp dir per test makes
-// ensureLoaded reload an empty registry (isolation) and keeps every write off the real
-// ~/.neo-ai-data. No credential is passed, so the crypto/storeCredential path is never exercised.
+// ensureLoaded reload an empty registry (isolation) and keeps every write, the encrypted
+// credential store included, off the real ~/.neo-ai-data. Every agent holds a PAT, so each
+// successful define carries this fixture one.
+const PAT = 'ghp_fixture_only';
 
 test.describe('Neo.ai.services.fleet.FleetRegistryService.updateAgent — narrow partial-merge patch', () => {
     let tmpDir;
@@ -55,7 +57,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService.updateAgent — narrow
     });
 
     test('merges the metadata patch into the existing definition, preserving every other field', () => {
-        FleetRegistryService.defineAgent({githubUsername: 'alice', harnessType: 'codex', metadata: {tier: 'A', keep: 1}});
+        FleetRegistryService.defineAgent({githubUsername: 'alice', harnessType: 'codex', credential: PAT, metadata: {tier: 'A', keep: 1}});
 
         const updated = FleetRegistryService.updateAgent('alice', {metadata: {tier: 'B', repoUrl: 'https://github.com/x/y'}});
 
@@ -70,7 +72,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService.updateAgent — narrow
     });
 
     test('a patch without metadata leaves the existing metadata intact (no accidental wipe)', () => {
-        FleetRegistryService.defineAgent({githubUsername: 'bob', harnessType: 'codex', metadata: {a: 1}});
+        FleetRegistryService.defineAgent({githubUsername: 'bob', harnessType: 'codex', credential: PAT, metadata: {a: 1}});
 
         const updated = FleetRegistryService.updateAgent('bob', {});
 
@@ -107,7 +109,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService — the raw-launch sec
     });
 
     test('updateAgent REJECTS a launch key in the metadata patch (the scoped-verb path is equally closed)', () => {
-        FleetRegistryService.defineAgent({githubUsername: 'alice', harnessType: 'codex'});
+        FleetRegistryService.defineAgent({githubUsername: 'alice', harnessType: 'codex', credential: PAT});
 
         expect(() => FleetRegistryService.updateAgent('alice', {metadata: {launch: {command: 'x'}}}))
             .toThrow(/not patchable through this surface/);
@@ -115,12 +117,12 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService — the raw-launch sec
     });
 
     test('claude-code is a registered harness vocabulary entry (the curated template is reachable)', () => {
-        const def = FleetRegistryService.defineAgent({githubUsername: 'c2', harnessType: 'claude-code'});
+        const def = FleetRegistryService.defineAgent({githubUsername: 'c2', harnessType: 'claude-code', credential: PAT});
         expect(def.harnessType).toBe('claude-code');
     });
 
     test('setLaunchOverride (Brain/operator-only) writes, updates, and clears the launch override', () => {
-        FleetRegistryService.defineAgent({githubUsername: 'ops', harnessType: 'codex'});
+        FleetRegistryService.defineAgent({githubUsername: 'ops', harnessType: 'codex', credential: PAT});
 
         const withLaunch = FleetRegistryService.setLaunchOverride('ops', {command: '/opt/custom', args: ['--serve'], env: {}});
         expect(withLaunch.metadata.launch.command).toBe('/opt/custom');
@@ -132,7 +134,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService — the raw-launch sec
     });
 
     test('the PUBLIC projection redacts the launch override — get/list never expose the Brain-only launch', () => {
-        FleetRegistryService.defineAgent({githubUsername: 'sec', harnessType: 'codex', metadata: {tier: 'A'}});
+        FleetRegistryService.defineAgent({githubUsername: 'sec', harnessType: 'codex', credential: PAT, metadata: {tier: 'A'}});
         FleetRegistryService.setLaunchOverride('sec', {command: '/opt/custom', args: ['--serve'], env: {PROBE_SECRET: 'x'}});
 
         expect(FleetRegistryService.getAgent('sec').metadata.launch).toBeUndefined();
@@ -147,6 +149,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService — the raw-launch sec
         const created = FleetRegistryService.defineAgent({
             githubUsername: 'nested-sec',
             harnessType   : 'codex',
+            credential    : PAT,
             metadata      : {
                 credential   : 'caller-secret',
                 refreshToken : 'refresh-secret',
@@ -195,7 +198,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService — the raw-launch sec
     });
 
     test('projections are DEEP CLONES — mutating a returned definition never reaches the registry cache', () => {
-        FleetRegistryService.defineAgent({githubUsername: 'iso', harnessType: 'codex'});
+        FleetRegistryService.defineAgent({githubUsername: 'iso', harnessType: 'codex', credential: PAT});
         FleetRegistryService.setLaunchOverride('iso', {command: '/opt/custom', args: [], env: {}});
 
         // attack through the public projection: re-attach a launch + tamper metadata
@@ -271,6 +274,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService.configureAgent — the
         const created = FleetRegistryService.defineAgent({
             githubUsername: 'remote-seat',
             harnessType   : 'codex',
+            credential    : PAT,
             mcpTarget     : {kind: 'tenant', tenantId: 'tenant-a'}
         });
 
@@ -292,6 +296,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService.configureAgent — the
         FleetRegistryService.defineAgent({
             githubUsername: 'first-seat',
             harnessType   : 'codex',
+            credential    : PAT,
             mcpTarget     : {kind: 'tenant', tenantId: 'tenant-a'}
         });
 
@@ -305,7 +310,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService.configureAgent — the
         expect(FleetRegistryService.getAgent('second-seat')).toBeNull();
         expect(fs.readFileSync(path.join(tmpDir, 'registry.json'), 'utf8')).toBe(beforeDefine);
 
-        FleetRegistryService.defineAgent({githubUsername: 'second-seat', harnessType: 'codex'});
+        FleetRegistryService.defineAgent({githubUsername: 'second-seat', harnessType: 'codex', credential: PAT});
 
         // The incumbent may re-assert its own canonical target, but another seat may not claim it.
         expect(FleetRegistryService.configureAgent({
@@ -335,6 +340,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService.configureAgent — the
         FleetRegistryService.defineAgent({
             githubUsername: 'portable',
             harnessType   : 'codex',
+            credential    : PAT,
             mcpTarget     : {kind: 'tenant', tenantId: 'tenant-a'}
         });
 
@@ -354,7 +360,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService.configureAgent — the
     });
 
     test('target grammar rejects every transport, secret, or authority-bearing shape without a write', () => {
-        FleetRegistryService.defineAgent({githubUsername: 'target-guard', harnessType: 'codex'});
+        FleetRegistryService.defineAgent({githubUsername: 'target-guard', harnessType: 'codex', credential: PAT});
         const before = fs.readFileSync(path.join(tmpDir, 'registry.json'), 'utf8');
 
         const rejected = [
@@ -388,6 +394,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService.configureAgent — the
         FleetRegistryService.defineAgent({
             githubUsername: 'ada',
             harnessType   : 'codex',
+            credential    : PAT,
             mcpServers    : {'neural-link': false}
         });
 
@@ -409,7 +416,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService.configureAgent — the
     });
 
     test('strict curated intent rejects unknown/non-boolean/authority-crossing fields without a write', () => {
-        FleetRegistryService.defineAgent({githubUsername: 'vega', harnessType: 'codex'});
+        FleetRegistryService.defineAgent({githubUsername: 'vega', harnessType: 'codex', credential: PAT});
         const before = fs.readFileSync(path.join(tmpDir, 'registry.json'), 'utf8');
 
         const rejected = [
@@ -434,7 +441,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService.configureAgent — the
     });
 
     test('fresh registry hydration returns the persisted sparse configuration', () => {
-        FleetRegistryService.defineAgent({githubUsername: 'fresh', harnessType: 'codex'});
+        FleetRegistryService.defineAgent({githubUsername: 'fresh', harnessType: 'codex', credential: PAT});
         FleetRegistryService.configureAgent({id: 'fresh', mcpServers: {'memory-core': false}});
 
         const otherDir = fs.mkdtempSync(path.join(os.tmpdir(), 'neo-fleet-reg-other-'));
@@ -520,7 +527,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService.configureAgent — the
     });
 
     test('a failed atomic publish leaves both cache and registry.json on the prior accepted state', () => {
-        FleetRegistryService.defineAgent({githubUsername: 'atomic', harnessType: 'codex'});
+        FleetRegistryService.defineAgent({githubUsername: 'atomic', harnessType: 'codex', credential: PAT});
 
         const
             beforeAgent  = FleetRegistryService.getAgent('atomic'),
@@ -558,20 +565,20 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService — launch ownership',
 
     test('a definition without launchOwner reads external: a row persisted before the field, and a define without it', () => {
         fs.writeFileSync(path.join(tmpDir, 'registry.json'), JSON.stringify({agents: {legacy: {
-            id: 'legacy', githubUsername: 'legacy', harnessType: 'codex', modelProvider: 'ollama', metadata: {},
+            id        : 'legacy', githubUsername: 'legacy', harnessType: 'codex', modelProvider: 'ollama', metadata: {},
             mcpServers: null, mcpTarget: null, createdAt: '2026-08-01T00:00:00.000Z', updatedAt: '2026-08-01T00:00:00.000Z'
         }}}));
 
         FleetRegistryService.dataDir = tmpDir;
 
         expect(FleetRegistryService.getAgent('legacy').launchOwner).toBe('external');
-        expect(FleetRegistryService.defineAgent({githubUsername: 'onboarded', harnessType: 'codex'}).launchOwner).toBe('external')
+        expect(FleetRegistryService.defineAgent({githubUsername: 'onboarded', harnessType: 'codex', credential: PAT}).launchOwner).toBe('external')
     });
 
     test('defineAgent takes fleet launch ownership as creation intent, and refuses any other value without a write', () => {
         FleetRegistryService.dataDir = tmpDir;
 
-        expect(FleetRegistryService.defineAgent({githubUsername: 'cockpit', harnessType: 'codex', launchOwner: 'fleet'}).launchOwner).toBe('fleet');
+        expect(FleetRegistryService.defineAgent({githubUsername: 'cockpit', harnessType: 'codex', credential: PAT, launchOwner: 'fleet'}).launchOwner).toBe('fleet');
         expect(() => FleetRegistryService.defineAgent({githubUsername: 'bad', harnessType: 'codex', launchOwner: 'banana'}))
             .toThrow(/FleetRegistryService\.defineAgent: invalid launchOwner 'banana'/);
         expect(FleetRegistryService.getAgent('bad')).toBeNull()
@@ -579,7 +586,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService — launch ownership',
 
     test('setLaunchOwner flips the fact and records when; an unknown id writes nothing, a bad value throws', () => {
         FleetRegistryService.dataDir = tmpDir;
-        FleetRegistryService.defineAgent({githubUsername: 'seat', harnessType: 'codex'});
+        FleetRegistryService.defineAgent({githubUsername: 'seat', harnessType: 'codex', credential: PAT});
 
         const adopted = FleetRegistryService.setLaunchOwner('seat', 'fleet');
 
@@ -592,9 +599,9 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService — launch ownership',
 
     test('launchRefusalOf: a row with no ownership act and a fleet-owned row start as before; a release through setLaunchOwner refuses, and an adoption lifts it', () => {
         FleetRegistryService.dataDir = tmpDir;
-        FleetRegistryService.defineAgent({githubUsername: 'default', harnessType: 'codex'});
-        FleetRegistryService.defineAgent({githubUsername: 'born',    harnessType: 'codex', launchOwner: 'fleet'});
-        FleetRegistryService.defineAgent({githubUsername: 'seat',    harnessType: 'codex', launchOwner: 'fleet'});
+        FleetRegistryService.defineAgent({githubUsername: 'default', harnessType: 'codex', credential: PAT});
+        FleetRegistryService.defineAgent({githubUsername: 'born',    harnessType: 'codex', credential: PAT, launchOwner: 'fleet'});
+        FleetRegistryService.defineAgent({githubUsername: 'seat',    harnessType: 'codex', credential: PAT, launchOwner: 'fleet'});
 
         const refusalOf = id => launchRefusalOf(FleetRegistryService.getAgent(id));
 
@@ -614,9 +621,9 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService — launch ownership',
         FleetRegistryService.dataDir = tmpDir;
 
         const
-            omitted   = FleetRegistryService.defineAgent({githubUsername: 'omitted',  harnessType: 'codex'}),
-            fleet     = FleetRegistryService.defineAgent({githubUsername: 'fleet',    harnessType: 'codex', launchOwner: 'fleet'}),
-            external  = FleetRegistryService.defineAgent({githubUsername: 'external', harnessType: 'codex', launchOwner: 'external'}),
+            omitted   = FleetRegistryService.defineAgent({githubUsername: 'omitted',  harnessType: 'codex', credential: PAT}),
+            fleet     = FleetRegistryService.defineAgent({githubUsername: 'fleet',    harnessType: 'codex', credential: PAT, launchOwner: 'fleet'}),
+            external  = FleetRegistryService.defineAgent({githubUsername: 'external', harnessType: 'codex', credential: PAT, launchOwner: 'external'}),
             refusalOf = id => launchRefusalOf(FleetRegistryService.getAgent(id));
 
         // the omitted default is not an act: no timestamp, the process record stays the only gate
@@ -643,7 +650,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService — launch ownership',
 
     test('no other write surface changes launchOwner', () => {
         FleetRegistryService.dataDir = tmpDir;
-        FleetRegistryService.defineAgent({githubUsername: 'owned', harnessType: 'codex', launchOwner: 'fleet'});
+        FleetRegistryService.defineAgent({githubUsername: 'owned', harnessType: 'codex', credential: PAT, launchOwner: 'fleet'});
 
         // a metadata key of the same name is only metadata: nothing reads it as the fact
         FleetRegistryService.updateAgent('owned', {metadata: {launchOwner: 'external'}});

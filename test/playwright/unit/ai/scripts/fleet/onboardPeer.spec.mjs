@@ -19,6 +19,7 @@ import {
     buildLoginCommand,
     buildOnboardingIntent,
     createOnboardingFleetBridge,
+    defineRequestOf,
     deriveAuthHandoff,
     normalizeToken,
     originDevRosterHasResident,
@@ -159,8 +160,8 @@ test.describe('onboardPeer — intent construction (pure half)', () => {
 test.describe('onboardPeer — the two-phase planner', () => {
 
     test('PHASE A: an un-rostered resident ends at the roster ceremony PRINT + the operator gate', () => {
-        const intent = buildIntent(REPO_OPTIONS),
-              plan   = planOnboarding({intent, facts: {agent: null, rosterHasResident: false}});
+        const intent = buildIntent({...REPO_OPTIONS, credentialEnv: 'NEO_ONBOARD_PAT'}),
+              plan   = planOnboarding({intent, facts: {agent: null, rosterHasResident: false, credentialPresent: true}});
 
         expect(plan.phase).toBe('A');
         expect(plan.segments.map(segment => [segment.key, segment.action])).toEqual([
@@ -184,6 +185,39 @@ test.describe('onboardPeer — the two-phase planner', () => {
         expect(plan.gateMessage).toContain('who_is_online({verbose:true})');
         // Phase A NEVER contains a launch segment — launching an un-rostered resident is refused by omission
         expect(plan.segments.some(segment => segment.key === 'launch')).toBe(false);
+    });
+
+    test('a new resident is defined with its GitHub PAT or not at all: no --credential-env, or an unset variable, refuses at define', () => {
+        const
+            unnamed = planOnboarding({intent: buildIntent(REPO_OPTIONS), facts: {agent: null, rosterHasResident: false}}),
+            named   = buildIntent({...REPO_OPTIONS, credentialEnv: 'NEO_ONBOARD_PAT'}),
+            unset   = planOnboarding({intent: named, facts: {agent: null, rosterHasResident: false, credentialPresent: false}}),
+            set     = planOnboarding({intent: named, facts: {agent: null, rosterHasResident: false, credentialPresent: true}});
+
+        expect(unnamed.segments[0]).toMatchObject({key: 'define', action: 'REFUSE'});
+        expect(unnamed.segments[0].detail).toContain('--credential-env');
+        expect(unset.segments[0]).toMatchObject({key: 'define', action: 'REFUSE'});
+        expect(unset.segments[0].detail).toContain("'NEO_ONBOARD_PAT' is unset or empty");
+        expect(set.segments[0]).toMatchObject({key: 'define', action: 'CREATE'});
+        expect(set.segments[0].detail).toContain("PAT from 'NEO_ONBOARD_PAT'")
+    });
+
+    test('--credential-env takes a variable NAME; the define request carries the PAT read from it, and the plan never prints it', () => {
+        expect(buildOnboardingIntent({...BASE_OPTIONS, credentialEnv: 'ghp_notAName123'}).valid).toBe(false);
+        expect(parseOnboardArgs(['--credential-env', 'NEO_ONBOARD_PAT']).options.credentialEnv).toBe('NEO_ONBOARD_PAT');
+
+        const
+            intent = buildIntent({...REPO_OPTIONS, credentialEnv: 'NEO_ONBOARD_PAT'}),
+            env    = {NEO_ONBOARD_PAT: 'ghp_value_under_test'},
+            report = renderPlan(intent, planOnboarding({intent, facts: {agent: null, rosterHasResident: false, credentialPresent: true}})).join('\n');
+
+        expect(defineRequestOf(intent, env)).toEqual({
+            id            : 'neo-gpt-2',
+            githubUsername: 'neo-gpt-2',
+            harnessType   : 'codex',
+            credential    : 'ghp_value_under_test'
+        });
+        expect(report).not.toContain('ghp_value_under_test')
     });
 
     test('PHASE A re-run: existing definition + repo report EXISTS honestly', () => {
@@ -539,7 +573,7 @@ test.describe('onboardPeer — long-lived Fleet owner transport', () => {
             const firstCode = `
                 const {createOnboardingFleetBridge} = await import(${JSON.stringify(moduleUrl)});
                 const bridge = createOnboardingFleetBridge({url: ${JSON.stringify(url)}});
-                await bridge.defineAgent({id:'neo-gpt-2', githubUsername:'neo-gpt-2', harnessType:'codex'});
+                await bridge.defineAgent({id:'neo-gpt-2', githubUsername:'neo-gpt-2', harnessType:'codex', credential:'ghp_fixture_only'});
                 await bridge.setRepo({id:'neo-gpt-2', cloneUrl:'https://github.com/x/y.git', repoSlug:'x/y'});
                 console.log(JSON.stringify(await bridge.startAgent('neo-gpt-2')));
             `;

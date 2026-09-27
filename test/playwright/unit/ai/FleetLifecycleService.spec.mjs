@@ -58,6 +58,9 @@ function makeSpawnStub() {
     return fn;
 }
 
+/** Every agent holds a GitHub PAT; a known agent resolves this one unless `creds` names another. */
+const FIXTURE_PAT = 'ghp_fixture_only';
+
 /** A minimal registry stub so lifecycle specs never touch the real on-disk credential store. */
 function makeRegistry(agents, creds) {
     return {
@@ -65,7 +68,8 @@ function makeRegistry(agents, creds) {
         // The spawn path reads the RAW definition (launch visible) — the public getAgent
         // projection redacts metadata.launch, so the service consumes this surface instead.
         getDefinition    : id => agents[id] || null,
-        resolveCredential: id => (Object.hasOwn(creds, id) ? creds[id] : null),
+        // `creds: {id: null}` models an agent stored without a PAT.
+        resolveCredential: id => (Object.hasOwn(creds, id) ? creds[id] : (agents[id] ? FIXTURE_PAT : null)),
         // Stub the Bridge-token mint with a deterministic per-id token, so spawn-injection specs can
         // assert env carriage without touching the real registry's crypto store.
         mintBridgeToken  : id => ({token: `bridge_${id}_token`, expiresAt: Date.now() + 3_600_000})
@@ -241,17 +245,14 @@ test.describe('Neo.ai.services.fleet.FleetLifecycleService', () => {
         expect(() => FleetLifecycleService.start('a')).toThrow(/env-key contract/)
     });
 
-    test('a tokenless agent starts with NO credential in its env — the parent\'s ambient token never crosses', () => {
-        const spawn = install({agents: {a: agentDef('a')}, creds: {}});
-        FleetLifecycleService.start('a');
+    test('an agent without a GitHub PAT is refused before the spawn — it never runs on the parent\'s ambient token', () => {
+        const spawn = install({agents: {a: agentDef('a')}, creds: {a: null}});
 
-        // no fleet credential resolved → the slot is EMPTY. The parent process may well carry its
-        // own ambient GH_TOKEN; a tokenless peer silently inheriting it would collapse the
-        // per-agent credential boundary (the cycle-1 review's falsifier) — the minimal allowlisted
-        // child env excludes it by construction.
-        expect(spawn.calls[0].opts.env.GH_TOKEN).toBeUndefined();
-        expect(spawn.calls[0].opts.env.NEO_MCP_REMOTE_TOKEN).toBeUndefined();
-        expect(FleetLifecycleService.isRunning('a')).toBe(true);
+        // untokened, the seat's `gh` would fall back to the machine's keyring account: refused, not
+        // spawned with an empty slot
+        expect(() => FleetLifecycleService.start('a')).toThrow(/agent 'a' has no GitHub PAT stored/);
+        expect(spawn.calls).toHaveLength(0);
+        expect(FleetLifecycleService.isRunning('a')).toBe(false);
     });
 
     test('start refuses an unknown agent', () => {
@@ -924,9 +925,9 @@ test.describe('Neo.ai.services.fleet.FleetLifecycleService — curated launch + 
             FleetLifecycleService.start('a');
 
             const env = spawn.calls[0].opts.env;
-            expect(env.NEO_TEST_AMBIENT_SECRET).toBeUndefined();  // a tokenless peer cannot inherit parent secrets
+            expect(env.NEO_TEST_AMBIENT_SECRET).toBeUndefined();  // a peer cannot inherit parent secrets
             expect(env.PATH).toBe(process.env.PATH);              // benign runtime vars DO cross (the allowlist)
-            expect(env.GH_TOKEN).toBeUndefined();                 // creds:{} → no PAT: nothing leaks from the parent's own GH_TOKEN either
+            expect(env.GH_TOKEN).toBe(FIXTURE_PAT);               // the agent's own PAT, never the parent's GH_TOKEN
             expect(env.NEO_MCP_REMOTE_TOKEN).toBeUndefined();     // no selected plane credential ⇒ remote slot stays empty
         } finally {
             delete process.env.NEO_TEST_AMBIENT_SECRET;

@@ -74,11 +74,11 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService', () => {
 
     test('modelProvider resolves via the AiConfig SSOT leaf when unset and honors an explicit value on creation', () => {
         // unset -> resolves via the AiConfig modelProvider SSOT (read-only; no service-local default shadow)
-        const defaulted = FleetRegistryService.defineAgent({githubUsername: 'prov-default', harnessType: 'codex'});
+        const defaulted = FleetRegistryService.defineAgent({githubUsername: 'prov-default', harnessType: 'codex', credential: 'ghp_default'});
         expect(defaulted.modelProvider).toBe(aiConfig.modelProvider);
 
         // an explicit value wins over the SSOT default
-        const explicit = FleetRegistryService.defineAgent({githubUsername: 'prov-explicit', harnessType: 'codex', modelProvider: 'ollama'});
+        const explicit = FleetRegistryService.defineAgent({githubUsername: 'prov-explicit', harnessType: 'codex', credential: 'ghp_explicit', modelProvider: 'ollama'});
         expect(explicit.modelProvider).toBe('ollama');
 
         // definition is create-only; existing-agent changes use the scoped update/config surfaces
@@ -142,7 +142,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService', () => {
         expect(FleetRegistryService.resolveCredential('rollback-agent')).toBe('ghp_recovered')
     });
 
-    test('a failed rollback leaves an orphan that credentialless creation cannot inherit', () => {
+    test('a failed rollback leaves an orphan no creation inherits: a define without a PAT is refused, and the next define overwrites it', () => {
         const
             writeCredentials = FleetRegistryService.writeCredentials,
             writeRegistry    = FleetRegistryService.writeRegistry;
@@ -177,7 +177,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService', () => {
         expect(() => FleetRegistryService.defineAgent({
             githubUsername: 'orphan-agent',
             harnessType   : 'codex'
-        })).toThrow(/orphan credential.*credentialless creation refused/);
+        })).toThrow(/'credential' is required/);
         expect(FleetRegistryService.getAgent('orphan-agent')).toBeNull();
 
         expect(FleetRegistryService.defineAgent({
@@ -262,6 +262,16 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService', () => {
         expect(() => FleetRegistryService.defineAgent({githubUsername: 'x', harnessType: 'emacs'})).toThrow(/invalid harnessType/);
         expect(() => FleetRegistryService.defineAgent({harnessType: 'codex'})).toThrow(/githubUsername/);
         expect(() => FleetRegistryService.defineAgent({githubUsername: 'x'})).toThrow(/harnessType/);
+    });
+
+    test('every agent holds its GitHub PAT: a define without one, or with a blank one, is refused and writes nothing', () => {
+        for (const credential of [undefined, null, '', '   ']) {
+            expect(() => FleetRegistryService.defineAgent({githubUsername: 'no-pat', harnessType: 'codex', credential}))
+                .toThrow(/'credential' is required — every agent holds its GitHub PAT/);
+        }
+
+        expect(FleetRegistryService.getAgent('no-pat')).toBeNull();
+        expect(FleetRegistryService.resolveCredential('no-pat')).toBeNull()
     });
 
     test('resolveCredential fails closed for an unknown agent', () => {
@@ -375,7 +385,7 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService', () => {
         });
 
         test('removeAgent does NOT revoke the stateless signed token (≤TTL lag, accepted — #13172)', () => {
-            FleetRegistryService.defineAgent({githubUsername: 'gone-agent', harnessType: 'codex'});
+            FleetRegistryService.defineAgent({githubUsername: 'gone-agent', harnessType: 'codex', credential: 'ghp_gone'});
             const {token} = FleetRegistryService.mintBridgeToken('gone-agent');
             expect(verifyWithPublicKey(token).agentId).toBe('gone-agent');
 

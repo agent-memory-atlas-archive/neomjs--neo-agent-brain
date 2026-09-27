@@ -482,14 +482,21 @@ class FleetLifecycleService extends Base {
             }
         }
 
-        // The provisioned remote-seat path resolves and authenticates the PAT BEFORE any checkout
-        // or config mutation, then hands that exact value through here. Own-property semantics are
-        // load-bearing: an explicit `null` is an authenticated negative result and must not trigger
-        // a second registry read that could observe a different credential.
+        // The provisioned start resolves the PAT once, BEFORE any checkout or config mutation, then
+        // hands that exact value through here. Own-property semantics are load-bearing: an explicit
+        // `null` is a resolved negative result and must not trigger a second registry read that
+        // could observe a different credential.
         const pat = Object.hasOwn(opts, 'resolvedCredential')
             ? opts.resolvedCredential
             : this.getRegistry().resolveCredential(id);
-        if (pat != null) env[this.credentialEnvVar] = pat;
+
+        // Every agent holds its GitHub PAT: without one the seat's `gh` falls back to the machine's
+        // keyring account, someone else's identity. Every spawn passes here, restarts included.
+        if (pat == null) {
+            throw new Error(`FleetLifecycleService.start: agent '${id}' has no GitHub PAT stored; store one before starting it.`)
+        }
+
+        env[this.credentialEnvVar] = pat;
 
         // Remote plane bearer: a second provider credential resolved + authenticated by
         // startAgentProvisioned through FleetTenantService. It has NO implicit fallback to the

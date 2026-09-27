@@ -104,7 +104,8 @@ async function spawnPermitted({lifecycleService, registry, agentId, startOptions
  *                                                package root containing this composer.
  * @param {String}   [options.nodePath]         Node executable override for generated MCP definitions.
  * @returns {Promise<Object>} the agent's lifecycle status (see `FleetLifecycleService.status`).
- * @throws {Error} when `lifecycleService` / `agentId` is missing, the agent is unknown, `managedRoot`
+ * @throws {Error} when `lifecycleService` / `agentId` is missing, the agent is unknown or has no GitHub
+ *   PAT stored (refused before any checkout), `managedRoot`
  *   is absent for a repo-bearing agent, a repo-bearing raw launch override would bypass curated
  *   preparation, provisioning/preparation fails (re-thrown — no spawn), or the seat's launch authority
  *   was released while preparation ran ({@link spawnPermitted}).
@@ -137,39 +138,47 @@ export async function startAgentProvisioned({
         repo   = agent.metadata?.repo,
         target = agent.mcpTarget;
 
-    // No repo coordinates ⇒ nothing to provision; start in the inherited cwd (backward-compatible).
-    if (!repo) {
-        if (target?.kind === 'tenant') {
-            throw new Error(`startAgentProvisioned: tenant MCP agent '${agentId}' requires a managed repo.`)
+    // Structural refusals first: none of them may read a secret.
+    if (!repo && target?.kind === 'tenant') {
+        throw new Error(`startAgentProvisioned: tenant MCP agent '${agentId}' requires a managed repo.`)
+    }
+
+    if (repo) {
+        // The managed-workspace contract is coupled to Fleet's curated harness launch. A repo-bearing
+        // raw override can execute an unrelated command and consumes no derived home/MCP artifacts,
+        // so reporting it as prepared would be a false resident-ready claim.
+        if (agent.metadata?.launch) {
+            throw new Error(`startAgentProvisioned: repo-bearing agent '${agentId}' uses a raw metadata.launch override; curated managed-workspace preparation is required.`);
         }
 
-        return spawnPermitted({lifecycleService, registry, agentId});
+        if (!managedRoot) {
+            throw new Error(`startAgentProvisioned: 'managedRoot' is required to provision the repo for agent '${agentId}'.`);
+        }
+        if (typeof agentosRuntimeRoot !== 'string' || !path.isAbsolute(agentosRuntimeRoot)) {
+            throw new Error(`startAgentProvisioned: 'agentosRuntimeRoot' must be an absolute path for agent '${agentId}'.`)
+        }
     }
 
-    // The managed-workspace contract is coupled to Fleet's curated harness launch. A repo-bearing
-    // raw override can execute an unrelated command and consumes no derived home/MCP artifacts, so
-    // reporting it as prepared would be a false resident-ready claim. Reject before repo side effects.
-    if (agent.metadata?.launch) {
-        throw new Error(`startAgentProvisioned: repo-bearing agent '${agentId}' uses a raw metadata.launch override; curated managed-workspace preparation is required.`);
+    // Every agent holds its GitHub PAT. Resolved once, before any checkout or config mutation, and
+    // handed to the spawn so it uses this exact value rather than a second read.
+    const resolvedCredential = registry.resolveCredential(agentId);
+
+    if (resolvedCredential == null) {
+        throw new Error(`startAgentProvisioned: agent '${agentId}' has no GitHub PAT stored; store one before starting it.`)
     }
 
-    if (!managedRoot) {
-        throw new Error(`startAgentProvisioned: 'managedRoot' is required to provision the repo for agent '${agentId}'.`);
-    }
-    if (typeof agentosRuntimeRoot !== 'string' || !path.isAbsolute(agentosRuntimeRoot)) {
-        throw new Error(`startAgentProvisioned: 'agentosRuntimeRoot' must be an absolute path for agent '${agentId}'.`)
+    // No repo coordinates ⇒ nothing to provision; start in the inherited cwd (backward-compatible).
+    if (!repo) {
+        return spawnPermitted({lifecycleService, registry, agentId, startOptions: {resolvedCredential}});
     }
 
     let
         remotePlan                   = null,
-        resolvedCredential,
         resolvedMcpCredential,
         remoteCapability;
 
     if (target?.kind === 'tenant') {
         const activeTenantService = tenantService ?? (await import('./FleetTenantService.mjs')).default;
-
-        resolvedCredential = registry.resolveCredential(agentId);
 
         remotePlan = activeTenantService.resolveMcpResources(target.tenantId);
 
@@ -259,8 +268,9 @@ export async function startAgentProvisioned({
         agentId,
         startOptions: {
             cwd: prepared.targetRepoRoot,
+            resolvedCredential,
             ...(target?.kind === 'tenant'
-                ? {resolvedCredential, resolvedMcpCredential, remoteMcpCapability: remoteCapability}
+                ? {resolvedMcpCredential, remoteMcpCapability: remoteCapability}
                 : {})
         }
     });

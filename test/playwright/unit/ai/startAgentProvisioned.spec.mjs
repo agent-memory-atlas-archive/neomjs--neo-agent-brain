@@ -6,6 +6,9 @@ import {startAgentProvisioned} from '../../../../ai/services/fleet/startAgentPro
 // ensureAgentRepo.spec. The `ensureRepo` + `cloneRepo` seams stand in for the real provisioning chain;
 // the `lifecycleService` stub records every `start` call so the cwd-threading contract is assertable.
 
+/** Every agent holds a GitHub PAT; a known agent resolves this one unless `credentials` names another. */
+const FIXTURE_PAT = 'ghp_fixture_only';
+
 /** A recording FleetLifecycleService stub: tracks start/capability/credential calls. */
 function makeLifecycle({
     agents = {},
@@ -29,7 +32,8 @@ function makeLifecycle({
                 events?.push('credential');
                 calls.credential.push(id);
 
-                return Object.hasOwn(credentials, id) ? credentials[id] : null
+                // `credentials: {id: null}` models an agent stored without a PAT
+                return Object.hasOwn(credentials, id) ? credentials[id] : (definitions[id] ? FIXTURE_PAT : null)
             }
         }),
         getInstanceRoot          : () => '/instances',
@@ -208,10 +212,11 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
             agentosRuntimeRoot: '/installed/neo',
             nodePath          : '/usr/bin/node'
         });
-        expect(events).toEqual(['ensure', 'prepare', 'start']);
+        // the PAT is resolved once, before the checkout, and that exact value reaches the spawn
+        expect(events).toEqual(['credential', 'ensure', 'prepare', 'start']);
         // Runtime authority stays AgentOS-owned; the harness cwd stays the provisioned target root.
         expect(lifecycle.calls.start).toHaveLength(1);
-        expect(lifecycle.calls.start[0]).toEqual({id: 'a', opts: {cwd: '/managed/a/neomjs-neo'}});
+        expect(lifecycle.calls.start[0]).toEqual({id: 'a', opts: {cwd: '/managed/a/neomjs-neo', resolvedCredential: FIXTURE_PAT}});
         expect(status.state).toBe('running');
         expect(status.cwd).toBe('/managed/a/neomjs-neo');
     });
@@ -223,12 +228,33 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
 
         await startAgentProvisioned({lifecycleService: lifecycle, agentId: 'a', managedRoot: '/managed', ensureRepo, prepareWorkspace});
 
-        // nothing to provision; start called with NO opts (no cwd)
+        // nothing to provision; start carries the resolved PAT and NO cwd
         expect(ensureRepo.calls).toHaveLength(0);
         expect(prepareWorkspace.calls).toHaveLength(0);
         expect(lifecycle.calls.start).toHaveLength(1);
         expect(lifecycle.calls.start[0].id).toBe('a');
-        expect(lifecycle.calls.start[0].opts).toBeUndefined();
+        expect(lifecycle.calls.start[0].opts).toEqual({resolvedCredential: FIXTURE_PAT});
+    });
+
+    test('an agent without a GitHub PAT is refused before any checkout, preparation or spawn', async () => {
+        for (const agents of [repoAgent('a'), {a: {id: 'a', metadata: {launch: {command: 'h'}}}}]) {
+            const events           = [],
+                  lifecycle        = makeLifecycle({agents, credentials: {a: null}, events}),
+                  ensureRepo       = makeEnsureRepo('/managed/a/neomjs-neo', events),
+                  prepareWorkspace = makePrepareWorkspace(events);
+
+            await expect(startAgentProvisioned({
+                lifecycleService  : lifecycle,
+                agentId           : 'a',
+                managedRoot       : '/managed',
+                ensureRepo,
+                prepareWorkspace,
+                agentosRuntimeRoot: '/installed/neo'
+            })).rejects.toThrow(/agent 'a' has no GitHub PAT stored/);
+
+            expect(events).toEqual(['credential']);
+            expect(lifecycle.calls.start).toEqual([])
+        }
     });
 
     test('a remote seat keeps repository and plane credentials distinct through readiness and spawn', async () => {
@@ -357,10 +383,10 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
         }])
     });
 
-    test('a remote seat may use a public repository without substituting its plane bearer as GH_TOKEN', async () => {
+    test('a remote seat carries its own PAT to the spawn, never its plane bearer in its place', async () => {
         const
             agents           = remoteRepoAgent('a'),
-            lifecycle        = makeLifecycle({agents, credentials: {}}),
+            lifecycle        = makeLifecycle({agents, credentials: {a: 'ghp_seat_only'}}),
             tenantService    = makeTenantService({credential: 'glpat_plane_only'}),
             ensureRepo       = makeEnsureRepo('/managed/a/neomjs-neo'),
             prepareWorkspace = makePrepareWorkspace();
@@ -379,7 +405,7 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
             id  : 'a',
             opts: {
                 cwd                  : '/managed/a/neomjs-neo',
-                resolvedCredential   : null,
+                resolvedCredential   : 'ghp_seat_only',
                 resolvedMcpCredential: 'glpat_plane_only',
                 remoteMcpCapability  : {
                     harnessType     : 'codex',
@@ -666,7 +692,7 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
             }
         })).rejects.toThrow(/released while its start was being prepared/);
 
-        expect(events).toEqual(['ensure', 'release', 'prepare']);
+        expect(events).toEqual(['credential', 'ensure', 'release', 'prepare']);
         expect(lifecycle.calls.start).toEqual([])
     });
 
