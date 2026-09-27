@@ -51,6 +51,103 @@ export function createMessageGraphProjectionProcessor(mailboxService) {
 }
 
 /**
+ * @summary The cadence at which the drain host runs the mailbox's post-marker integrity repair.
+ *
+ * `repairMessageGraphIntegrity` covers projections damaged AFTER their WAL record was marked
+ * projected (row loss, FK cascades, destructive clears). It used to run on every `listMessages`
+ * and `countMessages` call, so each cockpit tick and each turn start paid a candidate scan of the
+ * whole message WAL. It now rides the drain host at this cadence: the drain loop is the one place
+ * that already owns the WAL's reconciliation, and a minute of latency on a maintenance-class
+ * repair costs no read anything.
+ * @type {Number}
+ */
+export const MESSAGE_GRAPH_REPAIR_CADENCE_MS = 60_000;
+
+/**
+ * @summary The cadence at which the drain host logs a digest of every repair pass since the last
+ * digest — the clean and deferred-only passes the per-pass line (a change or a failure) never
+ * mentions.
+ * @type {Number}
+ */
+export const MESSAGE_GRAPH_REPAIR_DIGEST_MS = 3_600_000;
+
+/**
+ * @summary Builds the after-cycle hook that runs the mailbox's post-marker integrity repair at a
+ * named cadence.
+ *
+ * The first cycle runs it at once (a fresh process may be booting over a damaged projection);
+ * later cycles run it only once `intervalMs` has passed since the last run, and a run still in
+ * flight is joined, never doubled. Observable where it runs, on both hosts' logs: the first pass
+ * and every pass that changed or failed something log their counters (`scanned`, `intact`,
+ * `repaired`, `failed`, `cohortStamped`, the candidate counts); every `digestMs` one digest line
+ * folds ALL passes since the last digest, clean and deferred-only ones included; `getLastSummary()`
+ * and `getDigest()` read the same state in process.
+ * @param {Object} mailboxService Service exposing `repairMessageGraphIntegrity`.
+ * @param {Object} [options]
+ * @param {Number} [options.intervalMs=MESSAGE_GRAPH_REPAIR_CADENCE_MS] Minimum time between runs.
+ * @param {Number} [options.digestMs=MESSAGE_GRAPH_REPAIR_DIGEST_MS] Time between digest lines.
+ * @param {Function} [options.log] Log sink `(level, message)`.
+ * @param {Function} [options.now] Clock source (epoch ms).
+ * @returns {Function} Async after-cycle hook, carrying `getLastSummary()` and `getDigest()`.
+ */
+export function createMessageGraphIntegrityRepairCadence(mailboxService, {intervalMs = MESSAGE_GRAPH_REPAIR_CADENCE_MS, digestMs = MESSAGE_GRAPH_REPAIR_DIGEST_MS, log = () => {}, now = Date.now} = {}) {
+    const freshDigest = at => ({sinceAt: at, passes: 0, clean: 0, changed: 0, errors: 0, scanned: 0, repaired: 0, failed: 0, cohortStamped: 0, deferred: 0});
+
+    let lastRunAt   = null,
+        lastSummary = null,
+        running     = null,
+        digest      = freshDigest(now());
+
+    const hook = () => {
+        if (running) return running;
+        if (lastRunAt !== null && now() - lastRunAt < intervalMs) return Promise.resolve(null);
+
+        running = (async () => {
+            const firstPass = lastRunAt === null;
+
+            try {
+                lastSummary = await mailboxService.repairMessageGraphIntegrity({box: 'all'});
+
+                const changed = lastSummary.repaired > 0 || lastSummary.failed > 0 || (lastSummary.cohortStamped || 0) > 0;
+
+                digest.passes++;
+                digest[changed ? 'changed' : 'clean']++;
+                digest.scanned       += lastSummary.scanned                || 0;
+                digest.repaired      += lastSummary.repaired               || 0;
+                digest.failed        += lastSummary.failed                 || 0;
+                digest.cohortStamped += lastSummary.cohortStamped          || 0;
+                digest.deferred      += lastSummary.deferredCandidateCount || 0;
+
+                if (firstPass || changed) {
+                    log('INFO', `Message graph integrity repair: ${JSON.stringify(lastSummary)}`);
+                }
+            } catch (error) {
+                digest.passes++;
+                digest.errors++;
+                log('ERROR', `Message graph integrity repair failed: ${error.message || error}`);
+            } finally {
+                lastRunAt = now();
+                running   = null;
+
+                if (lastRunAt - digest.sinceAt >= digestMs) {
+                    log('INFO', `Message graph integrity repair digest: ${JSON.stringify({...digest, untilAt: lastRunAt})}`);
+                    digest = freshDigest(lastRunAt);
+                }
+            }
+
+            return lastSummary
+        })();
+
+        return running;
+    };
+
+    hook.getLastSummary = () => lastSummary;
+    hook.getDigest      = () => ({...digest});
+
+    return hook;
+}
+
+/**
  * @summary Processes one batch of accepted message WAL records via an injected replay processor.
  *
  * Missing processor is a deliberate non-mutating state for direct unit use. The hosted drain cycle
@@ -152,11 +249,14 @@ export async function drainMessageWalOnce({
  * @param {Function} [options.log] Log sink.
  * @param {Function} [options.now] Clock source (epoch ms), injected into the disposition receipt so
  *     its `at` timestamp is testable without a real clock. Defaults to `Date.now`.
+ * @param {Function|null} [options.afterCycle] Runs after each completed cycle with its summary —
+ *     the seat of {@link createMessageGraphIntegrityRepairCadence}, so maintenance that used to ride
+ *     the read path rides the drain host instead.
  * @returns {{stop: Function, getDisposition: Function}} Loop handle. `stop()` ends the loop
  *     (idempotent); `getDisposition()` returns this plane's drain receipt
  *     (`{state, drainedClean, reason, counts, at}` — see {@link createDrainDispositionTracker}).
  */
-export function startMessageDrainLoop({getConfig, getProcessor = () => null, log = () => {}, now = Date.now}) {
+export function startMessageDrainLoop({getConfig, getProcessor = () => null, log = () => {}, now = Date.now, afterCycle = null}) {
     let stopped        = false,
         timer          = null,
         inactiveLogged = false;
@@ -194,6 +294,10 @@ export function startMessageDrainLoop({getConfig, getProcessor = () => null, log
 
             if (summary.drained > 0 || summary.failed > 0) {
                 log('INFO', `Message WAL drain cycle: ${JSON.stringify(summary)}`);
+            }
+
+            if (afterCycle) {
+                await afterCycle(summary);
             }
         } catch (error) {
             disposition.recordFailure(error);

@@ -16,6 +16,7 @@ import path       from 'path';
 import {execSync} from 'child_process';
 
 import {
+    createMessageGraphIntegrityRepairCadence,
     createMessageGraphProjectionProcessor,
     startMessageDrainLoop
 } from './drainCycle.mjs';
@@ -245,6 +246,7 @@ async function main() {
     startMessageDrainLoop({
         getConfig   : () => memoryCoreConfig.messageWal,
         getProcessor: () => createMessageGraphProjectionProcessor(MailboxService),
+        afterCycle  : createMessageGraphIntegrityRepairCadence(MailboxService, {log: writeLog}),
         log         : writeLog
     });
 }

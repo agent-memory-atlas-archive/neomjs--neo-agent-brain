@@ -176,7 +176,14 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
             }
         });
 
-        GraphService.linkNodes(messageId, broadcast ? 'AGENT:*' : recipient, 'SENT_TO', 1, {});
+        // A routing edge to `AGENT:*` carries its classified cohort: the mailbox SQL reads an
+        // unstamped one as unknown provenance and serves it to nobody. A carrier with delivery
+        // edges is a modern broadcast of one; one without is the genuine-legacy fixture.
+        const cohortStamp = broadcast
+            ? {broadcastCohort: 'known', intendedRecipientCount: 1}
+            : recipient === 'AGENT:*' ? {broadcastCohort: 'legacy-unknown'} : {};
+
+        GraphService.linkNodes(messageId, broadcast ? 'AGENT:*' : recipient, 'SENT_TO', 1, cohortStamp);
 
         if (broadcast) {
             GraphService.linkNodes(messageId, recipient, 'DELIVERED_TO', 1, {readAt});
@@ -779,7 +786,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
         expect(GraphService.db.storage.db.prepare('SELECT count(*) AS count FROM Edges WHERE source = ?').get(messageId).count).toBe(0);
     });
 
-    test('listMessages/getMessage repair projected direct messages after graph row loss (#14426)', async () => {
+    test('the drain host\'s repair rebuilds a direct message after graph row loss, and listMessages/getMessage then serve it (#14426, #563)', async () => {
         await RequestContextService.run({ agentIdentityNodeId: '@bob' }, async () => {
             await PermissionService.grantPermission({ to: '@alice', scope: 'CAN_REPLY_TO' });
         });
@@ -796,6 +803,16 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
 
         GraphService.db.storage.db.prepare('DELETE FROM Nodes WHERE id = ?').run(res.messageId);
         clearGraphCacheWithoutStorageMutation();
+
+        // The post-marker repair left the read path — the drain host runs it at its cadence
+        // (`createMessageGraphIntegrityRepairCadence`, this is its call), and a read that came
+        // first serves the page without the lost row rather than rebuilding it.
+        const lostInbox = await RequestContextService.run({ agentIdentityNodeId: '@bob' }, async () => {
+            return await MailboxService.listMessages({status: 'all'});
+        });
+        expect(lostInbox.messages.map(message => message.messageId), 'a read repairs nothing').not.toContain(res.messageId);
+
+        expect(await MailboxService.repairMessageGraphIntegrity({box: 'all'})).toMatchObject({repaired: 1, failed: 0});
 
         const bobInbox = await RequestContextService.run({ agentIdentityNodeId: '@bob' }, async () => {
             return await MailboxService.listMessages({status: 'all'});
@@ -815,7 +832,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
         expect(repairCheck).toMatchObject({scanned: 1, intact: 1, repaired: 0, failed: 0});
     });
 
-    test('listMessages repairs a broadcast whose WHOLE DELIVERED_TO cohort was lost — read-path, no prior mark (#15369)', async () => {
+    test('the drain host\'s repair rebuilds a broadcast whose WHOLE DELIVERED_TO cohort was lost — no prior mark, off the read path (#15369, #563)', async () => {
         // @bob authorizes @alice; @alice broadcasts to AGENT:* (bob + charlie are the immutable
         // send-time audience). Multi-recipient intent proves a whole-cohort repair, not a one-edge
         // special case.
@@ -845,15 +862,18 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
             'storage cohort is truly gone — not a cache-only eviction that self-heals on reload'
         ).toBe(0);
 
-        // The read path, NO prior mark: a recipient LISTS. The message stays visible via the surviving
-        // SENT_TO → AGENT:* sentinel, so the loss is silent — but the per-recipient DELIVERED_TO cohort
-        // (delivery + read-state) is gone. Pre-fix the blind gate early-returns at scanned:0, so the list
-        // leaves the cohort broken; post-fix the broadcast-cohort term flips the gate and the WAL-backed
-        // repair rebuilds it during the read.
+        // NO prior mark. The message stays visible via the surviving SENT_TO → AGENT:* sentinel, so
+        // the loss is silent — but the per-recipient DELIVERED_TO cohort (delivery + read-state) is
+        // gone. The blind gate once early-returned at scanned:0 and left the cohort broken; the
+        // broadcast-cohort term flips the gate and the WAL-backed repair rebuilds it. The repair runs
+        // from the drain host at its cadence, not from the read: this is the cadence's call, over an
+        // unreadable stray segment it must tolerate.
         const bogusSegment = path.join(messageWalDir, 'message-wal-2001-01-01.jsonl');
         fs.ensureDirSync(bogusSegment);
 
         try {
+            expect(await MailboxService.repairMessageGraphIntegrity({box: 'all'})).toMatchObject({repaired: 1, failed: 0});
+
             const bobInbox = await RequestContextService.run({agentIdentityNodeId: '@bob'}, async () => {
                 return await MailboxService.listMessages({status: 'all'});
             });
@@ -871,10 +891,159 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
         `).all(res.messageId).map(row => row.target)).toEqual(['@bob', '@charlie']);
 
         // THE discriminating assertion (red-proof confirmed by disabling the new term): a follow-up
-        // integrity scan finds the cohort already rebuilt by the read. Without the fix the list never
-        // repairs, so this scan reports `repaired: 1` — the exact never-self-heals defect this closes.
+        // integrity scan finds the cohort already rebuilt by the cadence's pass. Without the fix that
+        // pass never repairs, so this scan reports `repaired: 1` — the exact never-self-heals defect
+        // this closes.
         const repairCheck = await MailboxService.repairMessageGraphIntegrity({ids: [res.messageId]});
         expect(repairCheck).toMatchObject({scanned: 1, intact: 1, repaired: 0, failed: 0});
+    });
+
+    test('a modern broadcast whose delivery cohort is missing admits no outsider before the drain host\'s repair, and its intended recipients after it', async () => {
+        await RequestContextService.run({agentIdentityNodeId: '@bob'}, () => PermissionService.grantPermission({to: '@alice', scope: 'CAN_REPLY_TO'}));
+        GraphService.upsertNode({id: '@charlie', type: 'AgentIdentity', name: 'Charlie', properties: {accountType: 'agent'}});
+
+        const res = await RequestContextService.run({agentIdentityNodeId: '@alice'}, () =>
+            MailboxService.addMessage({to: 'AGENT:*', subject: 'cohort membership', body: 'bob and charlie only'})
+        );
+
+        // @dave registers AFTER the send: never in the cohort, the outsider every reading must refuse.
+        GraphService.upsertNode({id: '@dave', type: 'AgentIdentity', name: 'Dave', properties: {accountType: 'agent'}});
+
+        const
+            routingStamp = () => JSON.parse(GraphService.db.storage.db.prepare("SELECT data FROM Edges WHERE source = ? AND type = 'SENT_TO' AND target = 'AGENT:*'").get(res.messageId).data).properties,
+            inboxIds     = identity => RequestContextService.run({agentIdentityNodeId: identity}, async () =>
+                (await MailboxService.listMessages({box: 'inbox', status: 'all'})).messages.map(message => message.messageId)),
+            inboxCount   = identity => RequestContextService.run({agentIdentityNodeId: identity}, async () =>
+                (await MailboxService.countMessages({box: 'inbox', status: 'all'})).count);
+
+        expect(routingStamp(), 'the routing edge carries the send-time cohort').toMatchObject({broadcastCohort: 'known', intendedRecipientCount: 2});
+        expect(await inboxIds('@bob')).toContain(res.messageId);
+        expect(await inboxIds('@dave'), 'an intact cohort never reaches an outsider').not.toContain(res.messageId);
+
+        expect(damageEdgeProjection(res.messageId, 'DELIVERED_TO'), 'the whole two-recipient cohort is lost').toBe(2);
+
+        // The interval before the repair: the damaged broadcast is visible to NOBODY — not to the
+        // outsider (a known positive cohort is no legacy broadcast, whatever its edges say) and not
+        // yet to its recipients (their edges are what the repair restores).
+        expect(await inboxIds('@dave'), 'list: no outsider before the repair').not.toContain(res.messageId);
+        expect(await inboxCount('@dave'), 'count: no outsider before the repair').toBe(0);
+        expect(await inboxIds('@bob'), 'a recipient waits for the repair').not.toContain(res.messageId);
+
+        expect(await MailboxService.repairMessageGraphIntegrity({box: 'all'})).toMatchObject({repaired: 1, failed: 0, cohortStamped: 0});
+
+        expect(await inboxIds('@bob'), 'the intended recipient recovers the message').toContain(res.messageId);
+        expect(await inboxIds('@charlie')).toContain(res.messageId);
+        expect(await inboxIds('@dave'), 'the outsider never sees it').not.toContain(res.messageId);
+        expect(await inboxCount('@dave')).toBe(0);
+    });
+
+    test('a broadcast with no send-time cohort ever recorded keeps its legacy reading — visible to every registered agent — and so does a known zero-audience one', async () => {
+        const
+            legacyId = 'MESSAGE:legacy-no-cohort-recorded',
+            zeroId   = 'MESSAGE:known-zero-audience',
+            sentAt   = new Date().toISOString(),
+            record   = (id, routing) => ({
+                id,
+                timestamp             : Date.parse(sentAt),
+                sentAt,
+                graphProjectionVersion: 1,
+                message               : {
+                    id,
+                    type      : 'MESSAGE',
+                    name      : id,
+                    properties: {subject: id, bodyText: 'broadcast', sentAt, readAt: null, from: '@alice', to: 'AGENT:*', userId: 'alice', sharedEntity: true}
+                },
+                routing
+            }),
+            routingStamp = id => JSON.parse(GraphService.db.storage.db.prepare("SELECT data FROM Edges WHERE source = ? AND type = 'SENT_TO' AND target = 'AGENT:*'").get(id).data).properties;
+
+        // A historical record has no `broadcastRecipients` at all; a modern zero-audience one has `[]`.
+        await MailboxService._projectMessageWalRecord(record(legacyId, {sentBy: '@alice', to: 'AGENT:*', senderUserId: 'alice'}), {pumpWake: false, appendMarker: false});
+        await MailboxService._projectMessageWalRecord(record(zeroId, {sentBy: '@alice', to: 'AGENT:*', senderUserId: 'alice', broadcastRecipients: []}), {pumpWake: false, appendMarker: false});
+
+        expect(routingStamp(legacyId)).toMatchObject({broadcastCohort: 'legacy-unknown'});
+        expect(routingStamp(legacyId).intendedRecipientCount).toBeUndefined();
+        expect(routingStamp(zeroId)).toMatchObject({broadcastCohort: 'known', intendedRecipientCount: 0});
+
+        const bob = await RequestContextService.run({agentIdentityNodeId: '@bob'}, () => MailboxService.listMessages({box: 'inbox', status: 'all'}));
+
+        expect(bob.messages.map(message => message.messageId)).toEqual(expect.arrayContaining([legacyId, zeroId]));
+        expect(bob.totalCount).toBe(2);
+    });
+
+    test('a routing edge projected before the cohort stamp is unknown provenance: served to nobody, stamped by the read path\'s gate before the first page a process serves, and by the repair pass as the steady-state fallback', async () => {
+        await RequestContextService.run({agentIdentityNodeId: '@bob'}, () => PermissionService.grantPermission({to: '@alice', scope: 'CAN_REPLY_TO'}));
+        GraphService.upsertNode({id: '@charlie', type: 'AgentIdentity', name: 'Charlie', properties: {accountType: 'agent'}});
+
+        const res = await RequestContextService.run({agentIdentityNodeId: '@alice'}, () =>
+            MailboxService.addMessage({to: 'AGENT:*', subject: 'pre-stamp routing edge', body: 'projected before the edge carried its cohort'})
+        );
+
+        GraphService.upsertNode({id: '@dave', type: 'AgentIdentity', name: 'Dave', properties: {accountType: 'agent'}});
+
+        const
+            sqlite       = GraphService.db.storage.db,
+            routingStamp = () => JSON.parse(sqlite.prepare("SELECT data FROM Edges WHERE source = ? AND type = 'SENT_TO' AND target = 'AGENT:*'").get(res.messageId).data).properties,
+            inboxIds     = identity => RequestContextService.run({agentIdentityNodeId: identity}, async () =>
+                (await MailboxService.listMessages({box: 'inbox', status: 'all'})).messages.map(message => message.messageId)),
+            inboxCount   = identity => RequestContextService.run({agentIdentityNodeId: identity}, async () =>
+                (await MailboxService.countMessages({box: 'inbox', status: 'all'})).count),
+            // A projection from before the stamp existed: strip it from storage and the cache.
+            stripStamp   = () => {
+                sqlite.prepare("UPDATE Edges SET data = json_remove(data, '$.properties.broadcastCohort', '$.properties.intendedRecipientCount') WHERE source = ? AND type = 'SENT_TO' AND target = 'AGENT:*'").run(res.messageId);
+                for (const edge of GraphService.db.edges.items.filter(candidate => candidate.source === res.messageId && candidate.type === 'SENT_TO')) {
+                    delete edge.properties.broadcastCohort;
+                    delete edge.properties.intendedRecipientCount;
+                }
+                expect(routingStamp().broadcastCohort).toBeUndefined();
+            };
+
+        stripStamp();
+        expect(damageEdgeProjection(res.messageId, 'DELIVERED_TO')).toBe(2);
+
+        // Unknown provenance is fail-closed: an unstamped edge is no legacy broadcast, so it admits
+        // nobody — the outsider least of all — in the list and in the count.
+        expect(await inboxIds('@dave'), 'unknown is not legacy').not.toContain(res.messageId);
+        expect(await inboxCount('@dave')).toBe(0);
+
+        // A fresh process meets this projection through the read path's gate: before its first page
+        // is served, the edge is stamped from the cohort the marker index recorded — so the outsider
+        // is refused before the first repair, and the recipient waits for it.
+        MailboxService._resetBroadcastCohortStampGate();
+        expect(await inboxIds('@dave'), 'the gate stamped it before serving').not.toContain(res.messageId);
+        expect(routingStamp()).toMatchObject({broadcastCohort: 'known', intendedRecipientCount: 2});
+        expect(await inboxCount('@dave')).toBe(0);
+        expect(await inboxIds('@bob'), 'the recipient waits for the repair').not.toContain(res.messageId);
+
+        expect(await MailboxService.repairMessageGraphIntegrity({box: 'all'})).toMatchObject({repaired: 1, failed: 0, cohortStamped: 0});
+        expect(await inboxIds('@bob')).toContain(res.messageId);
+        expect(await inboxIds('@dave')).not.toContain(res.messageId);
+
+        // The steady-state fallback: an edge that loses its stamp with the gate long settled admits
+        // nobody meanwhile, and the next pass stamps it and restores the cohort in one go.
+        stripStamp();
+        expect(damageEdgeProjection(res.messageId, 'DELIVERED_TO')).toBe(2);
+        expect(await inboxIds('@dave'), 'no outsider between passes either').not.toContain(res.messageId);
+        expect(await MailboxService.repairMessageGraphIntegrity({box: 'all'})).toMatchObject({cohortStamped: 1, cohortStampFailed: 0, repaired: 1, failed: 0});
+        expect(routingStamp()).toMatchObject({broadcastCohort: 'known', intendedRecipientCount: 2});
+        expect(await inboxIds('@bob')).toContain(res.messageId);
+        expect(await inboxIds('@dave')).not.toContain(res.messageId);
+    });
+
+    test('a broadcast whose cohort cannot be classified — no marker, no readable WAL record — stays unknown after the gate: served to nobody, never read as legacy', async () => {
+        const unknownId = 'MESSAGE:broadcast-of-unknown-provenance';
+
+        GraphService.upsertNode({id: unknownId, type: 'MESSAGE', name: 'unknown provenance', properties: {subject: 'unknown provenance', readAt: null, sentAt: new Date().toISOString()}});
+        GraphService.linkNodes(unknownId, '@alice', 'SENT_BY', 1, {});
+        GraphService.linkNodes(unknownId, 'AGENT:*', 'SENT_TO', 1, {});
+
+        MailboxService._resetBroadcastCohortStampGate();
+
+        const bob = await RequestContextService.run({agentIdentityNodeId: '@bob'}, () => MailboxService.listMessages({box: 'inbox', status: 'all'}));
+
+        expect(bob.messages.map(message => message.messageId), 'unknown provenance is served to nobody').not.toContain(unknownId);
+        expect(bob.totalCount).toBe(0);
+        expect(JSON.parse(GraphService.db.storage.db.prepare("SELECT data FROM Edges WHERE source = ? AND type = 'SENT_TO'").get(unknownId).data).properties.broadcastCohort, 'the gate left it unclassified').toBeUndefined();
     });
 
     test('a repair pass costs each candidate its own edges, not every cached edge or a hub reload, and turns the loop between candidates', async () => {
@@ -1020,20 +1189,26 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
         fs.ensureDirSync(bogusSegment);
 
         try {
+            // The read path opens no WAL payload at all; the disposition is the drain host's repair
+            // pass (`createMessageGraphIntegrityRepairCadence`'s call), run here by hand.
             const first = await RequestContextService.run({agentIdentityNodeId: '@alice'}, async () => {
                 return await MailboxService.listMessages({box: 'outbox', status: 'all'});
             });
             expect(first.messages.map(message => message.messageId)).toContain(res.messageId);
-            expect(reads.getCount()).toBe(1);
+            expect(reads.getCount(), 'a list reads no payload').toBe(0);
+
+            await MailboxService.repairMessageGraphIntegrity({box: 'all'});
+            expect(reads.getCount(), 'the first pass reads the accepted payload once').toBe(1);
 
             const markerEntries = fs.readFileSync(markerPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
             expect(markerEntries.at(-1).broadcastCohort).toEqual({disposition: 'legacy-unknown'});
 
+            await MailboxService.repairMessageGraphIntegrity({box: 'all'});
             const second = await RequestContextService.run({agentIdentityNodeId: '@alice'}, async () => {
                 return await MailboxService.listMessages({box: 'outbox', status: 'all'});
             });
             expect(second.messages.map(message => message.messageId)).toContain(res.messageId);
-            expect(reads.getCount(), 'the second list must consume the compatibility marker, not reread WAL').toBe(1);
+            expect(reads.getCount(), 'the second pass must consume the compatibility marker, not reread WAL').toBe(1);
         } finally {
             reads.restore();
             fs.removeSync(bogusSegment);
@@ -1745,7 +1920,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
         }
     });
 
-    test('post-sync canary: accepted unread self-message survives destructive graph clear (#14426)', async () => {
+    test('post-sync canary: accepted unread self-message survives destructive graph clear once the drain host\'s repair ran (#14426, #563)', async () => {
         const res = await RequestContextService.run({ agentIdentityNodeId: '@alice' }, async () => {
             return await MailboxService.addMessage({
                 to     : '@me',
@@ -1758,6 +1933,9 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
 
         await GraphService.db.storage.clear();
         clearGraphCacheWithoutStorageMutation();
+
+        // Neither reader repairs; the drain host's pass rebuilds the projection from the WAL.
+        expect(await MailboxService.repairMessageGraphIntegrity({box: 'all'})).toMatchObject({repaired: 1, failed: 0});
 
         const count = await RequestContextService.run({ agentIdentityNodeId: '@alice' }, async () => {
             return await MailboxService.countMessages({status: 'unread'});
@@ -2854,7 +3032,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
     };
 
     test('#17486 a vanished NODE row yields an honest failure receipt, not a false read', async () => {
-        // RA-2's node control. Before the outcome split, a narrow UPDATE that matched no row was
+        // The node control. Before the outcome split, a narrow UPDATE that matched no row was
         // indistinguishable from a durable one at the boolean, so this returned status:'read' with
         // the no-storage warning — telling an operator their receipt lives in memory when the
         // helper had deliberately not touched cache and the value existed nowhere at all.
@@ -2883,7 +3061,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
     });
 
     test('#17486 a vanished EDGE row fails the same way — one mechanism, both carriers', async () => {
-        // RA-2's edge control. The node arm alone would leave "both carriers share one writer" as a
+        // The edge control. The node arm alone would leave "both carriers share one writer" as a
         // claim about the source; a broadcast receipt travels the DELIVERED_TO edge, and a fix that
         // only reached the node path would keep lying here.
         const {messageId} = await RequestContextService.run({agentIdentityNodeId: '@alice'}, () =>
@@ -3262,7 +3440,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
 
         expect(edgeReadAt().readAt).toBeTruthy();
 
-        // Full replay #1: per-recipient read-state lives on the DELIVERED_TO edge, not the node —
+        // The first full replay: per-recipient read-state lives on the DELIVERED_TO edge, not the node —
         // the reviewer falsifier: pre-fix, this re-link stamped the WAL's readAt: null over it.
         await MailboxService._projectMessageWalRecord(record, {pumpWake: false});
         expect(edgeReadAt().readAt).toBeTruthy();
@@ -3273,7 +3451,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
             await MailboxService.deleteMessage({ messageId: msgId });
         });
 
-        // Full replay #2 over the tombstone + the read edge together.
+        // The second full replay, over the tombstone + the read edge together.
         await MailboxService._projectMessageWalRecord(record, {pumpWake: false});
 
         const node = GraphService.db.storage.db
