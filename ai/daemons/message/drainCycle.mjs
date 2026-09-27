@@ -51,6 +51,69 @@ export function createMessageGraphProjectionProcessor(mailboxService) {
 }
 
 /**
+ * @summary The cadence at which the drain host runs the mailbox's post-marker integrity repair.
+ *
+ * `repairMessageGraphIntegrity` covers projections damaged AFTER their WAL record was marked
+ * projected (row loss, FK cascades, destructive clears). It used to run on every `listMessages`
+ * and `countMessages` call, so each cockpit tick and each turn start paid a candidate scan of the
+ * whole message WAL. It now rides the drain host at this cadence: the drain loop is the one place
+ * that already owns the WAL's reconciliation, and a minute of latency on a maintenance-class
+ * repair costs no read anything.
+ * @type {Number}
+ */
+export const MESSAGE_GRAPH_REPAIR_CADENCE_MS = 60_000;
+
+/**
+ * @summary Builds the after-cycle hook that runs the mailbox's post-marker integrity repair at a
+ * named cadence.
+ *
+ * The first cycle runs it at once (a fresh process may be booting over a damaged projection);
+ * later cycles run it only once `intervalMs` has passed since the last run, and a run still in
+ * flight is joined, never doubled. The repair's own counters (`scanned`, `intact`, `repaired`,
+ * `failed`, the candidate counts) are logged whenever it changed or failed something, and the
+ * last summary stays readable through `getLastSummary()`, so the pass is observable where it runs.
+ * @param {Object} mailboxService Service exposing `repairMessageGraphIntegrity`.
+ * @param {Object} [options]
+ * @param {Number} [options.intervalMs=MESSAGE_GRAPH_REPAIR_CADENCE_MS] Minimum time between runs.
+ * @param {Function} [options.log] Log sink `(level, message)`.
+ * @param {Function} [options.now] Clock source (epoch ms).
+ * @returns {Function} Async after-cycle hook, carrying `getLastSummary()`.
+ */
+export function createMessageGraphIntegrityRepairCadence(mailboxService, {intervalMs = MESSAGE_GRAPH_REPAIR_CADENCE_MS, log = () => {}, now = Date.now} = {}) {
+    let lastRunAt   = null,
+        lastSummary = null,
+        running     = null;
+
+    const hook = () => {
+        if (running) return running;
+        if (lastRunAt !== null && now() - lastRunAt < intervalMs) return Promise.resolve(null);
+
+        running = (async () => {
+            try {
+                lastSummary = await mailboxService.repairMessageGraphIntegrity({box: 'all'});
+
+                if (lastSummary.repaired > 0 || lastSummary.failed > 0) {
+                    log('INFO', `Message graph integrity repair: ${JSON.stringify(lastSummary)}`);
+                }
+            } catch (error) {
+                log('ERROR', `Message graph integrity repair failed: ${error.message || error}`);
+            } finally {
+                lastRunAt = now();
+                running   = null;
+            }
+
+            return lastSummary
+        })();
+
+        return running;
+    };
+
+    hook.getLastSummary = () => lastSummary;
+
+    return hook;
+}
+
+/**
  * @summary Processes one batch of accepted message WAL records via an injected replay processor.
  *
  * Missing processor is a deliberate non-mutating state for direct unit use. The hosted drain cycle
@@ -152,11 +215,14 @@ export async function drainMessageWalOnce({
  * @param {Function} [options.log] Log sink.
  * @param {Function} [options.now] Clock source (epoch ms), injected into the disposition receipt so
  *     its `at` timestamp is testable without a real clock. Defaults to `Date.now`.
+ * @param {Function|null} [options.afterCycle] Runs after each completed cycle with its summary —
+ *     the seat of {@link createMessageGraphIntegrityRepairCadence}, so maintenance that used to ride
+ *     the read path rides the drain host instead.
  * @returns {{stop: Function, getDisposition: Function}} Loop handle. `stop()` ends the loop
  *     (idempotent); `getDisposition()` returns this plane's drain receipt
  *     (`{state, drainedClean, reason, counts, at}` — see {@link createDrainDispositionTracker}).
  */
-export function startMessageDrainLoop({getConfig, getProcessor = () => null, log = () => {}, now = Date.now}) {
+export function startMessageDrainLoop({getConfig, getProcessor = () => null, log = () => {}, now = Date.now, afterCycle = null}) {
     let stopped        = false,
         timer          = null,
         inactiveLogged = false;
@@ -194,6 +260,10 @@ export function startMessageDrainLoop({getConfig, getProcessor = () => null, log
 
             if (summary.drained > 0 || summary.failed > 0) {
                 log('INFO', `Message WAL drain cycle: ${JSON.stringify(summary)}`);
+            }
+
+            if (afterCycle) {
+                await afterCycle(summary);
             }
         } catch (error) {
             disposition.recordFailure(error);

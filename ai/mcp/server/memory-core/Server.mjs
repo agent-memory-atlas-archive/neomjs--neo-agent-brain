@@ -28,6 +28,7 @@ import {startDrainLoop}          from '../../../daemons/embed/drainCycle.mjs';
 import {acquireDrainLock}        from '../../../daemons/embed/drainLock.mjs';
 import MemoryCoreRecorderService from '../../../services/memory-core/MemoryCoreRecorderService.mjs';
 import {
+    createMessageGraphIntegrityRepairCadence,
     createMessageGraphProjectionProcessor,
     startMessageDrainLoop
 } from '../../../daemons/message/drainCycle.mjs';
@@ -393,6 +394,7 @@ class Server extends BaseServer {
                     this.messageWalDrainLoop = startMessageDrainLoop({
                         getConfig   : () => aiConfig.messageWal,
                         getProcessor: () => createMessageGraphProjectionProcessor(MailboxService),
+                        afterCycle  : createMessageGraphIntegrityRepairCadence(MailboxService, {log: messageDrainLog}),
                         log         : messageDrainLog
                     });
                     process.on('exit', () => this.messageWalDrainLock?.release());

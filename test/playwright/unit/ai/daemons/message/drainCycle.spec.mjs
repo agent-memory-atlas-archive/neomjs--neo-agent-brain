@@ -7,10 +7,12 @@ import path           from 'path';
 
 import {appendWalMessage} from '../../../../../../ai/services/memory-core/helpers/messageWalStore.mjs';
 import {
+    createMessageGraphIntegrityRepairCadence,
     createMessageGraphProjectionProcessor,
     drainMessageWalOnce,
     getMessageDrainBackoffDelayMs,
-    processMessageBatch
+    processMessageBatch,
+    startMessageDrainLoop
 } from '../../../../../../ai/daemons/message/drainCycle.mjs';
 
 /**
@@ -43,6 +45,51 @@ test.describe('Neo.ai.daemons.message.drainCycle', () => {
     });
 
     const seed = id => appendWalMessage(record(id), {dir: tmpDir, planeId: 'test-message-plane'});
+
+    test('the integrity repair rides the drain host at its cadence: at once on the first cycle, joined while in flight, then only past the interval (#563)', async () => {
+        const
+            calls   = [],
+            logs    = [],
+            clock   = {now: 1_000},
+            summary = {scanned: 1, intact: 0, repaired: 1, failed: 0},
+            hook    = createMessageGraphIntegrityRepairCadence({
+                async repairMessageGraphIntegrity(options) {
+                    calls.push(options);
+                    return summary
+                }
+            }, {intervalMs: 500, now: () => clock.now, log: (level, message) => logs.push(`${level} ${message}`)});
+
+        const first = hook({drained: 0});
+
+        expect(hook({drained: 0}), 'a run in flight is joined, never doubled').toBe(first);
+        expect(await first, 'the first cycle runs it at once').toBe(summary);
+        expect(calls).toEqual([{box: 'all'}]);
+        expect(hook.getLastSummary()).toBe(summary);
+        expect(logs, 'a pass that repaired something is logged with its counters').toEqual([`INFO Message graph integrity repair: ${JSON.stringify(summary)}`]);
+
+        clock.now += 100;
+        expect(await hook({drained: 0}), 'inside the interval nothing runs').toBeNull();
+        expect(calls).toHaveLength(1);
+
+        clock.now += 500;
+        await hook({drained: 0});
+        expect(calls, 'past the interval it runs again').toHaveLength(2);
+    });
+
+    test('the loop host runs the after-cycle hook once per completed cycle', async () => {
+        const summaries = [];
+        const loop      = startMessageDrainLoop({
+            getConfig   : () => ({dir: tmpDir, batchSize: 5, maxRetries: 0, backoffBaseMs: 1, pollIntervalMs: 10}),
+            getProcessor: () => async () => ({drained: 0, failed: 0, deferred: 0}),
+            afterCycle  : async summary => { summaries.push(summary) }
+        });
+
+        await new Promise(resolve => setTimeout(resolve, 80));
+        loop.stop();
+
+        expect(summaries.length).toBeGreaterThanOrEqual(2);
+        expect(summaries[0]).toMatchObject({observed: 0, drained: 0, outstanding: 0, inactive: false});
+    });
 
     test('without a replay processor, the cycle skips WAL reads instead of doing active no-op work', async () => {
         await seed('MESSAGE:deferred');

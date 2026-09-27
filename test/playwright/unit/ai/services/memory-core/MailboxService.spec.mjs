@@ -779,7 +779,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
         expect(GraphService.db.storage.db.prepare('SELECT count(*) AS count FROM Edges WHERE source = ?').get(messageId).count).toBe(0);
     });
 
-    test('listMessages/getMessage repair projected direct messages after graph row loss (#14426)', async () => {
+    test('the drain host\'s repair rebuilds a direct message after graph row loss, and listMessages/getMessage then serve it (#14426, #563)', async () => {
         await RequestContextService.run({ agentIdentityNodeId: '@bob' }, async () => {
             await PermissionService.grantPermission({ to: '@alice', scope: 'CAN_REPLY_TO' });
         });
@@ -796,6 +796,16 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
 
         GraphService.db.storage.db.prepare('DELETE FROM Nodes WHERE id = ?').run(res.messageId);
         clearGraphCacheWithoutStorageMutation();
+
+        // The post-marker repair left the read path — the drain host runs it at its cadence
+        // (`createMessageGraphIntegrityRepairCadence`, this is its call), and a read that came
+        // first serves the page without the lost row rather than rebuilding it.
+        const lostInbox = await RequestContextService.run({ agentIdentityNodeId: '@bob' }, async () => {
+            return await MailboxService.listMessages({status: 'all'});
+        });
+        expect(lostInbox.messages.map(message => message.messageId), 'a read repairs nothing').not.toContain(res.messageId);
+
+        expect(await MailboxService.repairMessageGraphIntegrity({box: 'all'})).toMatchObject({repaired: 1, failed: 0});
 
         const bobInbox = await RequestContextService.run({ agentIdentityNodeId: '@bob' }, async () => {
             return await MailboxService.listMessages({status: 'all'});
@@ -815,7 +825,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
         expect(repairCheck).toMatchObject({scanned: 1, intact: 1, repaired: 0, failed: 0});
     });
 
-    test('listMessages repairs a broadcast whose WHOLE DELIVERED_TO cohort was lost — read-path, no prior mark (#15369)', async () => {
+    test('the drain host\'s repair rebuilds a broadcast whose WHOLE DELIVERED_TO cohort was lost — no prior mark, off the read path (#15369, #563)', async () => {
         // @bob authorizes @alice; @alice broadcasts to AGENT:* (bob + charlie are the immutable
         // send-time audience). Multi-recipient intent proves a whole-cohort repair, not a one-edge
         // special case.
@@ -845,15 +855,18 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
             'storage cohort is truly gone — not a cache-only eviction that self-heals on reload'
         ).toBe(0);
 
-        // The read path, NO prior mark: a recipient LISTS. The message stays visible via the surviving
-        // SENT_TO → AGENT:* sentinel, so the loss is silent — but the per-recipient DELIVERED_TO cohort
-        // (delivery + read-state) is gone. Pre-fix the blind gate early-returns at scanned:0, so the list
-        // leaves the cohort broken; post-fix the broadcast-cohort term flips the gate and the WAL-backed
-        // repair rebuilds it during the read.
+        // NO prior mark. The message stays visible via the surviving SENT_TO → AGENT:* sentinel, so
+        // the loss is silent — but the per-recipient DELIVERED_TO cohort (delivery + read-state) is
+        // gone. The blind gate once early-returned at scanned:0 and left the cohort broken; the
+        // broadcast-cohort term flips the gate and the WAL-backed repair rebuilds it. The repair runs
+        // from the drain host at its cadence, not from the read: this is the cadence's call, over an
+        // unreadable stray segment it must tolerate.
         const bogusSegment = path.join(messageWalDir, 'message-wal-2001-01-01.jsonl');
         fs.ensureDirSync(bogusSegment);
 
         try {
+            expect(await MailboxService.repairMessageGraphIntegrity({box: 'all'})).toMatchObject({repaired: 1, failed: 0});
+
             const bobInbox = await RequestContextService.run({agentIdentityNodeId: '@bob'}, async () => {
                 return await MailboxService.listMessages({status: 'all'});
             });
@@ -871,8 +884,9 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
         `).all(res.messageId).map(row => row.target)).toEqual(['@bob', '@charlie']);
 
         // THE discriminating assertion (red-proof confirmed by disabling the new term): a follow-up
-        // integrity scan finds the cohort already rebuilt by the read. Without the fix the list never
-        // repairs, so this scan reports `repaired: 1` — the exact never-self-heals defect this closes.
+        // integrity scan finds the cohort already rebuilt by the cadence's pass. Without the fix that
+        // pass never repairs, so this scan reports `repaired: 1` — the exact never-self-heals defect
+        // this closes.
         const repairCheck = await MailboxService.repairMessageGraphIntegrity({ids: [res.messageId]});
         expect(repairCheck).toMatchObject({scanned: 1, intact: 1, repaired: 0, failed: 0});
     });
@@ -1020,20 +1034,26 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
         fs.ensureDirSync(bogusSegment);
 
         try {
+            // The read path opens no WAL payload at all; the disposition is the drain host's repair
+            // pass (`createMessageGraphIntegrityRepairCadence`'s call), run here by hand.
             const first = await RequestContextService.run({agentIdentityNodeId: '@alice'}, async () => {
                 return await MailboxService.listMessages({box: 'outbox', status: 'all'});
             });
             expect(first.messages.map(message => message.messageId)).toContain(res.messageId);
-            expect(reads.getCount()).toBe(1);
+            expect(reads.getCount(), 'a list reads no payload').toBe(0);
+
+            await MailboxService.repairMessageGraphIntegrity({box: 'all'});
+            expect(reads.getCount(), 'the first pass reads the accepted payload once').toBe(1);
 
             const markerEntries = fs.readFileSync(markerPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
             expect(markerEntries.at(-1).broadcastCohort).toEqual({disposition: 'legacy-unknown'});
 
+            await MailboxService.repairMessageGraphIntegrity({box: 'all'});
             const second = await RequestContextService.run({agentIdentityNodeId: '@alice'}, async () => {
                 return await MailboxService.listMessages({box: 'outbox', status: 'all'});
             });
             expect(second.messages.map(message => message.messageId)).toContain(res.messageId);
-            expect(reads.getCount(), 'the second list must consume the compatibility marker, not reread WAL').toBe(1);
+            expect(reads.getCount(), 'the second pass must consume the compatibility marker, not reread WAL').toBe(1);
         } finally {
             reads.restore();
             fs.removeSync(bogusSegment);
@@ -1745,7 +1765,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
         }
     });
 
-    test('post-sync canary: accepted unread self-message survives destructive graph clear (#14426)', async () => {
+    test('post-sync canary: accepted unread self-message survives destructive graph clear once the drain host\'s repair ran (#14426, #563)', async () => {
         const res = await RequestContextService.run({ agentIdentityNodeId: '@alice' }, async () => {
             return await MailboxService.addMessage({
                 to     : '@me',
@@ -1758,6 +1778,9 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
 
         await GraphService.db.storage.clear();
         clearGraphCacheWithoutStorageMutation();
+
+        // Neither reader repairs; the drain host's pass rebuilds the projection from the WAL.
+        expect(await MailboxService.repairMessageGraphIntegrity({box: 'all'})).toMatchObject({repaired: 1, failed: 0});
 
         const count = await RequestContextService.run({ agentIdentityNodeId: '@alice' }, async () => {
             return await MailboxService.countMessages({status: 'unread'});
