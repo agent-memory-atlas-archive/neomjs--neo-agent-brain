@@ -24,4 +24,18 @@ test.describe('wireDeploymentStateReadSource — the fleet-server boot injection
         expect(wireDeploymentStateReadSource({bridge})).toBeNull();
         expect(bridge.deploymentStateSource).toBeNull(); // untouched — the seam degrades to unavailable
     });
+
+    test('a supplied reader wires WITHOUT a path — plane mode reads the plane, not a file — and reaches the source untouched', () => {
+        const bridge       = {deploymentStateSource: null},
+              seen         = [],
+              stubSource   = {produceDeploymentState: async () => ({state: 'available', services: []})},
+              readImpl     = async () => ({status: 'available', snapshot: {}, ageMs: 1}),
+              createSource = options => { seen.push(options); return stubSource };
+
+        const wired = wireDeploymentStateReadSource({path: '', staleAfterMs: 120000, maxBytes: 262144, readImpl, bridge, createSource});
+
+        expect(seen).toEqual([{path: '', staleAfterMs: 120000, maxBytes: 262144, readImpl}]); // the reader rides beside the leaves
+        expect(bridge.deploymentStateSource).toBe(stubSource);
+        expect(wired).toBe(stubSource);
+    });
 });

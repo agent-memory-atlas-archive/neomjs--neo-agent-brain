@@ -30,7 +30,16 @@ import {projectDeploymentStateForFleet} from './projectDeploymentStateForFleet.m
 export function createDeploymentStateReadSource({path, staleAfterMs, maxBytes, readImpl = readDeploymentStateSnapshot, now = Date.now} = {}) {
     return {
         async produceDeploymentState() {
-            const read = await readImpl({filePath: path, now: now(), staleAfterMs, maxBytes});
+            let read;
+
+            // The file reader answers every failure as a verdict; a plane reader can THROW (transport,
+            // an unreadable answer). Either way the source projects an honest `unavailable` — the wire
+            // verb never fails upstream for a snapshot it merely could not read.
+            try {
+                read = await readImpl({filePath: path, now: now(), staleAfterMs, maxBytes});
+            } catch {
+                return projectDeploymentStateForFleet(null, {reason: 'snapshot-read-failed'});
+            }
 
             // `available` and `stale` both hand back the parsed snapshot with its `generatedAt` age; the
             // projection spells the horizon verdict from those same numbers. Every other verdict — a degraded

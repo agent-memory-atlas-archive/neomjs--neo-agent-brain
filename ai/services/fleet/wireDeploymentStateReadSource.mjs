@@ -13,7 +13,8 @@ import {createDeploymentStateReadSource} from './createDeploymentStateReadSource
  * `AiConfig.orchestrator.deploymentStateBridge.{snapshotPath, staleAfterMs, maxSnapshotBytes}` at the boot
  * call and passes them in; this function owns no config default and captures no leaf. **Fail-soft:** an
  * absent/empty path leaves `deploymentStateSource` unwired (the seam keeps its honest `unavailable`), never a
- * fabricated source.
+ * fabricated source — unless the caller supplies its own reader (plane mode: `planeDeploymentStateReader`
+ * reads the plane's snapshot through the admitted client and needs no file), which wires regardless of path.
  */
 
 /**
@@ -22,16 +23,17 @@ import {createDeploymentStateReadSource} from './createDeploymentStateReadSource
  * @param {String}   options.path                The resolved snapshot path (read from the leaf at the caller's boot use site).
  * @param {Number}   options.staleAfterMs        The resolved staleness horizon, forwarded to the read-source.
  * @param {Number}   options.maxBytes            The resolved byte bound, forwarded to the read-source.
+ * @param {Function} [options.readImpl]          A reader in place of the snapshot file (plane mode); with one, an empty path still wires.
  * @param {Object}   [options.bridge=FleetControlBridge] The control bridge to wire (a stub in specs).
  * @param {Function} [options.createSource=createDeploymentStateReadSource] The read-source factory (injected in specs).
- * @returns {Object|null} the wired read-source, or `null` when no path was supplied (left unwired).
+ * @returns {Object|null} the wired read-source, or `null` when neither a path nor a reader was supplied (left unwired).
  */
-export function wireDeploymentStateReadSource({path, staleAfterMs, maxBytes, bridge = FleetControlBridge, createSource = createDeploymentStateReadSource} = {}) {
-    if (typeof path !== 'string' || path.length === 0) {
-        return null; // no path → leave the seam unwired (honest unavailable), never fabricate a source
+export function wireDeploymentStateReadSource({path, staleAfterMs, maxBytes, readImpl, bridge = FleetControlBridge, createSource = createDeploymentStateReadSource} = {}) {
+    if (!readImpl && (typeof path !== 'string' || path.length === 0)) {
+        return null; // no path and no reader → leave the seam unwired (honest unavailable), never fabricate a source
     }
 
-    bridge.deploymentStateSource = createSource({path, staleAfterMs, maxBytes});
+    bridge.deploymentStateSource = createSource({path, staleAfterMs, maxBytes, ...(readImpl ? {readImpl} : {})});
 
     return bridge.deploymentStateSource;
 }
