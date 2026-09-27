@@ -19,7 +19,7 @@ export const DEPLOYMENT_RUNTIME_LIFECYCLE_OPERATIONS = Object.freeze([
     // A live cgroup memory-ceiling change (`POST /containers/{id}/update`), added for the store-class
     // ceiling raise: a store mid-ingestion must gain headroom WITHOUT the restart that would kill the
     // ingestion the raise exists to rescue. Governed by the store-variant actuator row in
-    // ADR-0026 §2.8; // ticket-ref-ok: the ADR is the governing authority for this operation's envelope
+    // ADR-0026 [not-ticket-ref: the ADR is the governing authority for this operation's envelope] §2.8;
     // still config-and-lifecycle-only — it moves one bounded resource limit on one allowlisted,
     // identity-proven target, never code or an open container field.
     'update-memory-limit'
@@ -212,7 +212,7 @@ export class DeploymentRuntimeAccessService extends Base {
     /**
      * Per-target tail of the memory-limit critical section (`withMemoryLimitExclusion`). Process-local
      * on purpose: the recovery-actuator decision record puts the docker socket in exactly ONE
-     * orchestrator-resident holder — ADR-0026 // ticket-ref-ok: the ADR is the governing authority for the single-holder topology this soundness argument rests on
+     * orchestrator-resident holder — ADR-0026 [not-ticket-ref: the ADR is the governing authority for the single-holder topology this soundness argument rests on]
      * (the singleton lease forbids a second), so there is no cross-process racer for this map to
      * miss — the assumption is architectural, not hopeful.
      * @member {Map} memoryLimitLocksByService=new Map()
@@ -761,11 +761,11 @@ export class DeploymentRuntimeAccessService extends Base {
             // `since` removes that poison, and `until` additionally excludes output from an
             // auto-restart that races after the inspect this interval was derived from. Both
             // bounds or none: a half-bounded slice is not the run the stopped fact names.
-            // The endpoints travel at FULL precision. Docker accepts RFC3339Nano, so flooring to
-            // whole seconds is a choice the transport never imposed — and it is wrong in both
-            // directions: a floored `since` reaches back into the previous incarnation, and a
-            // floored `until` cuts the final sub-second, which is exactly when V8 writes its fatal
-            // line. Truncating the upper edge can therefore discard the evidence being sought.
+            // The endpoints travel at FULL precision, as Unix seconds with their fraction — the
+            // spelling the Engine API takes (`toDockerQueryTime`). Flooring to whole seconds would
+            // be wrong in both directions: a floored `since` reaches back into the previous
+            // incarnation, and a floored `until` cuts the final sub-second, which is exactly when
+            // V8 writes its fatal line. Truncating the upper edge can discard the evidence sought.
             sinceStamp    = normalizeDockerTime(since),
             untilStamp    = normalizeDockerTime(until),
             bounded       = sinceStamp !== null && untilStamp !== null &&
@@ -775,8 +775,8 @@ export class DeploymentRuntimeAccessService extends Base {
                 'stderr=1',
                 `tail=${encodeURIComponent(String(tailCount))}`,
                 ...(bounded ? [
-                    `since=${encodeURIComponent(sinceStamp)}`,
-                    `until=${encodeURIComponent(untilStamp)}`
+                    `since=${encodeURIComponent(toDockerQueryTime(sinceStamp))}`,
+                    `until=${encodeURIComponent(toDockerQueryTime(untilStamp))}`
                 ] : [])
             ].join('&'),
             response      = await this.dockerRequest({
@@ -840,7 +840,7 @@ export class DeploymentRuntimeAccessService extends Base {
             },
             response = await this.dockerRequest({
                 method: 'GET',
-                path  : `/events?since=${encodeURIComponent(sinceStamp)}&until=${encodeURIComponent(untilStamp)}&filters=${encodeURIComponent(JSON.stringify(filters))}`
+                path  : `/events?since=${encodeURIComponent(toDockerQueryTime(sinceStamp))}&until=${encodeURIComponent(toDockerQueryTime(untilStamp))}&filters=${encodeURIComponent(JSON.stringify(filters))}`
             });
 
         let events;
@@ -1301,8 +1301,8 @@ export default Neo.setupClass(DeploymentRuntimeAccessService);
  * Anything non-positive is therefore refused rather than passed through, which is what keeps the
  * interval fail-closed instead of silently unbounded.
  *
- * The value is validated but NOT rounded: Docker accepts RFC3339Nano, and truncating the upper
- * endpoint would cut the final sub-second in which a fatal line is written.
+ * The value is validated but NOT rounded: the receipt echoes it at full precision, and the query
+ * built from it by {@link toDockerQueryTime} keeps the sub-second in which a fatal line is written.
  * @param {String|Number|null} value
  * @returns {String|null}
  */
@@ -1317,6 +1317,38 @@ function normalizeDockerTime(value) {
 
     return stamp
 }
+
+/**
+ * @summary The Engine API's spelling of a time bound: Unix seconds, the fraction carrying the
+ * sub-second, as the `since` / `until` parameters of `/events` and `/containers/{id}/logs` take
+ * them. The `docker` CLI accepts RFC3339 and converts; the daemon does not — it answers an RFC3339
+ * bound with `strconv.ParseInt … invalid syntax` (Docker 29, API 1.53), which is how the death
+ * channel and the incarnation-bounded log slice failed on every cycle before this spelling.
+ *
+ * The fraction travels VERBATIM: Docker's inspect stamps carry nanoseconds, `Date.parse` keeps
+ * milliseconds, and a conversion through it sends ONE value for two bounds inside the same
+ * millisecond — a wire interval that disagrees with the receipt. A `Date.parse`-able bound in
+ * another spelling (no zone) never comes from Docker and falls back to `Date.parse`.
+ * @param {String} stamp A bound {@link normalizeDockerTime} already validated.
+ * @returns {String} e.g. `'1737035722.165243637'`
+ */
+function toDockerQueryTime(stamp) {
+    const match = RFC3339_BOUND_RE.exec(stamp);
+
+    if (!match) return String(Date.parse(stamp) / 1000);
+
+    const [, whole, fraction, zone] = match,
+          seconds                   = Math.floor(Date.parse(`${whole}${zone}`) / 1000);
+
+    return fraction ? `${seconds}.${fraction}` : String(seconds)
+}
+
+/**
+ * @summary An RFC3339 bound split into its whole-second instant, its fraction (up to the nine
+ * digits Docker emits) and its zone, so the fraction can travel untouched.
+ * @type {RegExp}
+ */
+const RFC3339_BOUND_RE = /^(.+T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/;
 
 /**
  * @summary Parses Docker's newline-delimited event response into bounded death candidates.

@@ -46,7 +46,7 @@ test.describe('deploymentStateBridgeStore', () => {
             snapshot: {services: [{serviceKey: 'mc-server', deaths: [death]}]}
         }, 'mc-server')).toEqual({status: 'available', record: death, reason: null});
 
-        // The stale snapshot is a DISTINCT answer, not the same null as "no death". Before #466 RA-1
+        // The stale snapshot is a DISTINCT answer, not the same null as "no death". Before the split
         // both returned `null`, so a caller could not tell a snapshot it had not read from a service
         // that had not died — which is the incident this channel exists to close, one layer up.
         expect(selectLastServiceDeath({
@@ -87,6 +87,38 @@ test.describe('deploymentStateBridgeStore', () => {
                 ok: true, status: 'available', snapshot: {services: [{serviceKey: 'mc-server', deaths: [withDeath]}]}
             }, 'mc-server', {channelEnabled: false}))
                 .toEqual({status: 'disabled', record: null, reason: 'event-channel-disabled'})
+        });
+
+        test('a service whose OWN event read failed is `unavailable` with the bridge\'s reason, never observed-none', () => {
+            // The plane's mc-server aborted at 07:24Z and the healthcheck read "observed, no death"
+            // 48 minutes later, because the bridge's Docker event read had failed every cycle
+            // (`deathRead.unavailableReason: 'runtime-access-error'`) and this helper read the
+            // snapshot's presence of the service as observation.
+            expect(selectLastServiceDeath({
+                ok: true, status: 'available', snapshot: {services: [{
+                    serviceKey: 'mc-server',
+                    deaths    : null,
+                    deathRead : {status: 'unavailable', source: 'docker-events', limit: 10, unavailableReason: 'runtime-access-error'}
+                }]}
+            }, 'mc-server')).toEqual({status: 'unavailable', record: null, reason: 'runtime-access-error'});
+
+            // A channel the bridge itself switched off is `disabled`, with the bridge's reason.
+            expect(selectLastServiceDeath({
+                ok: true, status: 'available', snapshot: {services: [{
+                    serviceKey: 'mc-server',
+                    deaths    : null,
+                    deathRead : {status: 'disabled', source: 'docker-events', limit: 10, unavailableReason: 'channel-disabled'}
+                }]}
+            }, 'mc-server')).toEqual({status: 'disabled', record: null, reason: 'channel-disabled'});
+
+            // A read that succeeded keeps the observed reading, death or none.
+            expect(selectLastServiceDeath({
+                ok: true, status: 'available', snapshot: {services: [{
+                    serviceKey: 'mc-server',
+                    deaths    : [withDeath],
+                    deathRead : {status: 'available', source: 'docker-events', limit: 10, unavailableReason: null}
+                }]}
+            }, 'mc-server')).toEqual({status: 'available', record: withDeath, reason: null});
         });
 
         test('a service absent from a snapshot we DID read is `unknown`', () => {
