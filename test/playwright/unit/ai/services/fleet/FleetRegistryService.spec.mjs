@@ -610,6 +610,32 @@ test.describe('Neo.ai.services.fleet.FleetRegistryService — launch ownership',
         expect(launchRefusalOf(null)).toBeNull()
     });
 
+    test('an explicit launchOwner at defineAgent is an ownership act: born external refuses a start from birth, born fleet and the omitted default do not, adoption lifts it', () => {
+        FleetRegistryService.dataDir = tmpDir;
+
+        const
+            omitted   = FleetRegistryService.defineAgent({githubUsername: 'omitted',  harnessType: 'codex'}),
+            fleet     = FleetRegistryService.defineAgent({githubUsername: 'fleet',    harnessType: 'codex', launchOwner: 'fleet'}),
+            external  = FleetRegistryService.defineAgent({githubUsername: 'external', harnessType: 'codex', launchOwner: 'external'}),
+            refusalOf = id => launchRefusalOf(FleetRegistryService.getAgent(id));
+
+        // the omitted default is not an act: no timestamp, the process record stays the only gate
+        expect(omitted).not.toHaveProperty('launchOwnerSince');
+        expect(refusalOf('omitted')).toBeNull();
+
+        // both explicit values are acts, recorded in the same write as the row
+        expect(fleet.launchOwnerSince).toBe(fleet.createdAt);
+        expect(refusalOf('fleet')).toBeNull();
+        expect(external.launchOwnerSince).toBe(external.createdAt);
+        expect(refusalOf('external')).toBe('released to its own harness: adopt it to start it here');
+
+        // the persisted row carries the fact, not only the returned projection
+        expect(FleetRegistryService.getAgent('external').launchOwnerSince).toBe(external.createdAt);
+
+        FleetRegistryService.setLaunchOwner('external', 'fleet');
+        expect(refusalOf('external')).toBeNull()
+    });
+
     test('no other write surface changes launchOwner', () => {
         FleetRegistryService.dataDir = tmpDir;
         FleetRegistryService.defineAgent({githubUsername: 'owned', harnessType: 'codex', launchOwner: 'fleet'});

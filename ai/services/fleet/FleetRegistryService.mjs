@@ -195,9 +195,11 @@ function normalizeStoredMcpTarget(target) {
  * **Launch ownership** (`launchOwner`) says who starts a seat: `fleet` when this fleet is its only
  * launcher, `external` when it runs in a harness the fleet did not start. It decides whether a seat
  * with no process record may be read as stopped, so it enables a Brain-credentialed spawn and is kept
- * out of `metadata`: {@link defineAgent} takes it as creation intent, {@link setLaunchOwner} is the
- * one write after that, and a row without it reads `external`. A seat released by that write is never
- * started by this fleet again until it is adopted, whatever process record it holds ({@link launchRefusalOf}).
+ * out of `metadata`: {@link defineAgent} takes it as creation intent — an explicit value is an ownership
+ * act and records `launchOwnerSince` in the same write — {@link setLaunchOwner} is the one write after
+ * that, and a row without it reads `external` with no act recorded. A seat released to its own harness
+ * by either act is never started by this fleet until it is adopted, whatever process record it holds
+ * ({@link launchRefusalOf}).
  */
 class FleetRegistryService extends Base {
     static config = {
@@ -269,7 +271,10 @@ class FleetRegistryService extends Base {
      * @param {Object|null} [opts.mcpServers]   Sparse MCP overrides shared with configureAgent; omitted/null follows defaults.
      * @param {Object|null} [opts.mcpTarget] Resident (`null` / `{kind:'resident'}`) or
      *     `{kind:'tenant', tenantId}`. No transport, URL, header, env, command, or credential bag.
-     * @param {String} [opts.launchOwner='external'] `fleet` for a seat this fleet launches from birth.
+     * @param {String} [opts.launchOwner='external'] `fleet` for a seat this fleet launches from birth,
+     *     `external` for one that runs in its own harness. Passing either is an ownership act and records
+     *     `launchOwnerSince` with the row; omitting it records no act, so the seat's process record stays
+     *     its only start gate.
      * @returns {Object} The public agent definition (no credential).
      */
     defineAgent(options={}) {
@@ -355,6 +360,9 @@ class FleetRegistryService extends Base {
                 mcpServers   : matrix,
                 mcpTarget    : target,
                 launchOwner,
+                // an explicit owner is an ownership act, the fact `launchRefusalOf` keys on; the omitted
+                // default records none, so the process record stays that seat's only start gate
+                ...((options || {}).launchOwner != null ? {launchOwnerSince: now} : {}),
                 createdAt    : now,
                 updatedAt    : now
             },
