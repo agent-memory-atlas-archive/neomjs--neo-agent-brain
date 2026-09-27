@@ -217,12 +217,14 @@ export async function startAgentProvisioned({
     // Ensure the checkout exists (clone-or-reuse, never clobber). A throw here propagates: the harness
     // is never spawned into an unprovisioned / conflicting directory (fail-closed). Input validation
     // (managedRoot / agentId / repoSlug / a missing cloneUrl when a clone is needed) is inherited from
-    // the provisioning chain's own contracts — not re-implemented here.
+    // the provisioning chain's own contracts — not re-implemented here. The seat's own PAT
+    // authenticates its clone, so a private repo needs no credentials on the Fleet host.
     const {repoPath: targetRepoRoot} = await ensureRepo({
         managedRoot,
         agentId,
-        repoSlug: repo.repoSlug,
-        cloneUrl: repo.cloneUrl,
+        repoSlug  : repo.repoSlug,
+        cloneUrl  : repo.cloneUrl,
+        credential: resolvedCredential,
         cloneRepo
     });
 

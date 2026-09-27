@@ -1,21 +1,72 @@
 import {execFile}  from 'child_process';
+import os          from 'os';
 import path        from 'path';
 import {promisify} from 'util';
 
 const execFileAsync = promisify(execFile);
 
 /**
- * Default clone executor: a real `git clone -- <cloneUrl> <repoPath>`. The `--` terminates git's
- * option parsing so a hostile URL or path cannot smuggle a flag. Overridden via the `cloneRepo` seam
- * in tests so the provisioning contract is exercised without a git binary or network — mirroring
- * `FleetLifecycleService`'s default-real `spawnFn` seam.
+ * Environment variables through which a host's Git setup reaches a child `git`: askpass programs and config
+ * injected without a file. A seat's clone drops them.
+ * @type {RegExp}
+ * @private
+ */
+const HOST_GIT_ENV = /^(GIT_ASKPASS|SSH_ASKPASS|GIT_CONFIG|GIT_CONFIG_(GLOBAL|SYSTEM|NOSYSTEM|PARAMETERS|COUNT|KEY_\d+|VALUE_\d+))$/;
+
+/**
+ * @summary The `git` invocation of a clone: its argv and the child's environment.
+ *
+ * A seat's credential is presented only to `https://github.com`, the host a GitHub PAT belongs to. It goes
+ * through a helper scoped to that host that reads the token from the child's environment, so the token never
+ * appears in argv, where every process on the machine can read it. That clone runs outside the host's Git
+ * setup: no system or global config file, no home directory (so no `~/.netrc`), no config or askpass handed
+ * down through the environment, and git never prompts. So an ambient URL rewrite, header, netrc entry,
+ * credential helper or askpass can neither redirect nor authenticate it. Proxy and CA settings reach it only
+ * through the environment (`HTTPS_PROXY`, `GIT_SSL_CAINFO`), never through a config file. Any other remote, or no credential, is a plain clone in the
+ * process's own environment. The `--` ends git's option parsing, so a hostile URL or path cannot smuggle a flag.
  * @param {String} cloneUrl
  * @param {String} repoPath
+ * @param {String} [credential] The seat's GitHub PAT
+ * @param {Object} [env=process.env] The environment the clone would inherit
+ * @returns {{args: String[], env: Object|undefined}}
+ */
+export function gitCloneCommand(cloneUrl, repoPath, credential, env = process.env) {
+    if (!credential || !/^https:\/\/github\.com\//i.test(cloneUrl)) {
+        return {args: ['clone', '--', cloneUrl, repoPath], env: undefined}
+    }
+
+    return {
+        args: [
+            '-c', 'credential.helper=',
+            '-c', 'credential.https://github.com.helper=!f() { echo username=x-access-token; echo "password=$NEO_SEAT_GITHUB_TOKEN"; }; f',
+            'clone', '--', cloneUrl, repoPath
+        ],
+        env : {
+            ...Object.fromEntries(Object.entries(env).filter(([name]) => !HOST_GIT_ENV.test(name))),
+            HOME                 : os.devNull,
+            GIT_CONFIG_GLOBAL    : os.devNull,
+            GIT_CONFIG_NOSYSTEM  : '1',
+            GIT_TERMINAL_PROMPT  : '0',
+            NEO_SEAT_GITHUB_TOKEN: credential
+        }
+    }
+}
+
+/**
+ * Default clone executor: a real `git clone` as {@link gitCloneCommand} builds it. Overridden via the
+ * `cloneRepo` seam in tests so the provisioning contract is exercised without a git binary or network —
+ * mirroring `FleetLifecycleService`'s default-real `spawnFn` seam.
+ * @param {String} cloneUrl
+ * @param {String} repoPath
+ * @param {Object} [options]
+ * @param {String} [options.credential] The seat's GitHub PAT
  * @returns {Promise<void>}
  * @private
  */
-async function gitClone(cloneUrl, repoPath) {
-    await execFileAsync('git', ['clone', '--', cloneUrl, repoPath]);
+async function gitClone(cloneUrl, repoPath, {credential} = {}) {
+    const {args, env} = gitCloneCommand(cloneUrl, repoPath, credential);
+
+    await execFileAsync('git', args, env ? {env} : undefined);
 }
 
 /**
@@ -40,16 +91,16 @@ async function gitClone(cloneUrl, repoPath) {
  * @param {Object}    options
  * @param {String}    options.repoPath           The absolute, already-derived managed checkout path.
  * @param {String}    options.provisioningAction One of `'clone'` | `'reuse'` | `'conflict'`.
- * @param {String}   [options.cloneUrl]          The clone source (required for `'clone'`); the caller
- *                                               supplies an already-credential-resolved URL.
- * @param {Function} [options.cloneRepo=gitClone] `(cloneUrl, repoPath) => Promise<void>` — the clone
- *                                               executor; defaults to a real `git clone`, injectable for tests.
+ * @param {String}   [options.cloneUrl]          The clone source (required for `'clone'`).
+ * @param {String}   [options.credential]        The seat's GitHub PAT, which a GitHub clone authenticates with.
+ * @param {Function} [options.cloneRepo=gitClone] `(cloneUrl, repoPath, {credential}) => Promise<void>` — the
+ *                                               clone executor; defaults to a real `git clone`, injectable for tests.
  * @returns {Promise<{repoPath: String, action: String, cloned: Boolean}>}
  *   `action` ∈ `'cloned' | 'reused'`; `cloned` is `true` only when a clone actually ran.
  * @throws {Error} On a `'conflict'` action, an unknown action, a missing `cloneUrl` for `'clone'`, or a
  *   non-string / empty / non-absolute `repoPath`.
  */
-export async function provisionAgentRepo({repoPath, provisioningAction, cloneUrl, cloneRepo=gitClone} = {}) {
+export async function provisionAgentRepo({repoPath, provisioningAction, cloneUrl, credential, cloneRepo=gitClone} = {}) {
     if (typeof repoPath !== 'string' || repoPath.length === 0) {
         throw new Error("provisionAgentRepo: 'repoPath' must be a non-empty string.");
     }
@@ -73,7 +124,7 @@ export async function provisionAgentRepo({repoPath, provisioningAction, cloneUrl
             if (!url) {
                 throw new Error("provisionAgentRepo: 'cloneUrl' is required (a non-blank string) for a 'clone' action.");
             }
-            await cloneRepo(url, repoPath);
+            await cloneRepo(url, repoPath, {credential});
             return {repoPath, action: 'cloned', cloned: true};
         }
 
