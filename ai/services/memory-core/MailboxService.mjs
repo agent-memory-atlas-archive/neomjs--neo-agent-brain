@@ -43,6 +43,7 @@ const
     relatedPullRequestStateCache          = new Map(),
     WAKE_SUPPRESSION_ALLOWED_TAGS         = new Set(['sunset-protocol-handover', 'lead-role-baton']),
     MESSAGE_GRAPH_REPAIR_LIMIT            = 250,
+    MESSAGE_GRAPH_COHORT_STAMP_LIMIT      = 200,
     MESSAGE_GRAPH_REPAIR_FAILURE_RETRY_MS = 30 * 1000,
     MESSAGE_WAL_CANDIDATE_CACHE_LIMIT     = 512,
     MESSAGE_WAL_UNREADABLE_RETRY_MS       = 30 * 1000,
@@ -64,7 +65,10 @@ const graphProjectionRepairCursorByView    = new Map(),
     messageWalCandidateRecordCacheById     = new Map(),
     messageWalCandidateSegmentLoadByKey    = new Map(),
     messageWalCandidateMetadataCacheById   = new Map(),
-    unreadableMessageWalCandidateStateById = new Map();
+    unreadableMessageWalCandidateStateById = new Map(),
+    // Broadcast routing edges whose cohort stamp could not be read from the WAL this process; they
+    // keep their legacy reading rather than being re-read on every pass.
+    broadcastCohortStampUnreadableIds      = new Set();
 let graphProjectionCandidateScanPromise     = null,
     messageWalCandidateSegmentLoadDecisions = 0,
     messageWalCandidateSegmentLoadJoins     = 0;
@@ -517,6 +521,24 @@ function getMessageWalBroadcastCohort(record) {
 }
 
 /**
+ * @summary The send-time cohort as the properties a broadcast's `SENT_TO AGENT:*` routing edge
+ * carries, so the mailbox SQL can tell a legacy broadcast (no cohort ever recorded) from a modern
+ * one whose delivery edges are missing — the one WAL fact a read needs.
+ * @param {{disposition: String, intendedRecipientCount?: Number}|null|undefined} cohort A
+ *     {@link getMessageWalBroadcastCohort} result.
+ * @returns {Object} `{broadcastCohort: 'known', intendedRecipientCount}`,
+ *     `{broadcastCohort: 'legacy-unknown'}`, or `{}` for a direct message.
+ * @private
+ */
+function toBroadcastCohortEdgeProperties(cohort) {
+    if (!cohort) return {};
+
+    return cohort.disposition === 'known'
+        ? {broadcastCohort: 'known', intendedRecipientCount: cohort.intendedRecipientCount}
+        : {broadcastCohort: 'legacy-unknown'}
+}
+
+/**
  * @summary Derives the immutable canonical sender/destination marker for one accepted WAL record.
  *
  * Broadcast cohort knowledge is intentionally separate: a historical broadcast can retain a
@@ -584,8 +606,11 @@ function buildTaggedConceptFilterGroups(values = []) {
  *
  * Four routing branches, one per way a message reaches a view, unioned by message id: a direct
  * `SENT_TO` the target, a per-recipient `DELIVERED_TO` the target (broadcasts), a legacy broadcast
- * (`SENT_TO AGENT:*` with no `DELIVERED_TO` cohort at all) and, for the outbox, a `SENT_BY` the
- * target. Receipt state is read where the view stores it, as `resolveReceiptState` reads it per
+ * (`SENT_TO AGENT:*` with no `DELIVERED_TO` cohort at all AND no known positive send-time cohort
+ * on its routing edge — a modern broadcast whose delivery edges are missing is visible to nobody
+ * until the drain host's repair restores them, never to an outsider; a known zero-audience
+ * broadcast keeps its everyone-visible reading) and, for the outbox, a `SENT_BY` the target.
+ * Receipt state is read where the view stores it, as `resolveReceiptState` reads it per
  * row: the target's `DELIVERED_TO` edge when one exists (the first non-null across its spellings,
  * as `getStorageDeliveryMutableState` reads it), the MESSAGE node otherwise. Identity spellings
  * ride `json_each` arrays so one named parameter covers every legacy variant, and the
@@ -655,7 +680,7 @@ function buildMailboxMatchQuery({box, status, target, fromIdentity = null, threa
         branches.push(
             branch(`e.type = 'SENT_TO' AND e.target IN ${targetIn}`),
             branch(`e.type = 'DELIVERED_TO' AND e.target IN ${targetIn}`),
-            branch(`e.type = 'SENT_TO' AND e.target = 'AGENT:*' AND NOT EXISTS (SELECT 1 FROM Edges de WHERE de.source = n.id AND de.type = 'DELIVERED_TO')`)
+            branch(`e.type = 'SENT_TO' AND e.target = 'AGENT:*' AND COALESCE(json_extract(e.data, '$.properties.intendedRecipientCount'), 0) = 0 AND NOT EXISTS (SELECT 1 FROM Edges de WHERE de.source = n.id AND de.type = 'DELIVERED_TO')`)
         );
     }
 
@@ -1527,6 +1552,10 @@ async function readMessageWalCandidateRecords({
  * but cannot fail the mailbox read, while an in-process immutable-record cache prevents immediate
  * re-taxing. Zero-audience broadcasts are healthy; known-positive total cohort loss is repairable.
  *
+ * Broadcast routing edges projected before they carried their send-time cohort are named too
+ * (`broadcastCohortStamps`, at most {@link MESSAGE_GRAPH_COHORT_STAMP_LIMIT} per pass), so the
+ * repair can stamp them and the mailbox SQL stops reading a damaged modern broadcast as legacy.
+ *
  * @returns {Promise<Object>} Exact candidates, compact routes, reusable records, and residuals.
  * @private
  */
@@ -1546,6 +1575,7 @@ async function classifyMailboxGraphProjectionCandidates() {
         enrichedRecordsById   = new Map(),
         unreadableIds         = new Set(),
         deferredUnreadableIds = new Set(),
+        broadcastCohortStamps = [],
         compatibility         = {
             backfilled              : 0,
             cached                  : 0,
@@ -1555,6 +1585,8 @@ async function classifyMailboxGraphProjectionCandidates() {
             unresolved              : 0,
             unreadableDeferred      : 0,
             persistenceFailed       : 0,
+            cohortStampCandidates   : 0,
+            cohortStampUnreadable   : 0,
             mailboxRoutingConflicts : markerConflicts.mailboxRoutingIds.size,
             broadcastCohortConflicts: markerConflicts.broadcastCohortIds.size
         };
@@ -1590,6 +1622,7 @@ async function classifyMailboxGraphProjectionCandidates() {
         deferredUnreadableIds,
         segmentById,
         payloadSignatureBySegment,
+        broadcastCohortStamps,
         compatibility
     });
 
@@ -1623,6 +1656,7 @@ async function classifyMailboxGraphProjectionCandidates() {
                    MAX(CASE WHEN type = 'SENT_BY' THEN 1 ELSE 0 END) AS hasSentBy,
                    MAX(CASE WHEN type = 'SENT_TO' THEN 1 ELSE 0 END) AS hasSentTo,
                    MAX(CASE WHEN type = 'SENT_TO' AND target = 'AGENT:*' THEN 1 ELSE 0 END) AS isBroadcast,
+                   MAX(CASE WHEN type = 'SENT_TO' AND target = 'AGENT:*' AND json_extract(data, '$.properties.broadcastCohort') IS NOT NULL THEN 1 ELSE 0 END) AS hasCohortStamp,
                    MAX(CASE WHEN type = 'DELIVERED_TO' THEN 1 ELSE 0 END) AS hasDelivery
               FROM Edges
              WHERE source IN (${placeholders})
@@ -1633,6 +1667,8 @@ async function classifyMailboxGraphProjectionCandidates() {
         }
     }
 
+    const unstampedBroadcastIds = [];
+
     for (const id of orderedProjectedIds) {
         const edgeState = edgeStateById.get(id);
 
@@ -1640,31 +1676,46 @@ async function classifyMailboxGraphProjectionCandidates() {
         if (!edgeState?.hasSentBy) addReason(id, 'missing-sent-by');
         if (!edgeState?.hasSentTo) addReason(id, 'missing-sent-to');
         if (edgeState?.isBroadcast && !edgeState?.hasDelivery) zeroDeliveryBroadcastIds.push(id);
+        if (edgeState?.isBroadcast && !edgeState?.hasCohortStamp && !broadcastCohortStampUnreadableIds.has(id)) unstampedBroadcastIds.push(id);
     }
 
-    const metadataIds = new Set([
-        ...[...reasonsById.keys()].filter(id => !mailboxRoutingById.has(id)),
-        ...zeroDeliveryBroadcastIds.filter(id => !broadcastCohortById.has(id) || !mailboxRoutingById.has(id))
-    ]);
+    // Routing edges projected before they carried their cohort are stamped by the repair pass, a
+    // bounded batch per pass; a cohort comes from the marker index, the cache, or one WAL read.
+    const
+        stampIds    = unstampedBroadcastIds.slice(0, MESSAGE_GRAPH_COHORT_STAMP_LIMIT),
+        metadataIds = new Set([
+            ...[...reasonsById.keys()].filter(id => !mailboxRoutingById.has(id)),
+            ...zeroDeliveryBroadcastIds.filter(id => !broadcastCohortById.has(id) || !mailboxRoutingById.has(id))
+        ]);
+    const stampOnlyIds = new Set(stampIds.filter(id => !broadcastCohortById.has(id) && !metadataIds.has(id)));
 
-    if (metadataIds.size > 0) {
+    compatibility.cohortStampCandidates = unstampedBroadcastIds.length;
+
+    if (metadataIds.size > 0 || stampOnlyIds.size > 0) {
         const loaded = await readMessageWalCandidateRecords({
-            ids: [...metadataIds],
+            ids: [...metadataIds, ...stampOnlyIds],
             segmentById,
             payloadSignatureBySegment
         });
 
         loaded.recordsById.forEach((record, id) => enrichedRecordsById.set(id, record));
-        loaded.unreadableIds.forEach(id => unreadableIds.add(id));
-        loaded.deferredIds.forEach(id => deferredUnreadableIds.add(id));
-        compatibility.unreadableDeferred += loaded.deferredIds.size;
+        // A stamp-only id is no repair candidate: an unreadable record settles it for this process
+        // (the edge keeps today's legacy reading), a deferred one is retried on a later pass.
+        loaded.unreadableIds.forEach(id => metadataIds.has(id) ? unreadableIds.add(id) : broadcastCohortStampUnreadableIds.add(id));
+        loaded.deferredIds.forEach(id => metadataIds.has(id) && deferredUnreadableIds.add(id));
+        compatibility.unreadableDeferred += [...loaded.deferredIds].filter(id => metadataIds.has(id)).length;
 
-        for (const id of metadataIds) {
+        for (const id of [...metadataIds, ...stampOnlyIds]) {
             const record = loaded.recordsById.get(id);
 
             if (!record) {
-                addReason(id, 'unreadable-wal-record');
-                compatibility.unresolved++;
+                if (metadataIds.has(id)) {
+                    addReason(id, 'unreadable-wal-record');
+                    compatibility.unresolved++;
+                } else if (!loaded.deferredIds.has(id)) {
+                    broadcastCohortStampUnreadableIds.add(id);
+                    compatibility.cohortStampUnreadable++;
+                }
                 continue;
             }
 
@@ -1710,6 +1761,12 @@ async function classifyMailboxGraphProjectionCandidates() {
         } else {
             addReason(id, 'unreadable-broadcast-intent');
         }
+    }
+
+    for (const id of stampIds) {
+        const cohort = broadcastCohortById.get(id);
+
+        if (cohort) broadcastCohortStamps.push([id, cohort]);
     }
 
     for (const id of enrichedRecordsById.keys()) {
@@ -2934,7 +2991,12 @@ class MailboxService extends Base {
         }
 
         needsPiece('missing-sent-by') && linkRequiredMailboxEdgeOrThrow(messageId, sentBy, 'SENT_BY', 1.0, edgeProperties, routingDiagnostics);
-        needsPiece('missing-sent-to') && linkRequiredMailboxEdgeOrThrow(messageId, to, 'SENT_TO', 1.0, edgeProperties, routingDiagnostics);
+        // The routing edge carries the send-time cohort (`linkNodes` merges it onto an intact edge
+        // on a full replay), so a read can tell a legacy broadcast from a damaged modern one.
+        needsPiece('missing-sent-to') && linkRequiredMailboxEdgeOrThrow(messageId, to, 'SENT_TO', 1.0, {
+            ...edgeProperties,
+            ...toBroadcastCohortEdgeProperties(getMessageWalBroadcastCohort(record))
+        }, routingDiagnostics);
 
         if (to === 'AGENT:*') {
             for (const recipient of broadcastRecipients) {
@@ -3076,6 +3138,8 @@ class MailboxService extends Base {
             quarantinedCandidateCount       : 0,
             unreadableCandidateCount        : 0,
             deferredUnreadableCandidateCount: 0,
+            cohortStamped                   : 0,
+            cohortStampFailed               : 0,
             cursorStart                     : 0,
             cursorNext                      : 0,
             compatibility                   : {
@@ -3087,6 +3151,8 @@ class MailboxService extends Base {
                 unresolved              : 0,
                 unreadableDeferred      : 0,
                 persistenceFailed       : 0,
+                cohortStampCandidates   : 0,
+                cohortStampUnreadable   : 0,
                 mailboxRoutingConflicts : 0,
                 broadcastCohortConflicts: 0
             }
@@ -3103,7 +3169,38 @@ class MailboxService extends Base {
             repairIds        = idFilter || new Set(candidateState.reasonsById.keys());
 
         summary.candidateCount = repairIds.size;
-        if (candidateState) summary.compatibility = candidateState.compatibility;
+
+        if (candidateState) {
+            summary.compatibility = candidateState.compatibility;
+
+            // Routing edges from before the cohort stamp learn their send-time cohort here: a property
+            // merge on the intact `SENT_TO AGENT:*` edge (weight untouched), never a node write, so no
+            // Task transition can race it. A candidate missing its node or that edge is left to its
+            // repair, whose projection stamps the edge it recreates.
+            const stampedCohort = GraphService.db.storage.db.prepare(
+                "SELECT json_extract(data, '$.properties.broadcastCohort') AS cohort FROM Edges WHERE source = ? AND type = 'SENT_TO' AND target = 'AGENT:*'"
+            );
+
+            for (const [id, cohort] of candidateState.broadcastCohortStamps) {
+                const reasons = candidateState.reasonsById.get(id);
+
+                if (reasons?.has('missing-message-node') || reasons?.has('missing-sent-to')) continue;
+
+                try {
+                    GraphService.linkNodes(id, 'AGENT:*', 'SENT_TO', 0, toBroadcastCohortEdgeProperties(cohort));
+
+                    if (stampedCohort.get(id)?.cohort) {
+                        summary.cohortStamped++;
+                    } else {
+                        summary.cohortStampFailed++;
+                    }
+                } catch (error) {
+                    summary.cohortStampFailed++;
+                    logger.warn(`[MailboxService] broadcast cohort stamp failed for ${id}: ${error.message}`);
+                }
+            }
+        }
+
         if (repairIds.size === 0) {
             if (!idFilter) {
                 graphProjectionRepairCursorByView.clear();
