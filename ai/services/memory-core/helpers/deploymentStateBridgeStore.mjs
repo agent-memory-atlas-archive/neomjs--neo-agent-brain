@@ -158,6 +158,21 @@ export function selectLastServiceDeath(inspection, serviceKey, {channelEnabled =
         return {status: 'unknown', record: null, reason: 'service-absent'}
     }
 
+    // The service entry carries its own event read's status beside its deaths (`deathRead`, written
+    // by the bridge each cycle). A read that failed, or a channel switched off at the bridge, is
+    // forwarded as such: a channel that could not look is not a channel that saw nothing — the same
+    // rule the snapshot-level statuses above follow, one level down. A snapshot written before the
+    // field existed carries none and keeps the observed reading.
+    const deathRead = service.deathRead;
+
+    if (deathRead && typeof deathRead === 'object' && deathRead.status !== 'available') {
+        return {
+            status: deathRead.status === 'disabled' ? 'disabled' : 'unavailable',
+            record: null,
+            reason: deathRead.unavailableReason ?? 'event-read-failed'
+        }
+    }
+
     // Observed, definitively. `record` is null here and ONLY here, and it means "no death recorded".
     return {
         status: 'available',

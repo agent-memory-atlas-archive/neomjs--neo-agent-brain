@@ -761,11 +761,11 @@ export class DeploymentRuntimeAccessService extends Base {
             // `since` removes that poison, and `until` additionally excludes output from an
             // auto-restart that races after the inspect this interval was derived from. Both
             // bounds or none: a half-bounded slice is not the run the stopped fact names.
-            // The endpoints travel at FULL precision. Docker accepts RFC3339Nano, so flooring to
-            // whole seconds is a choice the transport never imposed — and it is wrong in both
-            // directions: a floored `since` reaches back into the previous incarnation, and a
-            // floored `until` cuts the final sub-second, which is exactly when V8 writes its fatal
-            // line. Truncating the upper edge can therefore discard the evidence being sought.
+            // The endpoints travel at FULL precision, as Unix seconds with their fraction — the
+            // spelling the Engine API takes (`toDockerQueryTime`). Flooring to whole seconds would
+            // be wrong in both directions: a floored `since` reaches back into the previous
+            // incarnation, and a floored `until` cuts the final sub-second, which is exactly when
+            // V8 writes its fatal line. Truncating the upper edge can discard the evidence sought.
             sinceStamp    = normalizeDockerTime(since),
             untilStamp    = normalizeDockerTime(until),
             bounded       = sinceStamp !== null && untilStamp !== null &&
@@ -775,8 +775,8 @@ export class DeploymentRuntimeAccessService extends Base {
                 'stderr=1',
                 `tail=${encodeURIComponent(String(tailCount))}`,
                 ...(bounded ? [
-                    `since=${encodeURIComponent(sinceStamp)}`,
-                    `until=${encodeURIComponent(untilStamp)}`
+                    `since=${encodeURIComponent(toDockerQueryTime(sinceStamp))}`,
+                    `until=${encodeURIComponent(toDockerQueryTime(untilStamp))}`
                 ] : [])
             ].join('&'),
             response      = await this.dockerRequest({
@@ -840,7 +840,7 @@ export class DeploymentRuntimeAccessService extends Base {
             },
             response = await this.dockerRequest({
                 method: 'GET',
-                path  : `/events?since=${encodeURIComponent(sinceStamp)}&until=${encodeURIComponent(untilStamp)}&filters=${encodeURIComponent(JSON.stringify(filters))}`
+                path  : `/events?since=${encodeURIComponent(toDockerQueryTime(sinceStamp))}&until=${encodeURIComponent(toDockerQueryTime(untilStamp))}&filters=${encodeURIComponent(JSON.stringify(filters))}`
             });
 
         let events;
@@ -1301,8 +1301,8 @@ export default Neo.setupClass(DeploymentRuntimeAccessService);
  * Anything non-positive is therefore refused rather than passed through, which is what keeps the
  * interval fail-closed instead of silently unbounded.
  *
- * The value is validated but NOT rounded: Docker accepts RFC3339Nano, and truncating the upper
- * endpoint would cut the final sub-second in which a fatal line is written.
+ * The value is validated but NOT rounded: the receipt echoes it at full precision, and the query
+ * built from it by {@link toDockerQueryTime} keeps the sub-second in which a fatal line is written.
  * @param {String|Number|null} value
  * @returns {String|null}
  */
@@ -1316,6 +1316,19 @@ function normalizeDockerTime(value) {
     if (!Number.isFinite(parsed) || parsed <= 0) return null;
 
     return stamp
+}
+
+/**
+ * @summary The Engine API's spelling of a time bound: Unix seconds, the fraction carrying the
+ * sub-second, as the `since` / `until` parameters of `/events` and `/containers/{id}/logs` take
+ * them. The `docker` CLI accepts RFC3339 and converts; the daemon does not — it answers an RFC3339
+ * bound with `strconv.ParseInt … invalid syntax` (Docker 29, API 1.53), which is how the death
+ * channel and the incarnation-bounded log slice failed on every cycle before this spelling.
+ * @param {String} stamp A bound {@link normalizeDockerTime} already validated.
+ * @returns {String} e.g. `'1786219200.9'`
+ */
+function toDockerQueryTime(stamp) {
+    return String(Date.parse(stamp) / 1000)
 }
 
 /**

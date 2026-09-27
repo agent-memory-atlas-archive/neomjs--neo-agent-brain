@@ -229,6 +229,10 @@ test.describe('Neo.ai.daemons.services.DeploymentRuntimeAccessService', () => {
         expect(eventPath).toContain('"event":["oom","die"]');
         expect(eventPath).toContain('com.docker.compose.service=mc-server');
         expect(eventPath).toContain('com.docker.compose.project=neo');
+        // The window travels as Unix seconds — the daemon refuses the RFC3339 form with
+        // `strconv.ParseInt … invalid syntax`, which is how the death channel failed every cycle.
+        expect(eventPath).toContain('since=1710000000&until=1710000002&');
+        expect(eventPath).not.toContain('2024-03-09T');
     });
 
     test('event reads refuse an unbounded window', async () => {
@@ -268,7 +272,9 @@ test.describe('Neo.ai.daemons.services.DeploymentRuntimeAccessService', () => {
         // V8 writes its fatal line in the final moments before the process dies. Flooring
         // `until` to whole seconds discards up to a second of output at exactly that edge —
         // the evidence being sought — while flooring `since` reaches back into the previous
-        // incarnation. Docker accepts RFC3339Nano, so neither rounding is imposed by transport.
+        // incarnation. The Engine API takes Unix seconds with a fraction, so neither rounding is
+        // imposed by transport; the RFC3339 spelling the CLI accepts is refused by the daemon
+        // (`strconv.ParseInt … invalid syntax`), so it must never reach the query.
         const logs = await service.readObserve({
             serviceKey: 'mc-server',
             operation : 'logs',
@@ -276,11 +282,11 @@ test.describe('Neo.ai.daemons.services.DeploymentRuntimeAccessService', () => {
             until     : '2026-08-08T20:05:00.900Z'
         });
 
-        const path = calls.find(call => call.path.includes('until='))?.path ?? '';
+        const path = decodeURIComponent(calls.find(call => call.path.includes('until='))?.path ?? '');
 
-        expect(decodeURIComponent(path), 'the endpoints reach Docker unrounded')
-            .toContain('until=2026-08-08T20:05:00.900Z');
-        expect(decodeURIComponent(path)).toContain('since=2026-08-08T20:00:00.900Z');
+        expect(path, 'the endpoints reach Docker unrounded, as Unix seconds').toContain('until=1786219500.9');
+        expect(path).toContain('since=1786219200.9');
+        expect(path, 'the RFC3339 spelling never reaches the daemon').not.toContain('2026-08-08T');
 
         expect(logs.data.appliedUntil, 'the receipt echoes the precision it actually sent')
             .toBe('2026-08-08T20:05:00.900Z');
