@@ -176,7 +176,14 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
             }
         });
 
-        GraphService.linkNodes(messageId, broadcast ? 'AGENT:*' : recipient, 'SENT_TO', 1, {});
+        // A routing edge to `AGENT:*` carries its classified cohort: the mailbox SQL reads an
+        // unstamped one as unknown provenance and serves it to nobody. A carrier with delivery
+        // edges is a modern broadcast of one; one without is the genuine-legacy fixture.
+        const cohortStamp = broadcast
+            ? {broadcastCohort: 'known', intendedRecipientCount: 1}
+            : recipient === 'AGENT:*' ? {broadcastCohort: 'legacy-unknown'} : {};
+
+        GraphService.linkNodes(messageId, broadcast ? 'AGENT:*' : recipient, 'SENT_TO', 1, cohortStamp);
 
         if (broadcast) {
             GraphService.linkNodes(messageId, recipient, 'DELIVERED_TO', 1, {readAt});
@@ -964,7 +971,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
         expect(bob.totalCount).toBe(2);
     });
 
-    test('a routing edge projected before the cohort stamp is stamped by the repair pass — only then does a missing cohort stop admitting an outsider', async () => {
+    test('a routing edge projected before the cohort stamp is unknown provenance: served to nobody, stamped by the read path\'s gate before the first page a process serves, and by the repair pass as the steady-state fallback', async () => {
         await RequestContextService.run({agentIdentityNodeId: '@bob'}, () => PermissionService.grantPermission({to: '@alice', scope: 'CAN_REPLY_TO'}));
         GraphService.upsertNode({id: '@charlie', type: 'AgentIdentity', name: 'Charlie', properties: {accountType: 'agent'}});
 
@@ -978,31 +985,65 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
             sqlite       = GraphService.db.storage.db,
             routingStamp = () => JSON.parse(sqlite.prepare("SELECT data FROM Edges WHERE source = ? AND type = 'SENT_TO' AND target = 'AGENT:*'").get(res.messageId).data).properties,
             inboxIds     = identity => RequestContextService.run({agentIdentityNodeId: identity}, async () =>
-                (await MailboxService.listMessages({box: 'inbox', status: 'all'})).messages.map(message => message.messageId));
+                (await MailboxService.listMessages({box: 'inbox', status: 'all'})).messages.map(message => message.messageId)),
+            inboxCount   = identity => RequestContextService.run({agentIdentityNodeId: identity}, async () =>
+                (await MailboxService.countMessages({box: 'inbox', status: 'all'})).count),
+            // A projection from before the stamp existed: strip it from storage and the cache.
+            stripStamp   = () => {
+                sqlite.prepare("UPDATE Edges SET data = json_remove(data, '$.properties.broadcastCohort', '$.properties.intendedRecipientCount') WHERE source = ? AND type = 'SENT_TO' AND target = 'AGENT:*'").run(res.messageId);
+                for (const edge of GraphService.db.edges.items.filter(candidate => candidate.source === res.messageId && candidate.type === 'SENT_TO')) {
+                    delete edge.properties.broadcastCohort;
+                    delete edge.properties.intendedRecipientCount;
+                }
+                expect(routingStamp().broadcastCohort).toBeUndefined();
+            };
 
-        // A projection from before the stamp existed: strip it from storage and the cache.
-        sqlite.prepare("UPDATE Edges SET data = json_remove(data, '$.properties.broadcastCohort', '$.properties.intendedRecipientCount') WHERE source = ? AND type = 'SENT_TO' AND target = 'AGENT:*'").run(res.messageId);
-        for (const edge of GraphService.db.edges.items.filter(candidate => candidate.source === res.messageId && candidate.type === 'SENT_TO')) {
-            delete edge.properties.broadcastCohort;
-            delete edge.properties.intendedRecipientCount;
-        }
-        expect(routingStamp().broadcastCohort).toBeUndefined();
-
+        stripStamp();
         expect(damageEdgeProjection(res.messageId, 'DELIVERED_TO')).toBe(2);
-        expect(await inboxIds('@dave'), 'an unstamped edge still reads as legacy — the window the stamping pass closes').toContain(res.messageId);
 
-        const pass = await MailboxService.repairMessageGraphIntegrity({box: 'all'});
+        // Unknown provenance is fail-closed: an unstamped edge is no legacy broadcast, so it admits
+        // nobody — the outsider least of all — in the list and in the count.
+        expect(await inboxIds('@dave'), 'unknown is not legacy').not.toContain(res.messageId);
+        expect(await inboxCount('@dave')).toBe(0);
 
-        expect(pass).toMatchObject({cohortStamped: 1, cohortStampFailed: 0, repaired: 1, failed: 0});
-        expect(routingStamp(), 'the pass stamped the edge from the cohort the WAL recorded').toMatchObject({broadcastCohort: 'known', intendedRecipientCount: 2});
+        // A fresh process meets this projection through the read path's gate: before its first page
+        // is served, the edge is stamped from the cohort the marker index recorded — so the outsider
+        // is refused before the first repair, and the recipient waits for it.
+        MailboxService._resetBroadcastCohortStampGate();
+        expect(await inboxIds('@dave'), 'the gate stamped it before serving').not.toContain(res.messageId);
+        expect(routingStamp()).toMatchObject({broadcastCohort: 'known', intendedRecipientCount: 2});
+        expect(await inboxCount('@dave')).toBe(0);
+        expect(await inboxIds('@bob'), 'the recipient waits for the repair').not.toContain(res.messageId);
+
+        expect(await MailboxService.repairMessageGraphIntegrity({box: 'all'})).toMatchObject({repaired: 1, failed: 0, cohortStamped: 0});
         expect(await inboxIds('@bob')).toContain(res.messageId);
         expect(await inboxIds('@dave')).not.toContain(res.messageId);
 
-        // The discriminating read: lose the cohort AGAIN — the stamped edge admits no outsider now.
+        // The steady-state fallback: an edge that loses its stamp with the gate long settled admits
+        // nobody meanwhile, and the next pass stamps it and restores the cohort in one go.
+        stripStamp();
         expect(damageEdgeProjection(res.messageId, 'DELIVERED_TO')).toBe(2);
-        expect(await inboxIds('@dave'), 'no outsider between repair passes').not.toContain(res.messageId);
-        expect(await inboxIds('@bob'), 'the recipient waits for the next pass').not.toContain(res.messageId);
-        expect(await MailboxService.repairMessageGraphIntegrity({box: 'all'}), 'nothing left to stamp').toMatchObject({cohortStamped: 0, repaired: 1});
+        expect(await inboxIds('@dave'), 'no outsider between passes either').not.toContain(res.messageId);
+        expect(await MailboxService.repairMessageGraphIntegrity({box: 'all'})).toMatchObject({cohortStamped: 1, cohortStampFailed: 0, repaired: 1, failed: 0});
+        expect(routingStamp()).toMatchObject({broadcastCohort: 'known', intendedRecipientCount: 2});
+        expect(await inboxIds('@bob')).toContain(res.messageId);
+        expect(await inboxIds('@dave')).not.toContain(res.messageId);
+    });
+
+    test('a broadcast whose cohort cannot be classified — no marker, no readable WAL record — stays unknown after the gate: served to nobody, never read as legacy', async () => {
+        const unknownId = 'MESSAGE:broadcast-of-unknown-provenance';
+
+        GraphService.upsertNode({id: unknownId, type: 'MESSAGE', name: 'unknown provenance', properties: {subject: 'unknown provenance', readAt: null, sentAt: new Date().toISOString()}});
+        GraphService.linkNodes(unknownId, '@alice', 'SENT_BY', 1, {});
+        GraphService.linkNodes(unknownId, 'AGENT:*', 'SENT_TO', 1, {});
+
+        MailboxService._resetBroadcastCohortStampGate();
+
+        const bob = await RequestContextService.run({agentIdentityNodeId: '@bob'}, () => MailboxService.listMessages({box: 'inbox', status: 'all'}));
+
+        expect(bob.messages.map(message => message.messageId), 'unknown provenance is served to nobody').not.toContain(unknownId);
+        expect(bob.totalCount).toBe(0);
+        expect(JSON.parse(GraphService.db.storage.db.prepare("SELECT data FROM Edges WHERE source = ? AND type = 'SENT_TO'").get(unknownId).data).properties.broadcastCohort, 'the gate left it unclassified').toBeUndefined();
     });
 
     test('a repair pass costs each candidate its own edges, not every cached edge or a hub reload, and turns the loop between candidates', async () => {

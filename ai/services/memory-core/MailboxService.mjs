@@ -606,10 +606,11 @@ function buildTaggedConceptFilterGroups(values = []) {
  *
  * Four routing branches, one per way a message reaches a view, unioned by message id: a direct
  * `SENT_TO` the target, a per-recipient `DELIVERED_TO` the target (broadcasts), a legacy broadcast
- * (`SENT_TO AGENT:*` with no `DELIVERED_TO` cohort at all AND no known positive send-time cohort
- * on its routing edge — a modern broadcast whose delivery edges are missing is visible to nobody
- * until the drain host's repair restores them, never to an outsider; a known zero-audience
- * broadcast keeps its everyone-visible reading) and, for the outbox, a `SENT_BY` the target.
+ * (`SENT_TO AGENT:*` with no `DELIVERED_TO` cohort at all AND a routing edge stamped
+ * `legacy-unknown` or known zero-audience — a modern broadcast whose delivery edges are missing is
+ * visible to nobody until the drain host's repair restores them, never to an outsider, and an
+ * UNSTAMPED edge is unknown provenance, fail-closed until `ensureBroadcastCohortStamps` or the
+ * repair classifies it) and, for the outbox, a `SENT_BY` the target.
  * Receipt state is read where the view stores it, as `resolveReceiptState` reads it per
  * row: the target's `DELIVERED_TO` edge when one exists (the first non-null across its spellings,
  * as `getStorageDeliveryMutableState` reads it), the MESSAGE node otherwise. Identity spellings
@@ -680,7 +681,7 @@ function buildMailboxMatchQuery({box, status, target, fromIdentity = null, threa
         branches.push(
             branch(`e.type = 'SENT_TO' AND e.target IN ${targetIn}`),
             branch(`e.type = 'DELIVERED_TO' AND e.target IN ${targetIn}`),
-            branch(`e.type = 'SENT_TO' AND e.target = 'AGENT:*' AND COALESCE(json_extract(e.data, '$.properties.intendedRecipientCount'), 0) = 0 AND NOT EXISTS (SELECT 1 FROM Edges de WHERE de.source = n.id AND de.type = 'DELIVERED_TO')`)
+            branch(`e.type = 'SENT_TO' AND e.target = 'AGENT:*' AND (json_extract(e.data, '$.properties.broadcastCohort') = 'legacy-unknown' OR json_extract(e.data, '$.properties.intendedRecipientCount') = 0) AND NOT EXISTS (SELECT 1 FROM Edges de WHERE de.source = n.id AND de.type = 'DELIVERED_TO')`)
         );
     }
 
@@ -1537,6 +1538,121 @@ async function readMessageWalCandidateRecords({
     }
 
     return {recordsById, unreadableIds, deferredIds}
+}
+
+/**
+ * @summary Merges a send-time cohort onto a broadcast's intact `SENT_TO AGENT:*` routing edge and
+ * reads it back — a property merge with the weight untouched, never a node write.
+ * @param {String} id MESSAGE id.
+ * @param {{disposition: String, intendedRecipientCount?: Number}} cohort
+ * @returns {Boolean} Whether storage now carries the stamp.
+ * @private
+ */
+function stampBroadcastCohortEdge(id, cohort) {
+    try {
+        GraphService.linkNodes(id, 'AGENT:*', 'SENT_TO', 0, toBroadcastCohortEdgeProperties(cohort));
+
+        return Boolean(GraphService.db.storage.db.prepare(
+            "SELECT json_extract(data, '$.properties.broadcastCohort') AS cohort FROM Edges WHERE source = ? AND type = 'SENT_TO' AND target = 'AGENT:*'"
+        ).get(id)?.cohort)
+    } catch (error) {
+        logger.warn(`[MailboxService] broadcast cohort stamp failed for ${id}: ${error.message}`);
+        return false
+    }
+}
+
+let broadcastCohortStampGate = null;
+
+/**
+ * @summary Stamps every `SENT_TO AGENT:*` routing edge projected before the cohort stamp existed,
+ * once per process, before the first page or count is served — so an EXISTING modern broadcast
+ * whose delivery edges are lost admits no outsider before the first repair, not only after its
+ * turn in the repair's bounded batch.
+ *
+ * Cohorts come from the marker index, then the metadata cache, then one WAL read for the rest; an
+ * edge whose record cannot be read stays unstamped — unknown, which the mailbox SQL never reads
+ * as legacy — and is counted. The stamps land in chunks with the loop yielded between them. A
+ * failure inside is logged and never fails the read that awaited it; a plane without a message
+ * WAL has nothing to stamp.
+ * @returns {Promise<{candidates: Number, stamped: Number, unreadable: Number, failed: Number, ms: Number}|null>}
+ * @private
+ */
+function ensureBroadcastCohortStamps() {
+    if (broadcastCohortStampGate) return broadcastCohortStampGate;
+
+    broadcastCohortStampGate = (async () => {
+        const sqlite  = GraphService.db?.storage?.db,
+              started = Date.now(),
+              result  = {candidates: 0, stamped: 0, unreadable: 0, failed: 0, ms: 0},
+              finish  = () => {
+                  result.ms = Date.now() - started;
+                  if (result.candidates > 0) logger.info(`[MailboxService] broadcast cohort stamp gate: ${JSON.stringify(result)}`);
+                  return result
+              };
+
+        if (!sqlite || getMissingMessageWalLeaves(aiConfig.messageWal, ['dir']).length > 0) return null;
+
+        try {
+            const ids = sqlite.prepare(`
+                SELECT source
+                  FROM Edges
+                 WHERE type = 'SENT_TO'
+                   AND target = 'AGENT:*'
+                   AND json_extract(data, '$.properties.broadcastCohort') IS NULL
+            `).all().map(row => row.source);
+
+            result.candidates = ids.length;
+            if (ids.length === 0) return finish();
+
+            const stats      = await getMessageWalGraphProjectionStats({dir: aiConfig.messageWal.dir}),
+                  cohortById = new Map(stats.broadcastCohortById);
+
+            for (const id of ids) {
+                const cached = messageWalCandidateMetadataCacheById.get(id);
+
+                if (!cohortById.has(id) && cached?.broadcastCohort) cohortById.set(id, cached.broadcastCohort);
+            }
+
+            const unresolved = ids.filter(id => !cohortById.has(id));
+
+            if (unresolved.length > 0) {
+                const loaded = await readMessageWalCandidateRecords({
+                    ids                      : unresolved,
+                    segmentById              : stats.segmentById,
+                    payloadSignatureBySegment: stats.payloadSignatureBySegment,
+                    bypassUnreadableBackoff  : true
+                });
+
+                loaded.recordsById.forEach((record, id) => {
+                    const cohort = getMessageWalBroadcastCohort(record);
+
+                    if (cohort) cohortById.set(id, cohort);
+                });
+            }
+
+            for (let index = 0; index < ids.length; index += MESSAGE_GRAPH_COHORT_STAMP_LIMIT) {
+                for (const id of ids.slice(index, index + MESSAGE_GRAPH_COHORT_STAMP_LIMIT)) {
+                    const cohort = cohortById.get(id);
+
+                    if (!cohort) {
+                        result.unreadable++;
+                    } else if (stampBroadcastCohortEdge(id, cohort)) {
+                        result.stamped++;
+                    } else {
+                        result.failed++;
+                    }
+                }
+
+                await new Promise(resolve => setImmediate(resolve));
+            }
+        } catch (error) {
+            logger.warn(`[MailboxService] broadcast cohort stamp gate failed: ${error.message}`);
+        }
+
+        return finish()
+    })();
+
+    return broadcastCohortStampGate;
 }
 
 /**
@@ -3173,31 +3289,16 @@ class MailboxService extends Base {
         if (candidateState) {
             summary.compatibility = candidateState.compatibility;
 
-            // Routing edges from before the cohort stamp learn their send-time cohort here: a property
-            // merge on the intact `SENT_TO AGENT:*` edge (weight untouched), never a node write, so no
-            // Task transition can race it. A candidate missing its node or that edge is left to its
-            // repair, whose projection stamps the edge it recreates.
-            const stampedCohort = GraphService.db.storage.db.prepare(
-                "SELECT json_extract(data, '$.properties.broadcastCohort') AS cohort FROM Edges WHERE source = ? AND type = 'SENT_TO' AND target = 'AGENT:*'"
-            );
-
+            // The steady-state fallback behind `ensureBroadcastCohortStamps` (the read path's one-time
+            // gate): a routing edge still without its cohort learns it here, a bounded batch per pass.
+            // A candidate missing its node or that edge is left to its repair, whose projection stamps
+            // the edge it recreates.
             for (const [id, cohort] of candidateState.broadcastCohortStamps) {
                 const reasons = candidateState.reasonsById.get(id);
 
                 if (reasons?.has('missing-message-node') || reasons?.has('missing-sent-to')) continue;
 
-                try {
-                    GraphService.linkNodes(id, 'AGENT:*', 'SENT_TO', 0, toBroadcastCohortEdgeProperties(cohort));
-
-                    if (stampedCohort.get(id)?.cohort) {
-                        summary.cohortStamped++;
-                    } else {
-                        summary.cohortStampFailed++;
-                    }
-                } catch (error) {
-                    summary.cohortStampFailed++;
-                    logger.warn(`[MailboxService] broadcast cohort stamp failed for ${id}: ${error.message}`);
-                }
+                summary[stampBroadcastCohortEdge(id, cohort) ? 'cohortStamped' : 'cohortStampFailed']++;
             }
         }
 
@@ -3480,6 +3581,9 @@ class MailboxService extends Base {
         // indexes before either can publish an empty result, including an honestly empty mailbox
         // where no later source-index lookup would otherwise execute.
         db.edges.assertIndices(['source', 'target']);
+
+        // Existing broadcasts learn their send-time cohort before the first page this process serves.
+        await ensureBroadcastCohortStamps();
 
         const sqlite = db.storage?.db;
 
@@ -3879,6 +3983,16 @@ class MailboxService extends Base {
      */
     clearRelatedPullRequestStateCache() {
         relatedPullRequestStateCache.clear()
+    }
+
+    /**
+     * @summary Test seam: forgets that the broadcast cohort stamp gate ran, so the next read stamps
+     * again as a fresh process would — the shape of an existing projection met after an upgrade.
+     * @returns {void}
+     */
+    _resetBroadcastCohortStampGate() {
+        broadcastCohortStampGate = null;
+        broadcastCohortStampUnreadableIds.clear()
     }
 
     /**
@@ -4812,6 +4926,8 @@ class MailboxService extends Base {
 
         const sqlite = GraphService.db?.storage?.db;
         if (!sqlite) return { count: 0 };
+
+        await ensureBroadcastCohortStamps();
 
         // One set with `listMessages` (`buildMailboxMatchQuery`), under this method's own contract:
         // the outbox count is every SENT_BY row (no status, no archive, no sender filter).
