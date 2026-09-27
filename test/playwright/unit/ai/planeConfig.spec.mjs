@@ -124,11 +124,10 @@ test.describe('resolved-value opacity — the invariant on the values that vary'
 });
 
 test.describe('plane-member derivation witnesses — #15791 seat-variance ground truth', () => {
-    // ticket-ref-ok: the #15799 AC binds these witnesses to the #15791 reconcile probe as their
-    // ground truth. The probe's finding class: per-seat plane divergence arises where members
-    // re-derive their own root (ambient cwd, homedir, ad-hoc module consts). These witnesses pin
-    // every migrated member default to the ONE declared anchor — cwd-independent by construction,
-    // so the probe's divergence class cannot re-enter through defaults.
+    // Per-seat plane divergence arises where members re-derive their own root (ambient cwd,
+    // homedir, ad-hoc module consts). These witnesses pin every migrated member default to the ONE
+    // declared anchor — cwd-independent by construction, so that divergence cannot re-enter
+    // through defaults.
     const anchor = ConfigBase.config.data.plane.dataRoot.default;
 
     test('the anchor itself is the twin resolution over neoRootDir', () => {
@@ -145,7 +144,6 @@ test.describe('plane-member derivation witnesses — #15791 seat-variance ground
         expect(fleetDataDir.env).toBe('NEO_FLEET_DATA_DIR');
         expect(fleetDataDir.type).toBe('string');
         expect(fleetDataDir.planeMember).toBe(true);
-        expect(data.fleet.instanceRoot.default).toBe(path.resolve(anchor, 'fleet/instances'));
         expect(data.engines.chroma.dataDirProd.default).toBe(path.resolve(anchor, 'chroma/unified'));
         expect(data.orchestrator.deploymentStateBridge.snapshotPath.default).toBe(path.resolve(anchor, 'deployment-state/snapshot.json'));
         expect(data.orchestrator.recoveryActuator.healAttemptsPath.default).toBe(path.resolve(anchor, 'orchestrator-daemon/heal-attempts.json'));
@@ -180,6 +178,27 @@ test.describe('plane-member derivation witnesses — #15791 seat-variance ground
         expect(data.backupPath.planeMember).toBe(false);
         expect(typeof data.backupPath.planeMemberReason).toBe('string');
         expect(data.backupPath.planeMemberReason.length).toBeGreaterThan(0)
+    });
+
+    // The same invariant for the seats: an agent's clones and harness homes carry path-keyed memory
+    // and auth that must outlive any plane, so the agents root is a non-member too.
+    test('fleet.agentsRoot is deliberately NOT anchored — a seat outlives the plane', () => {
+        const
+            {data}      = ConfigBase.config,
+            neoRoot     = data.neoRootDir.default,
+            agentsRoot  = data.fleet.agentsRoot,
+            rootDefault = agentsRoot.default;
+
+        expect(path.isAbsolute(rootDefault)).toBe(true);
+        expect(agentsRoot.env).toBe('NEO_FLEET_AGENTS_ROOT');
+
+        for (const plane of [neoRoot, anchor]) {
+            expect(rootDefault).not.toBe(plane);
+            expect(rootDefault.startsWith(plane + path.sep)).toBe(false)
+        }
+
+        expect(agentsRoot.planeMember).toBe(false);
+        expect(agentsRoot.planeMemberReason.length).toBeGreaterThan(0)
     });
 
     test('orchestrator dataDir + dbPath are anchored ABSOLUTE — ambient-cwd resolution retired', () => {
@@ -228,12 +247,11 @@ test.describe('plane-member derivation witnesses — #15791 seat-variance ground
 });
 
 test.describe('derivePlaneMemberPaths — the completeness half (#15932)', () => {
-    // ticket-ref-ok: the pinned census (`expect(TIER1_MEMBER_PATHS.length).toBe(10)`) guarded the
-    // list against DELETIONS and against nothing else — a plane-anchored leaf added without a list
-    // edit passed green forever, which is the omission direction that actually happens.
-    // ticket-ref-ok: #15932 is the mechanism under test; #15872's graph-SQLite omission is its
-    // first confirmed instance — named because the red control's target shape is the point.
-    // the config tree it claims to describe: declaration and membership are ONE act.
+    // A pinned count (`expect(TIER1_MEMBER_PATHS.length).toBe(10)`) guards the list against
+    // DELETIONS and nothing else — a plane-anchored leaf added without a list edit would pass green
+    // forever, which is the omission direction that actually happens (a graph-SQLite leaf once did).
+    // So the declared list must equal the set derived from the config tree it claims to describe:
+    // declaration and membership are ONE act.
     const anchor = ConfigBase.config.data.plane.dataRoot.default,
           leaf   = (defaultValue, extra = {}) => ({default: defaultValue, env: null, type: 'string', parse: null, ...extra});
 

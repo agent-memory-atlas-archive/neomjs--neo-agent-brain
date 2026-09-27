@@ -1279,9 +1279,9 @@ export async function startFleetServer(options={}) {
         ? `[FleetServer] deployment-state read-source wired (${aiConfig.orchestrator.deploymentStateBridge.snapshotPath})`
         : '[FleetServer] deployment-state read-source unwired — fleetDeploymentState answers unavailable');
 
-    // The plane guard above has accepted the resolved Fleet member. Inject it only now, before the
-    // listener can dispatch, so a refused composition never mutates the singleton's runtime root.
-    FleetManager.managedRoot = path.join(aiConfig.fleet.dataDir, 'repos');
+    // The plane guard above has accepted the composition. Inject the agents root only now, before
+    // the listener can dispatch, so a refused composition never mutates the singleton's runtime root.
+    FleetManager.managedRoot = aiConfig.fleet.agentsRoot;
 
     app.fleetWakeArming = options.wakeArmingContext ?? createWakeArmingContext({
         fanout: app.fleetWakeFanout,

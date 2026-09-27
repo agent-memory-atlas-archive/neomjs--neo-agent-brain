@@ -1,97 +1,118 @@
-import crypto from 'crypto';
-import path   from 'path';
+import path from 'path';
 
 /**
- * @summary Derive the stable, collision-free, traversal-safe managed checkout path for a Fleet
- * Manager agent's clone of a given repo.
+ * The one shape every seat path segment must have: lowercase letters, digits, `.`, `_` and `-`, at
+ * most 100 characters, never a leading `-` and never `.` or `..`. Lowercase only because the default
+ * macOS volume is case-insensitive: `Ada` and `ada` would otherwise share a folder.
+ * @type {RegExp}
+ * @private
+ */
+const SEGMENT = /^(?!\.{1,2}$)(?!-)[a-z0-9._-]{1,100}$/;
+
+/**
+ * The segment under an agent's folder that holds its harness homes. No clone owner may take it, so a
+ * checkout can never land inside a harness home.
+ * @type {String}
+ */
+export const HARNESS_SEGMENT = 'harness';
+
+/**
+ * @summary Derive the managed checkout path of a Fleet agent's clone of a repo:
+ * `<managedRoot>/<agentId>/<owner>/<repo>`, the layout a person would make by hand.
  *
- * The pure half of Fleet Manager repo provisioning: given a trusted `managedRoot` and an agent +
- * repo, decide *where* that agent's checkout belongs — deterministic path math only, with no fs /
- * git / env / config access. The side-effectful clone / locate / health-check (a later leaf)
- * consumes this; isolating the decision makes the correctness-and-security-critical rule fully
- * unit-testable.
+ * The pure half of Fleet repo provisioning: path math only, with no fs / git / env / config access.
+ * The clone / locate / health-check consumes it.
  *
- * Two invariants are load-bearing because Fleet Manager auto-memory is **checkout-path-keyed**:
- * - **Stable:** identical inputs always map to the identical path — an unstable path would silently
- *   fork an agent's path-keyed memory across restarts.
- * - **Collision-free:** distinct agents (or repos) never share a path — a collision would
- *   cross-contaminate two agents' memory. Distinctness holds even when two ids sanitize to the same
- *   readable form, because each segment carries a deterministic hash of the *raw* value.
+ * Two invariants are load-bearing because Claude file-memory is **keyed by the checkout path**:
+ * - **Stable:** identical inputs map to the identical path, so an agent's memory never forks.
+ * - **Collision-free:** every segment is the raw value itself — an invalid value is refused, never
+ *   rewritten — so distinct agents or repos never share a path.
  *
- * And one security invariant, mirroring the untrusted-key posture of `FleetRegistryService` (an
- * agent id may be an arbitrary explicit string, not just a GitHub username): the untrusted value is
- * sanitized and the resolved path is asserted to stay **contained** under `managedRoot`, so a value
- * like `../../etc` can never escape the managed tree.
+ * The values are untrusted (an agent id may be any explicit string), so each segment is validated by
+ * {@link assertSeatSegment} and the resolved path is asserted to stay **contained** under
+ * `managedRoot`.
  *
- * `managedRoot` is a required argument — never defaulted, derived, or read from env / fs here (the
- * config-is-SSOT contract); the consuming service resolves it from config and passes it in.
+ * `managedRoot` is required, never defaulted, derived or read from env here: the composing
+ * entrypoint passes the resolved `AiConfig.fleet.agentsRoot`.
  *
  * @param {Object} options
- * @param {String} options.managedRoot An absolute path to the trusted fleet-managed checkout root.
- * @param {String} options.agentId     The Fleet Manager agent id (untrusted; any non-empty string).
- * @param {String} options.repoSlug    The repo identifier, e.g. `'neomjs/neo'` (untrusted; non-empty).
- * @returns {String} `<managedRoot>/<agentSegment>/<repoSegment>` — absolute, stable, contained.
- * @throws {Error} If `managedRoot` is not a non-empty absolute string, or `agentId` / `repoSlug` is
- * not a non-empty string, or (defense-in-depth) the resolved path escapes `managedRoot`.
+ * @param {String} options.managedRoot An absolute path to the trusted agents root.
+ * @param {String} options.agentId     The Fleet agent id (untrusted).
+ * @param {String} options.repoSlug    `<owner>/<repo>`, e.g. `'neomjs/neo'` (untrusted).
+ * @returns {String} `<managedRoot>/<agentId>/<owner>/<repo>`, absolute, stable, contained.
+ * @throws {Error} If `managedRoot` is not an absolute path, `repoSlug` is not exactly
+ * `<owner>/<repo>`, a segment fails {@link assertSeatSegment}, the owner is {@link HARNESS_SEGMENT},
+ * or (defense-in-depth) the resolved path escapes `managedRoot`.
  */
 export function deriveAgentRepoPath({managedRoot, agentId, repoSlug} = {}) {
-    assertNonEmptyString(managedRoot, 'managedRoot');
-    assertNonEmptyString(agentId,     'agentId');
-    assertNonEmptyString(repoSlug,    'repoSlug');
+    const root = assertRoot(managedRoot, 'managedRoot', 'deriveAgentRepoPath');
 
-    if (!path.isAbsolute(managedRoot)) {
-        throw new Error(`deriveAgentRepoPath: 'managedRoot' must be an absolute path, received '${managedRoot}'.`);
+    assertSeatSegment(agentId, 'agentId', 'deriveAgentRepoPath');
+
+    if (typeof repoSlug !== 'string' || repoSlug.split('/').length !== 2) {
+        throw new Error(`deriveAgentRepoPath: 'repoSlug' must be '<owner>/<repo>', received '${repoSlug}'.`);
     }
 
-    const
-        root   = path.resolve(managedRoot),
-        target = path.resolve(root, safeSegment(agentId), safeSegment(repoSlug)),
-        rel    = path.relative(root, target);
+    const [owner, repo] = repoSlug.split('/');
 
-    // Defense-in-depth over safeSegment: the resolved path must stay strictly within the managed
-    // root. A silently-wrong path would clone into the wrong place, so an escape is a loud failure,
-    // not a quietly-returned bad path. `path.relative` is the robust containment idiom (handles a
-    // root of `/` and cross-drive targets that a `startsWith` check would mis-handle).
-    if (rel.startsWith('..') || path.isAbsolute(rel)) {
-        throw new Error(`deriveAgentRepoPath: derived path escaped the managed root (agentId='${agentId}', repoSlug='${repoSlug}').`);
+    assertSeatSegment(owner,   'owner',   'deriveAgentRepoPath');
+    assertSeatSegment(repo,    'repo',    'deriveAgentRepoPath');
+
+    if (owner === HARNESS_SEGMENT) {
+        throw new Error(`deriveAgentRepoPath: the owner '${HARNESS_SEGMENT}' is reserved for an agent's harness homes.`);
     }
 
-    return target;
+    return assertContained(root, path.resolve(root, agentId, owner, repo), 'deriveAgentRepoPath')
 }
 
 /**
- * Build a filesystem-safe, human-readable, collision-free path segment from an untrusted raw value:
- * a sanitized + length-bounded readable prefix joined to a deterministic 12-hex-char SHA-256 suffix.
- * The hash makes the segment stable AND keeps distinct raw values distinct even when sanitization is
- * lossy (e.g. `a/b` and `a-b` sanitize alike but hash differently). Sanitization collapses unsafe
- * characters and dot-runs and trims leading/trailing separators, so `.` / `..` can never survive as
- * a bare traversal segment.
- * @param {String} raw
- * @returns {String} `<readable>-<sha256(raw)[0..12]>`
- * @private
+ * @summary Refuse any value that is not a valid seat path segment. Nothing is sanitized: a lossy
+ * rewrite is what once needed a hash to stay collision-free.
+ * @param {*}      value  The untrusted value.
+ * @param {String} name   The argument name, for the error.
+ * @param {String} caller The deriving function, for the error.
+ * @throws {Error} If `value` is not a string matching the segment shape.
  */
-function safeSegment(raw) {
-    const
-        hash      = crypto.createHash('sha256').update(raw).digest('hex').slice(0, 12),
-        sanitized = raw
-            .replace(/[^a-zA-Z0-9._-]+/g, '-') // collapse runs of unsafe chars (incl. `/` and `\`) to one dash
-            .replace(/\.{2,}/g, '.')           // collapse dot-runs — kills `..`
-            .replace(/^[.\-]+|[.\-]+$/g, '')   // trim leading/trailing dots + dashes — kills a bare `.` / `-`
-            .slice(0, 40),                     // bound the readable prefix
-        readable  = sanitized || 'x';          // fallback when sanitization empties the value
-
-    return `${readable}-${hash}`;
+export function assertSeatSegment(value, name, caller) {
+    if (typeof value !== 'string' || !SEGMENT.test(value)) {
+        throw new Error(
+            `${caller}: '${name}' must be 1–100 lowercase letters, digits, '.', '_' or '-' (not '.', '..' ` +
+            `or a leading '-'), received '${value}'.`
+        )
+    }
 }
 
 /**
- * Guard a required string argument.
- * @param {*}      value
- * @param {String} name
- * @throws {Error} If `value` is not a non-empty string.
- * @private
+ * @summary Guard the trusted root: a non-empty absolute path.
+ * @param {*}      value  The root.
+ * @param {String} name   The argument name, for the error.
+ * @param {String} caller The deriving function, for the error.
+ * @returns {String} The resolved root.
+ * @throws {Error} If `value` is not a non-empty absolute path.
  */
-function assertNonEmptyString(value, name) {
-    if (typeof value !== 'string' || value.length === 0) {
-        throw new Error(`deriveAgentRepoPath: '${name}' must be a non-empty string.`);
+export function assertRoot(value, name, caller) {
+    if (typeof value !== 'string' || !path.isAbsolute(value)) {
+        throw new Error(`${caller}: '${name}' must be an absolute path, received '${value}'.`)
     }
+
+    return path.resolve(value)
+}
+
+/**
+ * @summary Defense-in-depth over the segment rule: the resolved path must stay strictly within the
+ * root. `path.relative` is the robust containment idiom (a root of `/`, cross-drive targets).
+ * @param {String} root   The resolved root.
+ * @param {String} target The resolved path.
+ * @param {String} caller The deriving function, for the error.
+ * @returns {String} `target`.
+ * @throws {Error} If `target` escapes `root`.
+ */
+export function assertContained(root, target, caller) {
+    const rel = path.relative(root, target);
+
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+        throw new Error(`${caller}: the derived path escaped the root ('${target}').`)
+    }
+
+    return target
 }

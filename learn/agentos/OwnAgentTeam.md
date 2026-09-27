@@ -213,7 +213,9 @@ when their Electron app data is separate.
 
 The robust local setup is:
 
-1. Give each teammate its own repo clone or worktree cwd.
+1. Give each teammate its own repo clone or worktree cwd. Fleet does this by construction: it
+   provisions each agent's clones at `<NEO_FLEET_AGENTS_ROOT>/<id>/<owner>/<repo>`, beside its
+   harness homes at `<id>/harness/<type>`.
 2. Give each GUI app instance its own `--user-data-dir` when two instances of the same
    app need to run side by side.
 3. Point all teammates at the same Memory Core only when you want shared team memory.

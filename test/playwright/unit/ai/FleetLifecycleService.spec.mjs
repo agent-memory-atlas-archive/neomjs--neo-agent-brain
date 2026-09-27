@@ -20,6 +20,7 @@ import path              from 'path';
 
 import Neo                          from 'neo.mjs/src/Neo.mjs';
 import * as core                    from 'neo.mjs/src/core/_export.mjs';
+import AiConfig                     from '../../../../ai/config.template.mjs';
 import FleetLifecycleService        from '../../../../ai/services/fleet/FleetLifecycleService.mjs';
 import {generateOpenCodeSeatConfig} from '../../../../ai/services/fleet/generateOpenCodeSeatConfig.mjs';
 
@@ -367,6 +368,14 @@ test.describe('Neo.ai.services.fleet.FleetLifecycleService', () => {
 // gap the cycle-1 review demonstrated on the real harness binaries).
 test.describe('Neo.ai.services.fleet.FleetLifecycleService — curated launch + security matrix', () => {
     const curatedAgent = (id, harnessType = 'codex') => ({id, githubUsername: id, harnessType, metadata: {}});
+
+    test('without an injected root, harness homes derive under the AiConfig agents root', () => {
+        install();
+
+        expect(FleetLifecycleService.instanceRoot).toBeNull();
+        expect(FleetLifecycleService.getInstanceRoot()).toBe(AiConfig.fleet.agentsRoot);
+        expect(path.isAbsolute(FleetLifecycleService.getInstanceRoot())).toBe(true)
+    });
 
     test('curated codex derivation: template args + isolated CODEX_HOME under instanceRoot, keyed by agent id', () => {
         const spawn = install({agents: {peer2: curatedAgent('peer2')}, creds: {}});
@@ -898,7 +907,7 @@ test.describe('Neo.ai.services.fleet.FleetLifecycleService — curated launch + 
 
         const {args, opts} = spawn.calls[0];
         expect(args).toEqual([
-            '--mcp-config', path.join(FleetLifecycleService.instanceRoot, 'c2-9c0abe51c6e6', 'claude-code-28e174396028', 'mcp-config.json'),
+            '--mcp-config', path.join(FleetLifecycleService.instanceRoot, 'c2', 'harness', 'claude-code', 'mcp-config.json'),
             '--strict-mcp-config',
             '--input-format', 'stream-json',
             '--output-format', 'stream-json',

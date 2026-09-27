@@ -5,85 +5,73 @@ import {deriveAgentRepoPath} from '../../../../ai/services/fleet/deriveAgentRepo
 // Pure function — imported directly (no fs / git / Neo runtime), so the suite has no host-runtime
 // side effects and each case is fully isolated. Mirrors resolveCallTarget.spec / LockRegistry.spec.
 
-const ROOT = path.resolve('/srv/fleet');
-
-// Convenience: the resolved managed root + the OS separator, for containment assertions.
-const underRoot = p => p === ROOT || p.startsWith(ROOT + path.sep);
+const ROOT = path.resolve('/srv/agents');
 
 test.describe('deriveAgentRepoPath (Fleet Manager repo-provisioning path derivation)', () => {
-    test('derives an absolute <root>/<agent>/<repo> path contained under the managed root', () => {
-        const result = deriveAgentRepoPath({managedRoot: '/srv/fleet', agentId: 'neo-opus-ada', repoSlug: 'neomjs/neo'});
+    test('derives <root>/<agentId>/<owner>/<repo>, the layout a person would make', () => {
+        expect(deriveAgentRepoPath({managedRoot: '/srv/agents', agentId: 'neo-fable-clio', repoSlug: 'neomjs/neo'}))
+            .toBe(path.join(ROOT, 'neo-fable-clio', 'neomjs', 'neo'));
 
-        expect(path.isAbsolute(result)).toBe(true);
-        expect(underRoot(result)).toBe(true);
-        // exactly two segments below the root: <agent>/<repo>
-        expect(path.relative(ROOT, result).split(path.sep)).toHaveLength(2);
+        // an org's profile repo keeps its leading dot
+        expect(deriveAgentRepoPath({managedRoot: '/srv/agents', agentId: 'neo-gpt', repoSlug: 'neomjs/.github'}))
+            .toBe(path.join(ROOT, 'neo-gpt', 'neomjs', '.github'));
     });
 
     test('is stable — identical inputs always map to the identical path (memory is path-keyed)', () => {
-        const args = {managedRoot: '/srv/fleet', agentId: 'neo-gpt', repoSlug: 'neomjs/neo'};
+        const args = {managedRoot: '/srv/agents', agentId: 'neo-gpt', repoSlug: 'neomjs/neo'};
         expect(deriveAgentRepoPath(args)).toBe(deriveAgentRepoPath(args));
     });
 
-    test('is collision-free across distinct agents and distinct repos', () => {
-        const
-            a = deriveAgentRepoPath({managedRoot: '/srv/fleet', agentId: 'alice', repoSlug: 'neomjs/neo'}),
-            b = deriveAgentRepoPath({managedRoot: '/srv/fleet', agentId: 'bob',   repoSlug: 'neomjs/neo'}),
-            c = deriveAgentRepoPath({managedRoot: '/srv/fleet', agentId: 'alice', repoSlug: 'neomjs/other'});
+    test('is collision-free across distinct agents, owners and repos: each segment is the raw value', () => {
+        const paths = [
+            {agentId: 'alice', repoSlug: 'neomjs/neo'},
+            {agentId: 'bob',   repoSlug: 'neomjs/neo'},
+            {agentId: 'alice', repoSlug: 'neomjs/other'},
+            {agentId: 'alice', repoSlug: 'other/neo'}
+        ].map(args => deriveAgentRepoPath({managedRoot: '/srv/agents', ...args}));
 
-        expect(a).not.toBe(b); // distinct agents
-        expect(a).not.toBe(c); // distinct repos
+        expect(new Set(paths).size).toBe(paths.length)
     });
 
-    test('stays collision-free even when two ids sanitize to the same readable form (hash-disambiguated)', () => {
-        // `a/b` and `a-b` both sanitize to the readable form `a-b`; the raw-value hash keeps them apart.
-        const
-            slash = deriveAgentRepoPath({managedRoot: '/srv/fleet', agentId: 'a/b', repoSlug: 'r'}),
-            dash  = deriveAgentRepoPath({managedRoot: '/srv/fleet', agentId: 'a-b', repoSlug: 'r'});
+    test('refuses every value it would otherwise have to rewrite — nothing is sanitized', () => {
+        const refuse = (agentId, repoSlug, name) =>
+            expect(() => deriveAgentRepoPath({managedRoot: '/srv/agents', agentId, repoSlug})).toThrow(name);
 
-        expect(slash).not.toBe(dash);
-    });
-
-    test('contains every traversal-bearing or unsafe id under the managed root (security invariant)', () => {
-        for (const agentId of ['../../etc/passwd', '..', '/abs', 'a/b/../..', '__proto__', '.', '....//....']) {
-            const result = deriveAgentRepoPath({managedRoot: '/srv/fleet', agentId, repoSlug: 'r'});
-            expect(underRoot(result)).toBe(true);                              // never escapes upward
-            expect(path.relative(ROOT, result).startsWith('..')).toBe(false);  // not above the root
+        // traversal, separators, a leading '-' and the empty value never become a segment
+        for (const agentId of ['..', '.', 'a/b', '../../etc/passwd', '-rf', '', 'a b', 'a\\b']) {
+            refuse(agentId, 'neomjs/neo', /'agentId'/)
         }
-        // a traversal-bearing repoSlug is contained too
-        const r = deriveAgentRepoPath({managedRoot: '/srv/fleet', agentId: 'a', repoSlug: '../../../root'});
-        expect(underRoot(r)).toBe(true);
+
+        // lowercase only: the default macOS volume is case-insensitive, `Ada` and `ada` would share a folder
+        refuse('Ada', 'neomjs/neo', /'agentId'/);
+        refuse('ada', 'Neomjs/neo', /'owner'/);
+        refuse('ada', 'neomjs/Neo', /'repo'/);
+
+        // a segment longer than 100 characters
+        refuse('a'.repeat(101), 'neomjs/neo', /'agentId'/);
     });
 
-    test('keeps a human-readable prefix so the operator can navigate the managed tree', () => {
-        const result  = deriveAgentRepoPath({managedRoot: '/srv/fleet', agentId: 'neo-opus-ada', repoSlug: 'neomjs/neo'}),
-              agentSeg = path.relative(ROOT, result).split(path.sep)[0];
-        // readable prefix preserved, hash suffix appended
-        expect(agentSeg.startsWith('neo-opus-ada-')).toBe(true);
+    test('the slug is exactly <owner>/<repo>, and the owner `harness` is reserved for harness homes', () => {
+        for (const repoSlug of ['neo', 'neomjs/neo/extra', '/neo', 'neomjs/', '../../root', undefined]) {
+            expect(() => deriveAgentRepoPath({managedRoot: '/srv/agents', agentId: 'ada', repoSlug})).toThrow();
+        }
 
-        // a fully-unsafe id still yields a non-empty, readable-ish segment (sanitized `etc-passwd`)
-        const sneaky = deriveAgentRepoPath({managedRoot: '/srv/fleet', agentId: '../../etc/passwd', repoSlug: 'r'});
-        expect(path.relative(ROOT, sneaky).split(path.sep)[0]).toContain('etc-passwd');
+        expect(() => deriveAgentRepoPath({managedRoot: '/srv/agents', agentId: 'ada', repoSlug: 'harness/codex'}))
+            .toThrow(/reserved/);
     });
 
     test('the managed root is honored verbatim — same agent/repo under different roots diverges', () => {
         const
-            a = deriveAgentRepoPath({managedRoot: '/srv/fleet',  agentId: 'x', repoSlug: 'r'}),
-            b = deriveAgentRepoPath({managedRoot: '/data/fleet', agentId: 'x', repoSlug: 'r'});
+            a = deriveAgentRepoPath({managedRoot: '/srv/agents',  agentId: 'x', repoSlug: 'o/r'}),
+            b = deriveAgentRepoPath({managedRoot: '/data/agents', agentId: 'x', repoSlug: 'o/r'});
 
-        expect(a).not.toBe(b);
-        expect(a.startsWith(path.resolve('/srv/fleet')  + path.sep)).toBe(true);
-        expect(b.startsWith(path.resolve('/data/fleet') + path.sep)).toBe(true);
+        expect(a).toBe(path.join(path.resolve('/srv/agents'),  'x', 'o', 'r'));
+        expect(b).toBe(path.join(path.resolve('/data/agents'), 'x', 'o', 'r'));
     });
 
-    test('fails loud on contract violations (no silent default path)', () => {
-        // missing / empty / non-string required args
-        expect(() => deriveAgentRepoPath({managedRoot: '/srv/fleet', agentId: '',   repoSlug: 'r'})).toThrow(/agentId/);
-        expect(() => deriveAgentRepoPath({managedRoot: '/srv/fleet', agentId: 'a',  repoSlug: '' })).toThrow(/repoSlug/);
-        expect(() => deriveAgentRepoPath({managedRoot: '',           agentId: 'a',  repoSlug: 'r'})).toThrow(/managedRoot/);
-        expect(() => deriveAgentRepoPath({managedRoot: '/srv/fleet', agentId: 42,   repoSlug: 'r'})).toThrow(/agentId/);
+    test('fails loud on a missing or relative root (no silent default path)', () => {
+        expect(() => deriveAgentRepoPath({managedRoot: '',             agentId: 'a', repoSlug: 'o/r'})).toThrow(/managedRoot/);
+        expect(() => deriveAgentRepoPath({managedRoot: 'relative/dir', agentId: 'a', repoSlug: 'o/r'})).toThrow(/absolute/);
         expect(() => deriveAgentRepoPath({})).toThrow(/managedRoot/);
-        // a non-absolute managed root is a caller contract violation
-        expect(() => deriveAgentRepoPath({managedRoot: 'relative/dir', agentId: 'a', repoSlug: 'r'})).toThrow(/absolute/);
     });
 });

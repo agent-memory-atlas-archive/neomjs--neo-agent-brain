@@ -19,6 +19,7 @@ import path                            from 'node:path';
 import RequestContextService           from '../../../../../../ai/mcp/server/shared/services/RequestContextService.mjs';
 import ConfigBase                      from '../../../../../../ai/configBase.mjs';
 import FleetControlBridge              from '../../../../../../ai/services/fleet/FleetControlBridge.mjs';
+import FleetManager                    from '../../../../../../ai/services/fleet/FleetManager.mjs';
 import {
     createDeploymentStateSnapshot,
     writeDeploymentStateSnapshot
@@ -1028,6 +1029,28 @@ test.describe('composed deployment-state path', () => {
     test.afterEach(() => {
         globalThis.fetch = nativeFetch;
         FleetControlBridge.deploymentStateSource = null
+    });
+
+    test('the composed entrypoint hands Fleet the resolved agents root, never a join under its data dir', async () => {
+        stubProviderIdentity();
+
+        const
+            root  = await mkdtemp(path.join(os.tmpdir(), 'neo-fleet-agents-root-')),
+            prior = FleetManager.managedRoot,
+            config = composedConfig(path.join(root, 'absent-snapshot.json'));
+
+        config.fleet = {...config.fleet, agentsRoot: path.join(root, 'agents')};
+
+        try {
+            const server = await startFleetServer({aiConfig: config, logger, planeGuard() {}, host: '127.0.0.1', port: 0});
+
+            expect(FleetManager.managedRoot).toBe(path.join(root, 'agents'));
+
+            await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+        } finally {
+            FleetManager.managedRoot = prior;
+            await rm(root, {recursive: true, force: true})
+        }
     });
 
     test('the composed entrypoint serves a producer-derived projection from the resolved snapshot leaves, and answers unwired without them', async () => {
