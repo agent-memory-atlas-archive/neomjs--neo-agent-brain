@@ -12,7 +12,7 @@ import {
     MANAGED_WORKSPACE_MCP_SERVER_DESCRIPTORS as MCP_SERVER_DESCRIPTORS,
     createManagedAgentWorkspacePlan
 } from './managedAgentWorkspacePlan.mjs';
-import {OPENCODE_SEAT_SERVERS, generateOpenCodeSeatConfig} from './generateOpenCodeSeatConfig.mjs';
+import {OPENCODE_SEAT_SERVERS, WAKE_ENVELOPE_PLANT_FILE_NAME, generateOpenCodeSeatConfig} from './generateOpenCodeSeatConfig.mjs';
 
 export {createManagedAgentWorkspacePlan} from './managedAgentWorkspacePlan.mjs';
 
@@ -928,6 +928,12 @@ async function prepareOpenCodeArtifacts({targetRepoRoot, instanceHome, agentosRu
             nodeBinary  : plan[0].command,
             seatHome    : instanceHome,
             wakeHookPath: path.join(instanceHome, 'write-wake-envelope.mjs'),
+            // The seat's OWN OpenCode plugins dir, resolved here rather than inside the boot hook:
+            // `deriveHarnessLaunchSpec` points `XDG_CONFIG_HOME` at this same `instanceHome`, so the plant
+            // lands where that seat's first OpenCode process looks for it — before the hook ever runs.
+            // The hook runs after the server is listening, so a plant IT installed could only be loaded by
+            // a later process, and `hookEnv` does not carry `XDG_CONFIG_HOME` at all.
+            wakePlantPath: path.join(instanceHome, 'opencode', 'plugins', WAKE_ENVELOPE_PLANT_FILE_NAME),
             servers
         },
         {files}       = generateOpenCodeSeatConfig({...options, remoteServers}),
@@ -940,7 +946,13 @@ async function prepareOpenCodeArtifacts({targetRepoRoot, instanceHome, agentosRu
             ownedLabel     : 'mcp."neo-mjs-*",instructions',
             transport      : {adapter: 'opencode', containerName: 'mcp'}
         },
-        {match: /write-wake-envelope\.mjs$/, ownedProjection: wholeFileOwnedProjection,     ownedLabel: 'generated wake-envelope boot hook'}
+        {match: /write-wake-envelope\.mjs$/, ownedProjection: wholeFileOwnedProjection,     ownedLabel: 'generated wake-envelope boot hook'},
+        // Its own row, so a plant update reports divergence on the PLANT. While the plant's bytes lived
+        // inside the hook, every plant edit instead surfaced as a divergence on each seat's boot hook —
+        // the right posture pointed at the wrong artifact, which is what made an ordinary plant bump look
+        // like workspace corruption. Freshness is therefore the existing whole-file posture, unchanged:
+        // create absent, converge owned, refuse drift loudly, never clobber a hand edit.
+        {match: /opencode\/plugins\/neo-wake-envelope\.mjs$/, ownedProjection: wholeFileOwnedProjection, ownedLabel: 'generated wake-envelope plant'}
     ]});
 }
 

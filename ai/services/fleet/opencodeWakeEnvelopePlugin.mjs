@@ -9,8 +9,9 @@
  * dir keeps the plant out of the tracked tree.
  *
  * What it does: on every operator-seat `session.created` event, atomically writes the seat's
- * wake envelope to `$XDG_DATA_HOME/opencode/wake-envelope.json` (fallback
- * `~/.local/share/opencode/wake-envelope.json`), mode 0600. A desktop restart with a
+ * wake envelope to `$XDG_DATA_HOME/opencode/wake-envelope.json`, mode 0600. `XDG_DATA_HOME` is
+ * REQUIRED — an unset value refuses rather than falling back to `~/.local/share`, which is the
+ * shared slot every seat on the machine would write. A desktop restart with a
  * RESTORED session never fires `session.created`, so the first qualifying `session.updated`
  * of a restored top-level session re-binds the envelope through the same write+probe
  * discipline (the restore gap this writer exists to close; identity always comes from an
@@ -51,9 +52,12 @@
  * - The embedded server's address comes from the plugin input's authoritative `serverUrl`
  *   (when present); the `lsof`-on-own-pid scan is only a fallback — with multiple listeners
  *   on the process, the first `lsof` row is not guaranteed to be the API server.
- * - The envelope root honors `XDG_DATA_HOME`, so per-seat XDG isolation (Fleet launch
- *   specs) keeps each seat's envelope on its own path instead of collapsing onto the
- *   shared default.
+ * - The envelope root REQUIRES `XDG_DATA_HOME` and has no `~/.local/share` fallback, so per-seat XDG
+ *   isolation (Fleet launch specs) keeps each seat's envelope on its own path. The fallback was removed
+ *   deliberately: it resolved to the one path that is NOT per-seat, and one process can instantiate this
+ *   plant for several project directories at once, so the fallback made the route fail by collision
+ *   rather than by absence — the last writer won and nothing recorded which. An unset variable now throws
+ *   at load, which is loud, immediate, and leaves the prior envelope untouched.
  * - Writes are same-directory atomic (tmp file + rename). The credential-bearing tmp is
  *   created with mode 0600 and explicitly tightened before rename; a final `chmod 0600`
  *   also repairs a pre-existing permissive destination. The rename closes torn reads.
@@ -81,10 +85,20 @@ export const NeoWakeEnvelope = async (ctx) => {
     const { project, client, $, directory } = ctx;
 
     const fs   = await import('node:fs/promises');
-    const os   = await import('node:os');
     const path = await import('node:path');
 
-    const dataRoot     = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
+    // `XDG_DATA_HOME` is REQUIRED, with no shared-home fallback. A fallback resolves the envelope to
+    // the operator's own `~/.local/share`, and that path is exactly the shared slot: one process can
+    // instantiate this plant for several project directories, all writing the same file, so a silent
+    // fallback does not degrade the route — it makes two seats fight over one envelope, with the last
+    // writer winning and nothing recording which. Refusing leaves the previous envelope in place and
+    // says why, which is recoverable; fabricating a shared-path envelope is not.
+    const dataRoot = process.env.XDG_DATA_HOME;
+
+    if (!dataRoot) {
+        throw new Error('XDG_DATA_HOME is not set — the wake-envelope plant refuses to publish, because the fallback path (~/.local/share) is shared across every seat and project directory on this machine. Launch the seat through its Fleet launch spec, which sets XDG_DATA_HOME to the instance home.')
+    }
+
     const envelopePath = path.join(dataRoot, 'opencode', 'wake-envelope.json');
 
     const log = async (level, message) => {
