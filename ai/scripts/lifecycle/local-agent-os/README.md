@@ -527,7 +527,11 @@ carries the role, the deployment mode, or the lane closure, so the supervised
 path and the portable one cannot drift apart.
 
 Both agents run on the `PATH` their template declares, and `assert_daemon_path`
-fails the install when a command either one runs is missing from it. The host
+fails the install when a command either one runs is missing from it. Each list
+copies its daemon's bare-name invocations (the wake receiver's, `hostEdge.mjs`'s),
+so a commit adding one adds it to the list. `tmux` is on neither: the tmux
+adapter is optional, and a host that selects it must have `tmux` on the declared
+`PATH` itself. The host
 edge takes its environment from the plist, the `hostEdgeProfile.mjs` posture and
 an optional `.env` in `AGENTOS_RUNTIME_ROOT` (dotenv's working-directory
 default). It carries no `DOTENV_CONFIG_PATH` and no seat identity: a machine

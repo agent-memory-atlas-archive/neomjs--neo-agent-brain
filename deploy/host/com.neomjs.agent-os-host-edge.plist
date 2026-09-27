@@ -36,8 +36,8 @@
     <dict>
         <!-- Declared, never the installing shell's PATH, which names a seat and session.
              The host edge runs ps, lsof, osascript, git, gh and node by bare name (the
-             runbook asserts each), tmux only for the tmux adapter; lms and antigravity
-             resolve without PATH. -->
+             runbook asserts each); lms and antigravity resolve without PATH. The optional
+             tmux adapter also needs tmux here, which the runbook does not assert. -->
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <!-- The one posture coordinate a supervisor legitimately supplies: this
