@@ -1324,12 +1324,31 @@ function normalizeDockerTime(value) {
  * them. The `docker` CLI accepts RFC3339 and converts; the daemon does not — it answers an RFC3339
  * bound with `strconv.ParseInt … invalid syntax` (Docker 29, API 1.53), which is how the death
  * channel and the incarnation-bounded log slice failed on every cycle before this spelling.
+ *
+ * The fraction travels VERBATIM: Docker's inspect stamps carry nanoseconds, `Date.parse` keeps
+ * milliseconds, and a conversion through it sends ONE value for two bounds inside the same
+ * millisecond — a wire interval that disagrees with the receipt. A `Date.parse`-able bound in
+ * another spelling (no zone) never comes from Docker and falls back to `Date.parse`.
  * @param {String} stamp A bound {@link normalizeDockerTime} already validated.
- * @returns {String} e.g. `'1786219200.9'`
+ * @returns {String} e.g. `'1737035722.165243637'`
  */
 function toDockerQueryTime(stamp) {
-    return String(Date.parse(stamp) / 1000)
+    const match = RFC3339_BOUND_RE.exec(stamp);
+
+    if (!match) return String(Date.parse(stamp) / 1000);
+
+    const [, whole, fraction, zone] = match,
+          seconds                   = Math.floor(Date.parse(`${whole}${zone}`) / 1000);
+
+    return fraction ? `${seconds}.${fraction}` : String(seconds)
 }
+
+/**
+ * @summary An RFC3339 bound split into its whole-second instant, its fraction (up to the nine
+ * digits Docker emits) and its zone, so the fraction can travel untouched.
+ * @type {RegExp}
+ */
+const RFC3339_BOUND_RE = /^(.+T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/;
 
 /**
  * @summary Parses Docker's newline-delimited event response into bounded death candidates.

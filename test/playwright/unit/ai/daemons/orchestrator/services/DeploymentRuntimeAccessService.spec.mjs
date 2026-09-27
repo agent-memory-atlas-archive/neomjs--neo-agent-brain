@@ -231,7 +231,7 @@ test.describe('Neo.ai.daemons.services.DeploymentRuntimeAccessService', () => {
         expect(eventPath).toContain('com.docker.compose.project=neo');
         // The window travels as Unix seconds — the daemon refuses the RFC3339 form with
         // `strconv.ParseInt … invalid syntax`, which is how the death channel failed every cycle.
-        expect(eventPath).toContain('since=1710000000&until=1710000002&');
+        expect(eventPath).toContain('since=1710000000.000&until=1710000002.000&');
         expect(eventPath).not.toContain('2024-03-09T');
     });
 
@@ -284,12 +284,35 @@ test.describe('Neo.ai.daemons.services.DeploymentRuntimeAccessService', () => {
 
         const path = decodeURIComponent(calls.find(call => call.path.includes('until='))?.path ?? '');
 
-        expect(path, 'the endpoints reach Docker unrounded, as Unix seconds').toContain('until=1786219500.9');
-        expect(path).toContain('since=1786219200.9');
+        expect(path, 'the endpoints reach Docker unrounded, as Unix seconds with the receipt\'s own digits').toContain('until=1786219500.900');
+        expect(path).toContain('since=1786219200.900');
         expect(path, 'the RFC3339 spelling never reaches the daemon').not.toContain('2026-08-08T');
 
         expect(logs.data.appliedUntil, 'the receipt echoes the precision it actually sent')
             .toBe('2026-08-08T20:05:00.900Z');
+    });
+
+    test('every fractional digit Docker reports survives — two bounds inside one millisecond stay distinct on the wire and equal to their receipt', async () => {
+        const {service, calls} = createService({logText: 'FATAL ERROR'});
+
+        // Docker's inspect stamps carry nanoseconds. `Date.parse` keeps milliseconds, so a conversion
+        // through it emits ONE value for two distinct bounds — an interval on the wire that disagrees
+        // with the receipt claiming it was applied.
+        const
+            since = '2025-01-16T13:55:22.165243637Z',
+            until = '2025-01-16T13:55:22.165987654Z',
+            logs  = await service.readObserve({serviceKey: 'mc-server', operation: 'logs', since, until}),
+            path  = decodeURIComponent(calls.find(call => call.path.includes('/logs?') && call.path.includes('until='))?.path ?? '');
+
+        expect(path).toContain('since=1737035722.165243637&until=1737035722.165987654');
+        expect(logs.data).toMatchObject({appliedSince: since, appliedUntil: until, bounded: true});
+
+        const
+            events    = await service.readObserve({serviceKey: 'mc-server', operation: 'events', since, until}),
+            eventPath = decodeURIComponent(calls.find(call => call.path.startsWith('/events?'))?.path ?? '');
+
+        expect(eventPath).toContain('since=1737035722.165243637&until=1737035722.165987654&');
+        expect(events.data).toMatchObject({appliedSince: since, appliedUntil: until, bounded: true});
     });
 
     test('an unusable bound stays unbounded rather than half-applied', async () => {
