@@ -898,7 +898,7 @@ test.describe('Neo.ai.services.fleet.FleetLifecycleService — curated launch + 
 
         const {args, opts} = spawn.calls[0];
         expect(args).toEqual([
-            '--mcp-config', path.join(FleetLifecycleService.instanceRoot, 'c2-9c0abe51c6e6', 'claude-code-28e174396028', 'mcp-config.json'),
+            '--mcp-config', path.join(FleetLifecycleService.instanceRoot, 'c2', 'harness', 'claude-code', 'mcp-config.json'),
             '--strict-mcp-config',
             '--input-format', 'stream-json',
             '--output-format', 'stream-json',

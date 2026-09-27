@@ -93,8 +93,8 @@ async function boot() {
           bearerToken = resolveFleetBearer({suppliedToken: AiConfig.fleet.bearer}),
           origins     = AiConfig.fleet.cockpitOrigins;
 
-    // This entrypoint owns config resolution; FleetManager only consumes the resolved member.
-    FleetManager.managedRoot = path.join(AiConfig.fleet.dataDir, 'repos');
+    // This entrypoint owns config resolution; FleetManager only consumes the resolved root.
+    FleetManager.managedRoot = AiConfig.fleet.agentsRoot;
 
     // The mailbox-seam plane decision: resolved ONCE at boot, BEFORE viewer binding, all-or-nothing,
     // logged. The leaves resolve here at the use site (the AiConfig SSOT contract); the client itself

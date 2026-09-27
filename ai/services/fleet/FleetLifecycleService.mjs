@@ -255,9 +255,9 @@ class FleetLifecycleService extends Base {
     toolProjectionMode = 'harness-embedded'
 
     /**
-     * The absolute per-agent harness instance-home root — where the isolated harness config/state
-     * homes (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`) of template-launched agents are derived. `null` ⇒
-     * the AiConfig `fleet.instanceRoot` leaf (the config SSOT owning default + env binding).
+     * The absolute root the isolated harness config/state homes (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`)
+     * of template-launched agents are derived under, at `<id>/harness/<type>`. `null` ⇒ the AiConfig
+     * `fleet.agentsRoot` leaf (the config SSOT owning default + env binding).
      * The field is the explicit test / per-tenant override seam, never a default shadow.
      * @member {String|null} instanceRoot=null
      */
@@ -1270,15 +1270,15 @@ class FleetLifecycleService extends Base {
     }
 
     /**
-     * @summary Resolve the absolute per-agent harness instance-home root: the `instanceRoot` field
-     * when explicitly injected (the test/tenant override seam), else the AiConfig
-     * `fleet.instanceRoot` leaf — the SSOT that owns the default AND its env binding
-     * (`NEO_FLEET_INSTANCE_ROOT`), per the config-is-SSOT contract: this service never re-derives from `process.env`
-     * and holds no hidden default.
+     * @summary Resolve the root the harness homes are derived under: the `instanceRoot` field when
+     * explicitly injected (the test/tenant override seam), else the AiConfig `fleet.agentsRoot`
+     * leaf — the SSOT that owns the default AND its env binding (`NEO_FLEET_AGENTS_ROOT`), per the
+     * config-is-SSOT contract: this service never re-derives from `process.env` and holds no hidden
+     * default.
      * @returns {String}
      */
     getInstanceRoot() {
-        return this.instanceRoot || AiConfig.fleet.instanceRoot;
+        return this.instanceRoot || AiConfig.fleet.agentsRoot;
     }
 
     /**

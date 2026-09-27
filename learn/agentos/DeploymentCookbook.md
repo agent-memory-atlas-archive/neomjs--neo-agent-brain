@@ -298,6 +298,7 @@ Supply these values per service/profile as needed:
 | `NEO_MCP_HEALTHCHECK_IDENTITY` | Healthcheck CLI | Trusted proxy identity value used by the MCP healthcheck probe when proxy-header auth is enabled. |
 | `NEO_MCP_HEALTHCHECK_TOKEN_ENV` / `NEO_MCP_HEALTHCHECK_TOKEN` | Healthcheck CLI | Optional bearer-token slot for direct OIDC/OAuth protected MCP healthchecks. |
 | `NEO_FLEET_DATA_DIR` | Fleet | Fleet-owned durable root. The reference service fixes it to `/app/.neo-ai-data/fleet` on one named volume. |
+| `NEO_FLEET_AGENTS_ROOT` | Fleet | Host root of every agent's folder: clones at `<id>/<owner>/<repo>`, harness homes at `<id>/harness/<type>`. Not a plane member; the default `~/.neo-ai/agents` stays outside the plane and any checkout. A machine running its team from one shared folder sets it there. |
 | `NEO_FLEET_HEALTHCHECK_URL` | Fleet healthcheck CLI | Optional override for the exact authenticated `/fleet/probe` URL. |
 | `NEO_MCP_HEALTHCHECK_TOKEN` | Generic Fleet Compose secret source | Provider bearer supplied to Docker Compose; only the secret carrier name appears in rendered configuration. |
 | `NEO_MCP_HEALTHCHECK_TOKEN_FILE` | Fleet container + healthcheck CLI | Required in-container secret-file bearer carrier; the Fleet probe never accepts the credential on argv. |

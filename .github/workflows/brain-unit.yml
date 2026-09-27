@@ -143,6 +143,9 @@ jobs:
                   test/playwright/unit/ai/daemons/wake/opencodeSeatEnvelopeParity.spec.mjs
                   test/playwright/unit/ai/services/memory-core/helpers/computedRouteStore.spec.mjs
                   test/playwright/unit/ai/FleetLifecycleService.spec.mjs
+                  test/playwright/unit/ai/deriveAgentRepoPath.spec.mjs
+                  test/playwright/unit/ai/services/fleet/deriveAgentInstanceHome.spec.mjs
+                  test/playwright/unit/ai/planeConfig.spec.mjs
 
             - name: Verify community host authority boundary
               run: >-

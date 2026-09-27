@@ -290,12 +290,21 @@ class ConfigBase extends ConfigProvider {
              */
             heartbeatConcurrencyLockPath: leaf(path.resolve(planeDataRootDefault, 'heartbeat-concurrency.lock'), 'NEO_HEARTBEAT_LOCK_PATH', 'string', {planeMember: true}),
             /**
-             * Fleet Manager supervision leaves: where per-agent harness instance homes live and
-             * which binary each harness family launches. The lifecycle service reads these at the
-             * use site (`FleetLifecycleService.getInstanceRoot` / `getHarnessBinaryPath`) — the
-             * SSOT owning default + env binding; the service holds no default shadow.
+             * Fleet Manager supervision leaves: where each agent's folder lives and which binary
+             * each harness family launches. The lifecycle service reads these at the use site
+             * (`FleetLifecycleService.getInstanceRoot` / `getHarnessBinaryPath`) — the SSOT owning
+             * default + env binding; the service holds no default shadow.
              */
             fleet: {
+                /**
+                 * @summary The root of every agent's folder: its clones at `<id>/<owner>/<repo>` and
+                 * its harness homes at `<id>/harness/<type>` (`deriveAgentRepoPath`,
+                 * `deriveAgentInstanceHome`). A host path outside the plane, because a seat's working
+                 * trees and path-keyed memory must outlive any plane; a machine sets its own
+                 * (`/Users/Shared/agents` on the maintainers' host).
+                 * @type {string}
+                 */
+                agentsRoot     : leaf(path.resolve(os.homedir(), '.neo-ai', 'agents'), 'NEO_FLEET_AGENTS_ROOT', 'string', {planeMember: false, planeMemberReason: 'a seat, not plane data — its working trees and path-keyed memory must outlive any plane, so every machine places it explicitly'}),
                 /**
                  * @summary Fleet-owned durable root for registry, tenant, encryption-key, and
                  * signing-key material. The root is one plane member so every storage owner reads
@@ -303,13 +312,6 @@ class ConfigBase extends ConfigProvider {
                  * @type {string}
                  */
                 dataDir        : leaf(path.resolve(planeDataRootDefault, 'fleet'), 'NEO_FLEET_DATA_DIR', 'string', {planeMember: true}),
-                /**
-                 * Absolute root under which per-agent isolated harness config/state homes
-                 * (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`) are derived — the sibling of the managed
-                 * checkouts root.
-                 * @type {string}
-                 */
-                instanceRoot   : leaf(path.resolve(planeDataRootDefault, 'fleet/instances'), 'NEO_FLEET_INSTANCE_ROOT', 'string', {planeMember: true}),
                 /**
                  * Root of the synced GitHub conversation tree the cockpit's activity feed reads:
                  * `<root>/issues` + `<root>/pulls`, the single-origin layout `neomjs/github-content-sync`
@@ -1633,7 +1635,7 @@ class ConfigBase extends ConfigProvider {
                     // recent-event list) so a negative value can never expand the snapshot to every retained event.
                     selfHealRecentEventLimit    : leaf(10, 'NEO_DEPLOYMENT_STATE_BRIDGE_SELF_HEAL_RECENT_EVENT_LIMIT', 'number'),
                     /**
-                     * Direct service probes — the SECOND evidence channel ADR-0025 §2.4 requires before a // ticket-ref-ok: the ADR clause is what this leaf exists to satisfy
+                     * Direct service probes — the SECOND, independent evidence channel required before a
                      * container-unhealthy state may license a restart. The orchestrator asks the service
                      * itself whether it is serving, instead of trusting the runtime's canary.
                      *
@@ -2142,7 +2144,7 @@ class ConfigBase extends ConfigProvider {
                     // sibling); local profile defaults disabled (the operator IS present + autonomously
                     // recycling a dev container is disruptive). B0 in-process recycle + data-integrity
                     // re-embed + the read-only deployment-state bridge stay active locally regardless.
-                    // ORTHOGONAL to `recoveryActuator.blockedComposeServices` (ADR-26): this mode-gate is
+                    // ORTHOGONAL to `recoveryActuator.blockedComposeServices`: this mode-gate is
                     // "is B1 active in this deployment at all"; the blocklist is the per-service opt-out
                     // WITHIN an active mode. They compose; do not overload the blocklist to express the mode gate.
                     composeServiceRecoveryEnabled: leaf(null, 'NEO_ORCHESTRATOR_COMPOSE_SERVICE_RECOVERY_ENABLED', 'boolean'),
@@ -2728,7 +2730,6 @@ export const PLANE_MEMBER_PATHS = Object.freeze([
     'remRunStateDir',
     'heartbeatConcurrencyLockPath',
     'fleet.dataDir',
-    'fleet.instanceRoot',
     'engines.chroma.dataDirProd',
     'heapObservation.dir',
     'orchestrator.dataDir',
