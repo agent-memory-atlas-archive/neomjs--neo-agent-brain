@@ -1,24 +1,36 @@
 import {execFile}  from 'child_process';
+import os          from 'os';
 import path        from 'path';
 import {promisify} from 'util';
 
 const execFileAsync = promisify(execFile);
 
 /**
+ * Environment variables through which a host's Git setup reaches a child `git`: askpass programs and config
+ * injected without a file. A seat's clone drops them.
+ * @type {RegExp}
+ * @private
+ */
+const HOST_GIT_ENV = /^(GIT_ASKPASS|SSH_ASKPASS|GIT_CONFIG|GIT_CONFIG_(GLOBAL|SYSTEM|NOSYSTEM|PARAMETERS|COUNT|KEY_\d+|VALUE_\d+))$/;
+
+/**
  * @summary The `git` invocation of a clone: its argv and the child's environment.
  *
  * A seat's credential is presented only to `https://github.com`, the host a GitHub PAT belongs to. It goes
  * through a helper scoped to that host that reads the token from the child's environment, so the token never
- * appears in argv, where every process on the machine can read it. The inherited helpers are reset first, so
- * the host's own credentials are not tried before the seat's, and git never prompts. Any other remote, or no
- * credential, is a plain clone in the process's own environment. The `--` ends git's option parsing, so a
- * hostile URL or path cannot smuggle a flag.
+ * appears in argv, where every process on the machine can read it. That clone runs outside the host's Git
+ * setup: no system or global config file, no config or askpass handed down through the environment, and git
+ * never prompts. So an ambient URL rewrite, header, credential helper or askpass can neither redirect nor
+ * authenticate it. Proxy and CA settings reach it only through the environment (`HTTPS_PROXY`,
+ * `GIT_SSL_CAINFO`), never through a config file. Any other remote, or no credential, is a plain clone in the
+ * process's own environment. The `--` ends git's option parsing, so a hostile URL or path cannot smuggle a flag.
  * @param {String} cloneUrl
  * @param {String} repoPath
  * @param {String} [credential] The seat's GitHub PAT
+ * @param {Object} [env=process.env] The environment the clone would inherit
  * @returns {{args: String[], env: Object|undefined}}
  */
-export function gitCloneCommand(cloneUrl, repoPath, credential) {
+export function gitCloneCommand(cloneUrl, repoPath, credential, env = process.env) {
     if (!credential || !/^https:\/\/github\.com\//i.test(cloneUrl)) {
         return {args: ['clone', '--', cloneUrl, repoPath], env: undefined}
     }
@@ -29,7 +41,13 @@ export function gitCloneCommand(cloneUrl, repoPath, credential) {
             '-c', 'credential.https://github.com.helper=!f() { echo username=x-access-token; echo "password=$NEO_SEAT_GITHUB_TOKEN"; }; f',
             'clone', '--', cloneUrl, repoPath
         ],
-        env : {...process.env, GIT_TERMINAL_PROMPT: '0', NEO_SEAT_GITHUB_TOKEN: credential}
+        env : {
+            ...Object.fromEntries(Object.entries(env).filter(([name]) => !HOST_GIT_ENV.test(name))),
+            GIT_CONFIG_GLOBAL    : os.devNull,
+            GIT_CONFIG_NOSYSTEM  : '1',
+            GIT_TERMINAL_PROMPT  : '0',
+            NEO_SEAT_GITHUB_TOKEN: credential
+        }
     }
 }
 

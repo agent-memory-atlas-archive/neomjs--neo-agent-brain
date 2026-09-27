@@ -158,6 +158,7 @@ jobs:
                   test/playwright/unit/ai/FleetRegistryService.spec.mjs
                   test/playwright/unit/ai/startAgentProvisioned.spec.mjs
                   test/playwright/unit/ai/provisionAgentRepo.spec.mjs
+                  test/playwright/unit/ai/provisionAgentRepoGit.spec.mjs
                   test/playwright/unit/ai/ensureAgentRepo.spec.mjs
 
             - name: Verify community host authority boundary

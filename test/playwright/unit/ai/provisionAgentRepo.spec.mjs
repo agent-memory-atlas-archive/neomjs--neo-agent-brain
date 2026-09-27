@@ -1,4 +1,5 @@
 import {test, expect}                        from '@playwright/test';
+import os                                    from 'os';
 import {gitCloneCommand, provisionAgentRepo} from '../../../../ai/services/fleet/provisionAgentRepo.mjs';
 
 // A recording clone stub — the injectable side-effect seam, mirroring FleetLifecycleService.spec's
@@ -112,6 +113,29 @@ test.describe('gitCloneCommand — who a clone authenticates as', () => {
         expect(args.join(' '), 'the token is not in argv, where any process can read it').not.toContain('ghp_seat');
         expect(env.NEO_SEAT_GITHUB_TOKEN).toBe('ghp_seat');
         expect(env.GIT_TERMINAL_PROMPT).toBe('0')
+    });
+
+    test("the seat's clone runs outside the host's Git setup: no config file, no config or askpass from the environment", () => {
+        const {env} = gitCloneCommand(GITHUB, REPO, 'ghp_seat', {
+            PATH                 : '/usr/bin',
+            HTTPS_PROXY          : 'http://proxy.example:3128',
+            GIT_ASKPASS          : '/usr/local/bin/ask',
+            SSH_ASKPASS          : '/usr/local/bin/ask',
+            GIT_CONFIG_PARAMETERS: "'url.http://evil/.insteadof'='https://github.com/'",
+            GIT_CONFIG_COUNT     : '1',
+            GIT_CONFIG_KEY_0     : 'http.extraHeader',
+            GIT_CONFIG_VALUE_0   : 'Authorization: Basic AMBIENT',
+            GIT_CONFIG_GLOBAL    : '/home/host/.gitconfig'
+        });
+
+        expect(env).toEqual({
+            PATH                 : '/usr/bin',
+            HTTPS_PROXY          : 'http://proxy.example:3128', // a proxy stays an environment setting
+            GIT_CONFIG_GLOBAL    : os.devNull,
+            GIT_CONFIG_NOSYSTEM  : '1',
+            GIT_TERMINAL_PROMPT  : '0',
+            NEO_SEAT_GITHUB_TOKEN: 'ghp_seat'
+        })
     });
 
     test('any other remote, or no credential, is a plain clone in the process environment', () => {
