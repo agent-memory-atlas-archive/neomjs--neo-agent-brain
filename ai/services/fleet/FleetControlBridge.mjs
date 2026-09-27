@@ -154,9 +154,9 @@ class FleetControlBridge extends Base {
     goldenPathSource = null
 
     /**
-     * @summary The bounded graph-neighbourhood source around the viewer's Golden Path route, wired
-     * like `goldenPathSource` (no static default — the orchestrator wires the live source); unwired,
-     * `fleetGraphScene` answers `unavailable` rather than an empty graph.
+     * @summary The graph-scene source: the whole graph the viewer may see, with the Golden Path route
+     * as its overlay, wired like `goldenPathSource` (no static default — the orchestrator wires the live
+     * source); unwired, `fleetGraphScene` answers `unavailable` rather than an empty graph.
      * @member {Object|null} graphSceneSource=null
      */
     graphSceneSource = null
@@ -677,13 +677,13 @@ class FleetControlBridge extends Base {
     }
 
     /**
-     * @summary READ-OBSERVE: read a bounded, origin-qualified graph neighbourhood around the
-     * authenticated viewer's Golden Path route — the substrate the cockpit's 3D graph renders. The
+     * @summary READ-OBSERVE: read the origin-qualified graph the authenticated viewer may see, whole,
+     * with the Golden Path route as its overlay — the scene the cockpit's Observatory draws. The
      * scene always reports the budget it was read under and whether it is whole, because a viewer
-     * that cannot tell a capped neighbourhood from a complete one renders a slice as though it were
-     * the graph; a neighbour the viewer may not see leaves with its edges and is NOT reported as
-     * truncation, because a permission is not a budget. The source envelope passes through
-     * untouched; an unwired source is named as unavailable, never as an empty graph.
+     * that cannot tell a capped graph from a complete one renders a slice as though it were the
+     * graph; a node the viewer may not see leaves with its edges and is NOT reported as truncation,
+     * because a permission is not a budget. The source envelope passes through untouched; an
+     * unwired source is named as unavailable, never as an empty graph.
      * @param {Object} [params]
      * @returns {Promise<Object>|Object}
      */

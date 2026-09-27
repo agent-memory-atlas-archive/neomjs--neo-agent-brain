@@ -1327,6 +1327,135 @@ class GraphService extends Base {
     }
 
     /**
+     * @summary The whole graph one viewer may see, in display fields only: the bulk read behind the
+     * Fleet cockpit's Observatory.
+     *
+     * One pass per table under the SQL RLS clause of {@link GraphService#listNodeRecordsByType}, with the
+     * `isRlsVisible` recheck at the return boundary. A node carries its id, kind and label, never its
+     * property bag. An edge counts only when both endpoints are visible, and parallel edges of one type
+     * collapse to one. `counts.unlinked` names the answered nodes without such an edge, which a view drawn
+     * by relations may want to place apart.
+     *
+     * A budget keeps the best-connected nodes (degree, then id), so the unlinked go first, and the edges
+     * among them. `truncated` names a budget cut only: a row the viewer may not see is absent, not cut.
+     *
+     * The answer is columnar, because a tool result crosses the plane twice over (text and structured
+     * content): `kinds` and `types` are dictionaries, `nodes` holds parallel `ids` / `kinds` / `labels`
+     * lists, and `edges` is a flat `[source, target, type, …]` list of indices into them.
+     *
+     * The tables are read in keyset pages, yielding between pages: a whole-graph read takes seconds, and the
+     * plane's other requests share this thread. So the read is not one atomic snapshot: a row written while
+     * it runs may or may not be in the scene.
+     *
+     * Only the durable store enumerates the whole graph, so without it the read throws rather than
+     * answer the process cache as the graph.
+     * @param {Object} [data]
+     * @param {Number} [data.maxNodes=250000]
+     * @param {Number} [data.maxEdges=500000]
+     * @returns {Promise<Object>} `{kinds, types, nodes: {ids, kinds, labels}, edges, counts, budget, truncated}`
+     */
+    async readSceneGraph({maxNodes = 250000, maxEdges = 500000} = {}) {
+        const sqlite = this.db?.storage?.db;
+
+        if (!sqlite) {
+            throw new Error('GraphService.readSceneGraph needs the SQLite store: the node cache is not a complete enumeration');
+        }
+
+        const
+            budget    = {
+                maxNodes: Number.isFinite(maxNodes) && maxNodes > 0 ? Math.floor(maxNodes) : 250000,
+                maxEdges: Number.isFinite(maxEdges) && maxEdges > 0 ? Math.floor(maxEdges) : 500000
+            },
+            rlsUserId = resolveRlsUserId(this.db.storage.RequestContextService),
+            rlsArgs   = [rlsUserId, rlsUserId == null ? null : `@${rlsUserId}`],
+            rlsClause = `(user_id = ? OR user_id = ? OR user_id IS NULL
+                          OR json_extract(data, '$.properties.sharedEntity') = 1
+                          OR json_extract(data, '$.properties.visibility') = 'team')`,
+            visible   = new Map(),
+            links     = new Map(),
+            degree    = new Map(),
+            text      = value => typeof value === 'string' ? value : null,
+            // every page is a whole statement: an iterator held open across a yield would leave this shared
+            // connection busy for every request that runs in between
+            pages     = async (table, visit) => {
+                const statement = sqlite.prepare(`SELECT id, data FROM ${table} WHERE ${rlsClause} AND id > ? ORDER BY id LIMIT 5000`);
+
+                for (let after = '', rows; (rows = statement.all(...rlsArgs, after)).length;) {
+                    rows.forEach(row => visit(JSON.parse(row.data)));
+                    after = rows[rows.length - 1].id;
+                    await new Promise(resolve => setImmediate(resolve))
+                }
+            };
+
+        await pages('Nodes', node => {
+            if (isRlsVisible(node, rlsUserId)) {
+                visible.set(node.id, {id: node.id, kind: text(node.label), label: text(node.properties?.name) ?? text(node.properties?.title)})
+            }
+        });
+
+        await pages('Edges', edge => {
+            const
+                {source, target, type = null} = edge,
+                key                           = `${source}\u0000${target}\u0000${type ?? ''}`;
+
+            if (!links.has(key) && visible.has(source) && visible.has(target) && isRlsVisible(edge, rlsUserId)) {
+                links.set(key, {source, target, type});
+                degree.set(source, (degree.get(source) ?? 0) + 1);
+                degree.set(target, (degree.get(target) ?? 0) + 1)
+            }
+        });
+
+        let nodes = [...visible.values()],
+            edges = [...links.keys()].sort().map(key => links.get(key));
+
+        if (nodes.length > budget.maxNodes) {
+            const byId = (a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+
+            nodes = nodes
+                .sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0) || byId(a, b))
+                .slice(0, budget.maxNodes)
+                .sort(byId);
+
+            const kept = new Set(nodes.map(node => node.id));
+
+            edges = edges.filter(edge => kept.has(edge.source) && kept.has(edge.target))
+        }
+
+        edges = edges.slice(0, budget.maxEdges);
+
+        const
+            dictionary = () => {
+                const list = [], index = new Map();
+
+                return {list, code: value => index.get(value) ?? (index.set(value, list.length), list.push(value) - 1)}
+            },
+            kinds      = dictionary(),
+            types      = dictionary(),
+            position   = new Map(nodes.map((node, index) => [node.id, index])),
+            flat       = new Array(edges.length * 3);
+
+        edges.forEach(({source, target, type}, index) => {
+            flat[index * 3]     = position.get(source);
+            flat[index * 3 + 1] = position.get(target);
+            flat[index * 3 + 2] = types.code(type)
+        });
+
+        return {
+            kinds    : kinds.list,
+            types    : types.list,
+            nodes    : {
+                ids   : nodes.map(node => node.id),
+                kinds : nodes.map(node => kinds.code(node.kind)),
+                labels: nodes.map(node => node.label)
+            },
+            edges    : flat,
+            counts   : {nodes: nodes.length, edges: edges.length, unlinked: nodes.filter(node => !degree.has(node.id)).length},
+            budget,
+            truncated: {nodes: nodes.length < visible.size, edges: edges.length < links.size}
+        };
+    }
+
+    /**
      * @summary Per-node RLS visibility for the acting request — the GraphService-owned seam the
      * concept-walk's `rlsPredicate` consumes so a private / other-tenant intermediate is never traversed
      * THROUGH (path-level Depth-Floor; terminal-candidate authorization does NOT authorize the crossed
