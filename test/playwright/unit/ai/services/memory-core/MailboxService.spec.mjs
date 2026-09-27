@@ -2877,7 +2877,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
     };
 
     test('#17486 a vanished NODE row yields an honest failure receipt, not a false read', async () => {
-        // RA-2's node control. Before the outcome split, a narrow UPDATE that matched no row was
+        // The node control. Before the outcome split, a narrow UPDATE that matched no row was
         // indistinguishable from a durable one at the boolean, so this returned status:'read' with
         // the no-storage warning — telling an operator their receipt lives in memory when the
         // helper had deliberately not touched cache and the value existed nowhere at all.
@@ -2906,7 +2906,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
     });
 
     test('#17486 a vanished EDGE row fails the same way — one mechanism, both carriers', async () => {
-        // RA-2's edge control. The node arm alone would leave "both carriers share one writer" as a
+        // The edge control. The node arm alone would leave "both carriers share one writer" as a
         // claim about the source; a broadcast receipt travels the DELIVERED_TO edge, and a fix that
         // only reached the node path would keep lying here.
         const {messageId} = await RequestContextService.run({agentIdentityNodeId: '@alice'}, () =>
@@ -3285,7 +3285,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
 
         expect(edgeReadAt().readAt).toBeTruthy();
 
-        // Full replay #1: per-recipient read-state lives on the DELIVERED_TO edge, not the node —
+        // The first full replay: per-recipient read-state lives on the DELIVERED_TO edge, not the node —
         // the reviewer falsifier: pre-fix, this re-link stamped the WAL's readAt: null over it.
         await MailboxService._projectMessageWalRecord(record, {pumpWake: false});
         expect(edgeReadAt().readAt).toBeTruthy();
@@ -3296,7 +3296,7 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
             await MailboxService.deleteMessage({ messageId: msgId });
         });
 
-        // Full replay #2 over the tombstone + the read edge together.
+        // The second full replay, over the tombstone + the read edge together.
         await MailboxService._projectMessageWalRecord(record, {pumpWake: false});
 
         const node = GraphService.db.storage.db
