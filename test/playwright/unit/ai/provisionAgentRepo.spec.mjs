@@ -118,6 +118,7 @@ test.describe('gitCloneCommand — who a clone authenticates as', () => {
     test("the seat's clone runs outside the host's Git setup: no config file, no config or askpass from the environment", () => {
         const {env} = gitCloneCommand(GITHUB, REPO, 'ghp_seat', {
             PATH                 : '/usr/bin',
+            HOME                 : '/Users/host',           // where a ~/.netrc entry would authenticate the clone
             HTTPS_PROXY          : 'http://proxy.example:3128',
             GIT_ASKPASS          : '/usr/local/bin/ask',
             SSH_ASKPASS          : '/usr/local/bin/ask',
@@ -131,6 +132,7 @@ test.describe('gitCloneCommand — who a clone authenticates as', () => {
         expect(env).toEqual({
             PATH                 : '/usr/bin',
             HTTPS_PROXY          : 'http://proxy.example:3128', // a proxy stays an environment setting
+            HOME                 : os.devNull,
             GIT_CONFIG_GLOBAL    : os.devNull,
             GIT_CONFIG_NOSYSTEM  : '1',
             GIT_TERMINAL_PROMPT  : '0',

@@ -19,10 +19,10 @@ const HOST_GIT_ENV = /^(GIT_ASKPASS|SSH_ASKPASS|GIT_CONFIG|GIT_CONFIG_(GLOBAL|SY
  * A seat's credential is presented only to `https://github.com`, the host a GitHub PAT belongs to. It goes
  * through a helper scoped to that host that reads the token from the child's environment, so the token never
  * appears in argv, where every process on the machine can read it. That clone runs outside the host's Git
- * setup: no system or global config file, no config or askpass handed down through the environment, and git
- * never prompts. So an ambient URL rewrite, header, credential helper or askpass can neither redirect nor
- * authenticate it. Proxy and CA settings reach it only through the environment (`HTTPS_PROXY`,
- * `GIT_SSL_CAINFO`), never through a config file. Any other remote, or no credential, is a plain clone in the
+ * setup: no system or global config file, no home directory (so no `~/.netrc`), no config or askpass handed
+ * down through the environment, and git never prompts. So an ambient URL rewrite, header, netrc entry,
+ * credential helper or askpass can neither redirect nor authenticate it. Proxy and CA settings reach it only
+ * through the environment (`HTTPS_PROXY`, `GIT_SSL_CAINFO`), never through a config file. Any other remote, or no credential, is a plain clone in the
  * process's own environment. The `--` ends git's option parsing, so a hostile URL or path cannot smuggle a flag.
  * @param {String} cloneUrl
  * @param {String} repoPath
@@ -43,6 +43,7 @@ export function gitCloneCommand(cloneUrl, repoPath, credential, env = process.en
         ],
         env : {
             ...Object.fromEntries(Object.entries(env).filter(([name]) => !HOST_GIT_ENV.test(name))),
+            HOME                 : os.devNull,
             GIT_CONFIG_GLOBAL    : os.devNull,
             GIT_CONFIG_NOSYSTEM  : '1',
             GIT_TERMINAL_PROMPT  : '0',

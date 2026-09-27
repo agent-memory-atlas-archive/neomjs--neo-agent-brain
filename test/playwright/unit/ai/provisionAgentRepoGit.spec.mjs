@@ -89,4 +89,26 @@ test.describe('gitCloneCommand — a seat clone ignores the host\'s Git configur
         expect(requests.some(({authorization}) => authorization?.includes(AMBIENT)), 'no ambient header was sent').toBe(false);
         expect(fs.existsSync(askpassMarker), 'no askpass ran').toBe(false)
     });
+
+    test('a host ~/.netrc entry authenticates the host\'s git, never the seat\'s environment', async () => {
+        // curl retries a 401 with the netrc entry before git's own credential flow runs. The seat clone's TLS
+        // hides its headers from the proxy, so netrc is witnessed over plain http against the local server:
+        // the same request under a host environment whose HOME holds only a .netrc, and under the seat clone's.
+        const
+            netrcHome = fs.mkdtempSync(path.join(rootDir, 'netrc-home-')),
+            netrc     = Buffer.from('ambient:NETRC_SECRET').toString('base64'),
+            target    = `http://127.0.0.1:${port}/neomjs/private-fixture.git`,
+            host      = {...process.env, HOME: netrcHome, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', NO_PROXY: '*', no_proxy: '*'},
+            {env}     = gitCloneCommand('https://github.com/neomjs/private-fixture.git', path.join(rootDir, 'checkout-2'), 'ghp_bogus_seat_token', host),
+            probe     = async environment => {
+                requests.length = 0;
+                await run(['ls-remote', '--', target], environment);
+                return requests.some(({authorization}) => authorization?.includes(netrc))
+            };
+
+        fs.writeFileSync(path.join(netrcHome, '.netrc'), 'machine 127.0.0.1 login ambient password NETRC_SECRET\n', {mode: 0o600});
+
+        expect(await probe(host), 'the control: the host\'s git sends its netrc entry').toBe(true);
+        expect(await probe(env), 'the seat clone\'s environment reads no netrc').toBe(false)
+    });
 });
