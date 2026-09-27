@@ -201,9 +201,10 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
                   nodePath          : '/usr/bin/node'
               });
 
-        // provisioning fed the agent's metadata.repo coordinates + the managed root + the clone seam
+        // provisioning fed the agent's metadata.repo coordinates + the managed root + the clone seam, and the
+        // seat's own PAT, so a private repo clones without credentials on the Fleet host
         expect(ensureRepo.calls).toHaveLength(1);
-        expect(ensureRepo.calls[0]).toMatchObject({managedRoot: '/managed', agentId: 'a', repoSlug: 'neomjs/neo', cloneUrl: REPO.cloneUrl, cloneRepo});
+        expect(ensureRepo.calls[0]).toMatchObject({managedRoot: '/managed', agentId: 'a', repoSlug: 'neomjs/neo', cloneUrl: REPO.cloneUrl, credential: FIXTURE_PAT, cloneRepo});
         expect(prepareWorkspace.calls).toHaveLength(1);
         expect(prepareWorkspace.calls[0]).toMatchObject({
             agent             : repoAgent('a').a,

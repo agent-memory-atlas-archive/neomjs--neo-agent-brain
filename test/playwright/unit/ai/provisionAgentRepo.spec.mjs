@@ -1,13 +1,13 @@
-import {test, expect}        from '@playwright/test';
-import {provisionAgentRepo}  from '../../../../ai/services/fleet/provisionAgentRepo.mjs';
+import {test, expect}                        from '@playwright/test';
+import {gitCloneCommand, provisionAgentRepo} from '../../../../ai/services/fleet/provisionAgentRepo.mjs';
 
 // A recording clone stub — the injectable side-effect seam, mirroring FleetLifecycleService.spec's
 // spawn stub. It records calls so the clone/reuse/conflict contract is asserted with no git binary or
 // network. `impl` lets a case simulate a clone failure.
 const makeCloneStub = impl => {
     const calls = [];
-    const fn    = async (cloneUrl, repoPath) => {
-        calls.push({cloneUrl, repoPath});
+    const fn    = async (cloneUrl, repoPath, {credential} = {}) => {
+        calls.push({cloneUrl, repoPath, credential});
         if (impl) return impl(cloneUrl, repoPath);
     };
     fn.calls = calls;
@@ -87,5 +87,41 @@ test.describe('provisionAgentRepo (Fleet Manager repo-provisioning executor)', (
     test('non-clone actions work without an injected cloneRepo (the default seam is harmless off the clone path)', async () => {
         const r = await provisionAgentRepo({repoPath: REPO, provisioningAction: 'reuse'});
         expect(r).toEqual({repoPath: REPO, action: 'reused', cloned: false})
+    });
+
+    test("the seat's credential reaches the clone executor", async () => {
+        const clone = makeCloneStub();
+
+        await provisionAgentRepo({repoPath: REPO, cloneUrl: URL, credential: 'ghp_seat', provisioningAction: 'clone', cloneRepo: clone});
+
+        expect(clone.calls[0]).toEqual({cloneUrl: URL, repoPath: REPO, credential: 'ghp_seat'})
+    });
+});
+
+test.describe('gitCloneCommand — who a clone authenticates as', () => {
+    const GITHUB = 'https://github.com/neomjs/neo.git';
+
+    test("a GitHub https clone presents the seat's token through a host-scoped helper, never in argv, never prompting", () => {
+        const {args, env} = gitCloneCommand(GITHUB, REPO, 'ghp_seat');
+
+        expect(args).toEqual([
+            '-c', 'credential.helper=',
+            '-c', 'credential.https://github.com.helper=!f() { echo username=x-access-token; echo "password=$NEO_SEAT_GITHUB_TOKEN"; }; f',
+            'clone', '--', GITHUB, REPO
+        ]);
+        expect(args.join(' '), 'the token is not in argv, where any process can read it').not.toContain('ghp_seat');
+        expect(env.NEO_SEAT_GITHUB_TOKEN).toBe('ghp_seat');
+        expect(env.GIT_TERMINAL_PROMPT).toBe('0')
+    });
+
+    test('any other remote, or no credential, is a plain clone in the process environment', () => {
+        for (const [cloneUrl, credential] of [
+            [GITHUB, undefined],                          // no credential
+            ['https://gitlab.example/x/y.git', 'ghp_seat'], // a GitHub PAT belongs to github.com only
+            ['git@github.com:neomjs/neo.git', 'ghp_seat'],  // ssh authenticates with keys, not a PAT
+            ['https://github.com.evil.example/x/y.git', 'ghp_seat']
+        ]) {
+            expect(gitCloneCommand(cloneUrl, REPO, credential), cloneUrl).toEqual({args: ['clone', '--', cloneUrl, REPO], env: undefined})
+        }
     });
 });

@@ -16,7 +16,7 @@ test.afterAll(()  => { fs.rmSync(suiteRoot, {recursive: true, force: true}); });
 
 const makeCloneStub = () => {
     const calls = [];
-    const fn    = async (cloneUrl, repoPath) => { calls.push({cloneUrl, repoPath}) };
+    const fn    = async (cloneUrl, repoPath, {credential} = {}) => { calls.push({cloneUrl, repoPath, credential}) };
     fn.calls = calls;
     return fn
 };
@@ -31,10 +31,10 @@ test.describe('ensureAgentRepo (Fleet Manager derive → inspect → provision o
         const clone = makeCloneStub(),
               args  = {managedRoot: suiteRoot, agentId: 'agent-absent', repoSlug: 'neomjs/neo'},
               want  = pathFor(args.managedRoot, args.agentId, args.repoSlug),
-              r     = await ensureAgentRepo({...args, cloneUrl: URL, cloneRepo: clone});
+              r     = await ensureAgentRepo({...args, cloneUrl: URL, credential: 'ghp_seat', cloneRepo: clone});
 
         expect(r).toEqual({repoPath: want, state: 'absent', action: 'cloned', cloned: true});
-        expect(clone.calls).toEqual([{cloneUrl: URL, repoPath: want}])
+        expect(clone.calls, "the seat's credential rides to the clone").toEqual([{cloneUrl: URL, repoPath: want, credential: 'ghp_seat'}])
     });
 
     test('existing checkout → reuses it, never invoking the clone executor', async () => {
