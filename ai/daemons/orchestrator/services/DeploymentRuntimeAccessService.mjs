@@ -19,7 +19,7 @@ export const DEPLOYMENT_RUNTIME_LIFECYCLE_OPERATIONS = Object.freeze([
     // A live cgroup memory-ceiling change (`POST /containers/{id}/update`), added for the store-class
     // ceiling raise: a store mid-ingestion must gain headroom WITHOUT the restart that would kill the
     // ingestion the raise exists to rescue. Governed by the store-variant actuator row in
-    // ADR-0026 §2.8; // ticket-ref-ok: the ADR is the governing authority for this operation's envelope
+    // ADR-0026 [not-ticket-ref: the ADR is the governing authority for this operation's envelope] §2.8;
     // still config-and-lifecycle-only — it moves one bounded resource limit on one allowlisted,
     // identity-proven target, never code or an open container field.
     'update-memory-limit'
@@ -212,7 +212,7 @@ export class DeploymentRuntimeAccessService extends Base {
     /**
      * Per-target tail of the memory-limit critical section (`withMemoryLimitExclusion`). Process-local
      * on purpose: the recovery-actuator decision record puts the docker socket in exactly ONE
-     * orchestrator-resident holder — ADR-0026 // ticket-ref-ok: the ADR is the governing authority for the single-holder topology this soundness argument rests on
+     * orchestrator-resident holder — ADR-0026 [not-ticket-ref: the ADR is the governing authority for the single-holder topology this soundness argument rests on]
      * (the singleton lease forbids a second), so there is no cross-process racer for this map to
      * miss — the assumption is architectural, not hopeful.
      * @member {Map} memoryLimitLocksByService=new Map()
