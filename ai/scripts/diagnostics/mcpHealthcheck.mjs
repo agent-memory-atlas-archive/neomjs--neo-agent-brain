@@ -396,8 +396,12 @@ export async function runHealthcheck({
             abortController
         ).catch(error => { throw annotateTimeout(error, {startupMs, timeoutMs, phase: 'connect'}) });
 
+        // A container probe asks whether the process SERVES, so a cached healthy payload answers it:
+        // `freshObservability: false` returns that payload without re-running the Chroma, Docker and
+        // corpus probes on every tick. A degraded or unhealthy result is never cached, so recovery
+        // still reads fresh; the served-plane assertion below reads the same fields either way.
         const result = await withAbortableTimeout(
-            client.callTool({name: 'healthcheck', arguments: {}}),
+            client.callTool({name: 'healthcheck', arguments: {freshObservability: false}}),
             timeoutMs,
             'MCP healthcheck tool call',
             abortController

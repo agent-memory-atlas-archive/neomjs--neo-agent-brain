@@ -300,3 +300,27 @@ test.describe('declared V8 heap ceilings', () => {
             .toContain('"$$SERVER_ENTRYPOINT"');
     });
 });
+
+/**
+ * The MCP-probed API servers' container healthchecks are full MCP client sessions calling the
+ * `healthcheck` tool. At `interval: 10s` the probe was the service's largest caller (about 270 of
+ * the 353 calls mc-server served in 49 minutes on 2026-09-27). The cadence is pinned here so it
+ * cannot drift back: a probe at least 30 s apart, a timeout that covers a contention-inflated
+ * interpreter start, and a retry count that keeps detection within two minutes.
+ */
+test.describe('MCP container probes: cadence', () => {
+    const
+        seconds    = value => Number.parseFloat(String(value).replace(/s$/, '')),
+        MCP_PROBED = ['kb-server', 'mc-server'];
+
+    for (const service of MCP_PROBED) {
+        test(`${service}'s probe runs no more often than every 30 s and still detects within two minutes`, () => {
+            const healthcheck = compose.services[service].healthcheck;
+
+            expect(healthcheck.test.join(' '), 'the probe is the MCP healthcheck client').toContain('mcpHealthcheck.mjs');
+            expect(seconds(healthcheck.interval), 'interval').toBeGreaterThanOrEqual(30);
+            expect(seconds(healthcheck.timeout), 'timeout covers a contention-inflated interpreter start').toBeGreaterThanOrEqual(15);
+            expect(seconds(healthcheck.interval) * healthcheck.retries, 'detection latency stays within two minutes').toBeLessThanOrEqual(120);
+        });
+    }
+});

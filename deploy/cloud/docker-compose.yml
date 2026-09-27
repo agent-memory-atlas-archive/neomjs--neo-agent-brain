@@ -201,9 +201,13 @@ services:
     # in the container environment; mcpHealthcheck.mjs sends it as a bearer token.
     healthcheck:
       test        : ["CMD", "node", "./ai/scripts/diagnostics/mcpHealthcheck.mjs", "--url", "http://127.0.0.1:3000", "--client-name", "neo-kb-container-healthcheck"]
-      interval    : 10s
-      timeout     : 10s
-      retries     : 12
+      # The probe is a full MCP client calling the `healthcheck` tool; at 10 s it was the
+      # service's largest caller. 30 s × 4 keeps the two-minute detection latency of 10 s × 12
+      # at a sixth of the calls; the timeout covers a probe whose interpreter start is inflated by
+      # CPU contention, which is what its startup timing separates from a stalled service.
+      interval    : 30s
+      timeout     : 15s
+      retries     : 4
       start_period: 45s
     deploy:
       resources:
@@ -370,9 +374,12 @@ services:
     # distinguish the two, not to erase both.
     healthcheck:
       test        : ["CMD", "node", "./ai/scripts/diagnostics/mcpHealthcheck.mjs", "--url", "http://127.0.0.1:3001", "--client-name", "neo-mc-container-healthcheck", "--expected-status", "healthy,degraded"]
-      interval    : 10s
-      timeout     : 10s
-      retries     : 12
+      # Same cadence as kb-server, for the same reason: measured 2026-09-27, the 10 s probe was
+      # ~270 of the 353 `healthcheck` calls mc-server served in 49 minutes, three of them at 63–83 s
+      # while the service booted.
+      interval    : 30s
+      timeout     : 15s
+      retries     : 4
       start_period: 45s
     deploy:
       resources:
