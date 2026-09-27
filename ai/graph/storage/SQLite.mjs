@@ -7,20 +7,19 @@ const GRAPH_SCHEMA_VERSION_ID = 'graph';
 const GRAPH_SCHEMA_WIPE_ENV   = 'NEO_ALLOW_SCHEMA_WIPE';
 
 /**
- * @summary Maps a narrow UPDATE's result to the `GraphLog` id it produced, or `0` when nothing matched.
+ * @summary Maps a narrow UPDATE's result to whether a row matched and was updated.
  *
- * The `node_update` / `edge_update` triggers insert a `GraphLog` row inside the statement, so
- * `lastInsertRowid` names exactly this write's log position. Returning it lets a caller acknowledge
- * **its own** row instead of the global maximum — the difference between skipping the replay of a
- * write you just made and skipping a concurrent peer's write you have never seen.
- *
- * `0` rather than `false` on no-match keeps every existing truthiness check working while making the
- * id available to callers that need it.
+ * Only `changes` can say so. `lastInsertRowid` cannot name the `GraphLog` row the `node_update` /
+ * `edge_update` trigger wrote: SQLite restores `last_insert_rowid()` when a trigger program ends,
+ * so after the statement it holds the connection's last PLAIN insert — `0` on a connection that has
+ * not inserted yet, a stale rowid otherwise. Read as "did the write land", that reported a landed
+ * receipt as a missing row on every freshly started mc-server; the own-row acknowledgement it was
+ * meant to enable belongs to writer identity on the row, tracked separately.
  * @param {Object} result better-sqlite3 `RunResult`.
- * @returns {Number} `GraphLog` id, or `0`.
+ * @returns {Boolean} `true` when a row was updated.
  */
 function narrowWriteResult(result) {
-    return result.changes > 0 ? Number(result.lastInsertRowid) : 0
+    return result.changes > 0
 }
 
 /**

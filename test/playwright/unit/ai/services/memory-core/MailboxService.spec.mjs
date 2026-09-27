@@ -2979,16 +2979,18 @@ test.describe('Neo.ai.services.memory-core.MailboxService', () => {
 
         expect(first).toBeTruthy();
 
-        // A direct second write through the same narrow path must overwrite, not be refused.
-        // The writers return the GraphLog id they produced (0 = no row matched), so a caller can
-        // acknowledge its OWN log position instead of the global maximum. Truthiness is unchanged.
+        // A direct second write through the same narrow path must overwrite, not be refused. The
+        // writers report whether a row was updated — a Boolean, the one fact a narrow write can
+        // state: the GraphLog id they once returned came from `lastInsertRowid`, which SQLite
+        // restores at trigger exit, so it named no log row and read 0 on a fresh connection (the
+        // fresh-connection arm in the storage spec is the discriminating one).
         expect(storage.setRecordProperty('Nodes', directed, 'readAt', '2099-01-01T00:00:00.000Z'),
-            'the unconditional writer reports the log id it wrote').toBeGreaterThan(0);
+            'the unconditional writer reports that a row was updated').toBe(true);
         expect(readAtOf(), 'and the value actually changed').toBe('2099-01-01T00:00:00.000Z');
 
         // The paired control: the write-once variant refuses, which is why the two are separate.
         expect(storage.setRecordPropertyIfAbsent('Nodes', directed, 'readAt', '2100-01-01T00:00:00.000Z'),
-            'the write-once variant refuses an already-set field').toBe(0)
+            'the write-once variant refuses an already-set field').toBe(false)
     });
 
     /**

@@ -2461,13 +2461,13 @@ async function writeReceiptField(record, table, field, value, {writeOnce = false
         return RECEIPT_WRITE.noStorage
     }
 
+    // `written`: whether the statement updated a row — the one fact a narrow write can report.
     const
-        id     = getRecordField(record, 'id'),
-        method = writeOnce ? 'setRecordPropertyIfAbsent' : 'setRecordProperty',
-        // The GraphLog id this write produced, or 0 when the statement matched nothing.
-        logId  = db.storage[method](table, id, field, value);
+        id      = getRecordField(record, 'id'),
+        method  = writeOnce ? 'setRecordPropertyIfAbsent' : 'setRecordProperty',
+        written = db.storage[method](table, id, field, value);
 
-    if (!logId) {
+    if (!written) {
         // The statement matched nothing. For a write-once field that means the value was already
         // set; otherwise the row is gone from storage while the caller still holds a cached record.
         // Cache is deliberately NOT mutated either way, so the caller must not report success — and
@@ -2489,10 +2489,9 @@ async function writeReceiptField(record, table, field, value, {writeOnce = false
     // Two narrower acks were built and measured, and neither is shippable as-is: dropping the ack
     // entirely makes every receipt write invalidate its own cache entry (correct by the
     // invalidate-then-lazy-load design, but it changes a contract this suite relies on in 65
-    // places), and acknowledging only our own row — `logId === db.lastSyncId + 1`, which the
-    // writers now return the id for — holds or not depending on run order, so cache survival
-    // becomes nondeterministic. The real fix is a Database-level ability to skip replay of
-    // self-authored rows, which is a shared-primitive change and not this PR's to make.
+    // places), and acknowledging only our own row by log id cannot be built on `lastInsertRowid`
+    // (SQLite restores it at trigger exit). The real fix is writer identity on the row, so the
+    // Database can skip replay of self-authored rows — a shared-primitive change, tracked separately.
     db.acknowledgeLocalMutations?.();
 
     return RECEIPT_WRITE.written
