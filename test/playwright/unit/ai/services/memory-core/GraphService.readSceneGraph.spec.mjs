@@ -207,6 +207,54 @@ test.describe('GraphService.readSceneGraph — paged across a large graph', () =
         }
     });
 
+    test('the geometry columns align with the ids, read each kind\'s named field, and a hidden node contributes nothing', async () => {
+        const
+            GraphService = (await import('../../../../../../ai/services/memory-core/GraphService.mjs')).default,
+            originalDb   = GraphService.db,
+            dbPath       = path.resolve(process.cwd(), 'tmp', `graph-geometry-${globalThis.crypto.randomUUID()}.sqlite`),
+            storage      = Neo.create(SQLite, {dbPath});
+
+        try {
+            await storage.ready();
+            storage.RequestContextService = {getUserId: () => 'tenant-x'};
+            storage.addNodes([
+                node('issue-1',   {gravity_well: true, strategic_weight: 0.8, updatedAt: '2026-09-28T10:00:00.000Z'}),
+                node('issue-2'),
+                node('issue-3',   {updatedAt: 'not a time'}),
+                node('file-1',    {kind: 'FILE', mtimeMs: 1790590000000.625}),
+                node('memory-1',  {kind: 'AGENT_MEMORY', timestamp: '2026-09-28T09:00:00Z', gravity_well: 'yes'}),
+                node('concept-1', {kind: 'CONCEPT', gravity_well: true, strategic_weight: 0.5, updatedAt: '2026-09-28T08:00:00Z'}),
+                node('private-1', {userId: 'tenant-y', gravity_well: true, strategic_weight: 0.99, updatedAt: '2026-09-28T11:00:00Z'})
+            ]);
+            GraphService.db = {storage};
+
+            const
+                wire = await GraphService.readSceneGraph(),
+                row  = id => ['gravityWell', 'strategicWeight', 'lastActivityAt'].map(column => wire.nodes[column][wire.nodes.ids.indexOf(id)]);
+
+            expect(wire.activitySources).toEqual(GraphService.sceneActivitySources);
+            expect(wire.nodes.ids).toEqual(['concept-1', 'file-1', 'issue-1', 'issue-2', 'issue-3', 'memory-1']);
+            expect(row('issue-1')).toEqual([1, 0.8, Date.parse('2026-09-28T10:00:00.000Z')]);
+            expect(row('issue-2'), 'a mapped kind without its field').toEqual([0, null, null]);
+            expect(row('issue-3'), 'an unreadable field').toEqual([0, null, null]);
+            expect(row('file-1'), 'a file mtime, in whole ms').toEqual([0, null, 1790590000001]);
+            expect(row('memory-1'), 'only a boolean anchor is a well').toEqual([0, null, Date.parse('2026-09-28T09:00:00Z')]);
+            expect(row('concept-1'), 'a kind without a source reads null, whatever fields it carries').toEqual([1, 0.5, null]);
+            expect(JSON.stringify(wire), 'the hidden node leaves no trace').not.toMatch(/private-1|0\.99/);
+
+            const
+                specification = yaml.load(await fs.readFile(path.resolve('ai/mcp/server/memory-core/openapi.yaml'), 'utf8')),
+                validate      = new Ajv({strict: false}).compile(specification.paths['/graph/scene'].post.responses['200'].content['application/json'].schema);
+
+            expect(validate(wire), JSON.stringify(validate.errors)).toBe(true);
+            expect(validate({...wire, nodes: {...wire.nodes, gravityWell: wire.nodes.gravityWell.map(() => 2)}})).toBe(false)
+        } finally {
+            GraphService.db = originalDb;
+            if (storage.db?.open) storage.db.close();
+            for (const suffix of ['', '-wal', '-shm']) fs.removeSync(dbPath + suffix);
+        }
+    });
+
     test('every page lands, and the plane runs other work between pages', async () => {
         const
             GraphService = (await import('../../../../../../ai/services/memory-core/GraphService.mjs')).default,

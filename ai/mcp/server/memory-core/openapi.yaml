@@ -2116,8 +2116,12 @@ paths:
         `authoredBy`, `assignedTo` and `memoryOf` retain distinct source roles: issue/PR authors and assignees,
         and agent-memory identity. Singular -1 and a null list mean unknown; [] means observed no assignees.
         Attribution comes only from answered nodes after RLS and budget selection. It is historical attribution,
-        not current work or a change actor. It carries no property bags. `counts.unlinked` names the answered nodes
-        with no visible relation. A budget keeps the best-connected nodes, and `truncated` reports only a budget cut.
+        not current work or a change actor. It carries no property bags. Geometry columns carry the Brain's own
+        meaning: `gravityWell` (1 marks a strategic anchor), `strategicWeight` and `lastActivityAt` (epoch ms), read
+        from the field `activitySources` names for the node's kind. A null `lastActivityAt` means the kind has no
+        source when `activitySources` omits it, and otherwise that the node lacks a readable field. `counts.unlinked`
+        names the answered nodes with no visible relation. A budget keeps the best-connected nodes, and `truncated`
+        reports only a budget cut.
       tags: [Graph]
       requestBody:
         required: false
@@ -2141,16 +2145,21 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [actors, nodes]
+                required: [actors, activitySources, nodes]
                 properties:
                   actors:
                     type: array
                     description: Canonical actor identifiers shared by the three attribution columns.
                     items:
                       type: string
+                  activitySources:
+                    type: object
+                    description: The field each node kind's `lastActivityAt` is read from; a kind absent here has no source.
+                    additionalProperties:
+                      type: string
                   nodes:
                     type: object
-                    required: [ids, kinds, labels, authoredBy, assignedTo, memoryOf]
+                    required: [ids, kinds, labels, authoredBy, assignedTo, memoryOf, gravityWell, strategicWeight, lastActivityAt]
                     properties:
                       ids:
                         type: array
@@ -2187,6 +2196,24 @@ paths:
                         items:
                           type: integer
                           minimum: -1
+                      gravityWell:
+                        type: array
+                        description: 1 for a REM strategic anchor, else 0.
+                        items:
+                          type: integer
+                          enum: [0, 1]
+                      strategicWeight:
+                        type: array
+                        description: The node's strategic weight, or null.
+                        items:
+                          type: number
+                          nullable: true
+                      lastActivityAt:
+                        type: array
+                        description: Epoch ms of the node's last activity, from its kind's `activitySources` field, or null.
+                        items:
+                          type: integer
+                          nullable: true
         '500':
           description: Internal server error.
           content:

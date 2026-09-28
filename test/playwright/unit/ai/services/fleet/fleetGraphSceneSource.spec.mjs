@@ -188,6 +188,25 @@ test.describe('fleetGraphSceneSource — pure projection', () => {
         expect(scene.edges).toEqual([{from: 'neomjs/neo#pr-101', to: 'neomjs/neo#issue-7'}])
     });
 
+    test('the geometry columns land sparse on their nodes, and an answer without them projects as before', () => {
+        const
+            sources = {ISSUE: 'updatedAt', PULL_REQUEST: 'updatedAt'},
+            plain   = answerOf(NODES, EDGES),
+            graph   = {...plain, activitySources: sources, nodes: {...plain.nodes, gravityWell: [1, 0, 1], strategicWeight: [0.9, null, 0.4], lastActivityAt: [NOW_MS, null, null]}},
+            scene   = projectScene({graph}),
+            byId    = new Map(scene.nodes.map(node => [node.id, node]));
+
+        expect(scene.activitySources).toEqual(sources);
+        expect(byId.get('neomjs/neo#issue-7')).toEqual({id: 'neomjs/neo#issue-7', label: 'Seven', kind: 'ISSUE', gravityWell: true, strategicWeight: 0.9, lastActivityAt: NOW_MS});
+        expect(byId.get('neomjs/neo#pr-101'), 'a mapped kind without the field reads null').toEqual({id: 'neomjs/neo#pr-101', label: 'One-oh-one', kind: 'PULL_REQUEST', lastActivityAt: null});
+        expect(byId.get('neomjs/neo#concept-a'), 'a kind the map does not name carries no recency').toEqual({id: 'neomjs/neo#concept-a', label: 'A', kind: 'CONCEPT', gravityWell: true, strategicWeight: 0.4});
+
+        const older = projectScene({graph: plain});
+
+        expect(older).not.toHaveProperty('activitySources');
+        expect(older.nodes.map(node => Object.keys(node).join())).toEqual(['id,label,kind', 'id,label,kind', 'id,label,kind'])
+    });
+
     test('the byte budget trims edges first, then nodes, from the end, and says truncated', () => {
         const
             // measured under a budget of the same width as the one below, since the budget is in the scene

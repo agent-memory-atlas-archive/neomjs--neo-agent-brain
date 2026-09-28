@@ -143,6 +143,24 @@ class GraphService extends Base {
          */
         graphInitError: null,
         /**
+         * The property each node kind's last activity is read from, for the scene's `lastActivityAt`. A kind
+         * absent here has no source, so its null means "no activity time for this kind"; a kind present here
+         * with a null value means the node lacks a readable field.
+         * @member {Object} sceneActivitySources
+         */
+        sceneActivitySources: {
+            AGENT_MEMORY : 'timestamp',
+            DIRECTORY    : 'mtimeMs',
+            DISCUSSION   : 'updatedAt',
+            FILE         : 'mtimeMs',
+            ISSUE        : 'updatedAt',
+            KB_GAP       : 'discoveredAt',
+            MESSAGE      : 'sentAt',
+            PULL_REQUEST : 'updatedAt',
+            RETROSPECTIVE: 'discoveredAt',
+            TOOLING_GAP  : 'discoveredAt'
+        },
+        /**
          * @member {Boolean} singleton=true
          */
         singleton: true
@@ -1354,10 +1372,15 @@ class GraphService extends Base {
      * Actor columns contain dictionary codes for authored/assigned issue and PR identities, and
      * agent-memory identity only. A missing assignee list is null; an observed empty list is [].
      * The dictionary is built after RLS and budget selection, so excluded rows contribute no actors.
+     *
+     * Geometry columns carry the Brain's own meaning, never the property bag: `gravityWell` (1 for a REM
+     * strategic anchor, else 0), `strategicWeight` (a number or null) and `lastActivityAt` (epoch ms or null),
+     * read from the field {@link GraphService#sceneActivitySources} names for the node's kind, which the answer
+     * repeats as `activitySources`. The store records no per-node capture time.
      * @param {Object} [data]
      * @param {Number} [data.maxNodes=250000]
      * @param {Number} [data.maxEdges=500000]
-     * @returns {Promise<Object>} `{kinds, types, actors, nodes, edges, counts, budget, truncated}`.
+     * @returns {Promise<Object>} `{kinds, types, actors, activitySources, nodes, edges, counts, budget, truncated}`.
      */
     async readSceneGraph({maxNodes = 250000, maxEdges = 500000} = {}) {
         const sqlite = this.db?.storage?.db;
@@ -1376,10 +1399,16 @@ class GraphService extends Base {
             rlsClause = `(user_id = ? OR user_id = ? OR user_id IS NULL
                           OR json_extract(data, '$.properties.sharedEntity') = 1
                           OR json_extract(data, '$.properties.visibility') = 'team')`,
+            sources   = this.sceneActivitySources,
             visible   = new Map(),
             links     = new Map(),
             degree    = new Map(),
             text      = value => typeof value === 'string' ? value : null,
+            // an ISO string (issues, memories, retrospectives) or a file's mtime, as whole ms
+            epochMs   = value => {
+                const ms = typeof value === 'number' ? value : typeof value === 'string' ? Date.parse(value) : NaN;
+                return Number.isFinite(ms) ? Math.round(ms) : null;
+            },
             actor     = value => {
                 const id = normalizeAgentIdentityNodeId(text(value)?.trim());
                 return id && id !== '@' ? id : null;
@@ -1404,12 +1433,15 @@ class GraphService extends Base {
                       assigned   = work && Array.isArray(properties.assignees) ? properties.assignees.map(actor) : null;
 
                 visible.set(node.id, {
-                    id        : node.id,
+                    id             : node.id,
                     kind,
-                    label     : text(properties.name) ?? text(properties.title),
-                    authoredBy: work ? actor(properties.author) : null,
-                    assignedTo: assigned?.every(Boolean) ? [...new Set(assigned)].sort() : null,
-                    memoryOf  : kind === 'AGENT_MEMORY' ? actor(properties.agentIdentity) : null
+                    label          : text(properties.name) ?? text(properties.title),
+                    authoredBy     : work ? actor(properties.author) : null,
+                    assignedTo     : assigned?.every(Boolean) ? [...new Set(assigned)].sort() : null,
+                    memoryOf       : kind === 'AGENT_MEMORY' ? actor(properties.agentIdentity) : null,
+                    gravityWell    : properties.gravity_well === true ? 1 : 0,
+                    strategicWeight: Number.isFinite(properties.strategic_weight) ? properties.strategic_weight : null,
+                    lastActivityAt : Object.hasOwn(sources, kind) ? epochMs(properties[sources[kind]]) : null
                 })
             }
         });
@@ -1465,16 +1497,20 @@ class GraphService extends Base {
         });
 
         return {
-            kinds : kinds.list,
-            types : types.list,
-            actors: actors.list,
-            nodes : {
-                ids       : nodes.map(node => node.id),
-                kinds     : nodes.map(node => kinds.code(node.kind)),
-                labels    : nodes.map(node => node.label),
-                authoredBy: nodes.map(node => node.authoredBy === null ? -1 : actors.code(node.authoredBy)),
-                assignedTo: nodes.map(node => node.assignedTo === null ? null : node.assignedTo.map(actors.code)),
-                memoryOf  : nodes.map(node => node.memoryOf === null ? -1 : actors.code(node.memoryOf))
+            kinds          : kinds.list,
+            types          : types.list,
+            actors         : actors.list,
+            activitySources: {...sources},
+            nodes          : {
+                ids            : nodes.map(node => node.id),
+                kinds          : nodes.map(node => kinds.code(node.kind)),
+                labels         : nodes.map(node => node.label),
+                authoredBy     : nodes.map(node => node.authoredBy === null ? -1 : actors.code(node.authoredBy)),
+                assignedTo     : nodes.map(node => node.assignedTo === null ? null : node.assignedTo.map(actors.code)),
+                memoryOf       : nodes.map(node => node.memoryOf === null ? -1 : actors.code(node.memoryOf)),
+                gravityWell    : nodes.map(node => node.gravityWell),
+                strategicWeight: nodes.map(node => node.strategicWeight),
+                lastActivityAt : nodes.map(node => node.lastActivityAt)
             },
             edges    : flat,
             counts   : {nodes: nodes.length, edges: edges.length, unlinked: nodes.length - linked.size},
