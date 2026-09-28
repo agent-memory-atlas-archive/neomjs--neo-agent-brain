@@ -871,10 +871,6 @@ function buildOsascriptArgs({appName, digest, focusSeedKey, focusSeedSequence, i
 }
 
 /**
- * @summary Retries only pre-submit frontmost races; post-submit restore races count delivered.
- * @private
- */
-/**
  * @summary Delivers the osascript payload exactly once, then reports what actually happened.
  *
  * There is deliberately no retry. A retry is not a safety net here — it is a cause of the
