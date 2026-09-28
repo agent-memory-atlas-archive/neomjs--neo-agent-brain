@@ -770,7 +770,7 @@ export class DeploymentStateBridgeService extends Base {
             };
 
         if (eventsAllowed) {
-            // Contained to the CHANNEL, deliberately (#497 RA-2). Both validators below throw on a bad
+            // Contained to the CHANNEL, deliberately. Both validators below throw on a bad
             // value — a non-positive lookback, a non-integer death limit — and both sit OUTSIDE `read()`'s
             // own catch, with no per-service guard in `collectSnapshot` and a rethrowing
             // `writeSnapshotIfDue` above. So one bad leaf in an OPTIONAL channel would stop the snapshot
@@ -837,7 +837,7 @@ export class DeploymentStateBridgeService extends Base {
             : null;
 
         // The SECOND evidence channel. Until this existed, `endpointProbe` had no producer anywhere in
-        // the orchestrator, so ADR-0025 §2.4's authoritative pair could never form and a wedged // ticket-ref-ok: the ADR clause is the reason this call exists at all
+        // the orchestrator, so ADR-0025 [not-ticket-ref: decision-record authority] §2.4's authoritative pair could never form and a wedged
         // container was diagnosed and never acted on.
         const endpointProbe = await this.collectDirectProbe({serviceKey});
 
@@ -957,7 +957,7 @@ export class DeploymentStateBridgeService extends Base {
         // Persist the baseline BEFORE returning. A restart-churn baseline held in process memory
         // could never work: the orchestrator is itself the process that churns, so an in-memory
         // anchor resets on every restart and the count can never reach a threshold — the same
-        // reasoning ADR-0025 rejects in-memory anti-thrash state on. // ticket-ref-ok: names the decision this durability requirement inherits
+        // reasoning ADR-0025 [not-ticket-ref: decision-record authority] rejects in-memory anti-thrash state on.
         // An unjudgeable baseline must not be overwritten by a fresh anchor derived from it —
         // that is the silent-reset path. Leave it; the `restartChurn` section below reports the
         // degradation on the record, so skipping the write no longer costs an operator the signal.
@@ -2677,7 +2677,7 @@ function summarizeInspect(inspect) {
         // image-name proxy gets invented.
         declaredHeapCeilingMb: parseDeclaredHeapCeilingMb(inspect.Config?.Cmd),
         nodeCommand          : isNodeCommand(inspect.Config?.Cmd),
-        // Named `currentRun`, not `state`, and that is the whole of #466's third Fix bullet. A
+        // Named `currentRun`, not `state`. A
         // container runtime's `State` block describes the run that is happening NOW, so after an OOM
         // kill and restart it reports the NEW run's `ExitCode: 0` and `OOMKilled: false` — which is
         // how seven hours of work got built on "the process exited cleanly" for a container that had

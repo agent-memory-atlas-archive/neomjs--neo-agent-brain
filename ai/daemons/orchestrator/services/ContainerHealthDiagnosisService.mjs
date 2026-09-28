@@ -435,9 +435,10 @@ export class ContainerHealthDiagnosisService extends Base {
     /**
      * Collects the restart-churn fact.
      *
-     * @summary Deliberately **non-authoritative**, following the precedent ADR-0025 §2.4 sets for the // ticket-ref-ok: the ADR is the governing authority for this safety property, not background reading
-     * data-integrity coverage-drift fact: *"a record is non-authoritative: the multi-fact requirement
-     * gates authoritative actions, not records."*
+     * @summary Deliberately **non-authoritative**, following the precedent
+     * ADR-0025 [not-ticket-ref: decision-record authority] §2.4 sets for the data-integrity
+     * coverage-drift fact: *"a record is non-authoritative: the multi-fact requirement gates
+     * authoritative actions, not records."*
      *
      * Non-authoritative is load-bearing here rather than merely conventional. `countAuthoritativeFacts`
      * counts every authoritative fact regardless of type, and `hasAuthoritativeEvidence` admits a
@@ -1209,7 +1210,8 @@ export class ContainerHealthDiagnosisService extends Base {
         // — the runtime only sets it after `retries` consecutive failures — and it is tempting to treat
         // that as sufficient on its own. It is not. Debouncing answers NOISE; it cannot answer
         // CONTRADICTION, because repeated evaluations of one probe are still one evidence channel, and
-        // the channel itself can be measuring the wrong thing. ADR-0025 §2.1 names the live instance: a // ticket-ref-ok: the ADR clause is the governing safety authority this branch must not contradict
+        // the channel itself can be measuring the wrong thing.
+        // ADR-0025 [not-ticket-ref: decision-record authority] §2.1 names the live instance: a
         // provider-dependent canary false-fails while the service still answers and persists, so
         // restarting it is a self-inflicted outage. §2.4 therefore requires the PAIR — a
         // `container-unhealthy` state plus a failed DIRECT endpoint probe — and
@@ -1221,7 +1223,8 @@ export class ContainerHealthDiagnosisService extends Base {
         // `serviceAnswering` VETOES the unhealthy-based restart, and it must veto the corroborated
         // branch too — not only the single-fact one. `hasAuthoritativeEvidence`'s first arm admits ANY
         // two authoritative facts, so `container-unhealthy` + a sustained `memory-saturation` reaches
-        // restart on a service that is demonstrably serving. ADR-0025 §2.4's resource alternative is // ticket-ref-ok: the ADR clause is the authority for requiring a failed operation, not a fact count
+        // restart on a service that is demonstrably serving.
+        // ADR-0025 [not-ticket-ref: decision-record authority] §2.4's resource alternative is
         // narrower than that arm: it requires resource exhaustion AND *a sustained failed service
         // operation*. A direct answer is the negation of that second half, so it outranks the count.
         //
@@ -1321,7 +1324,8 @@ export class ContainerHealthDiagnosisService extends Base {
         // class was diagnosed wrongly, so this branch only ever speaks where nothing else did, and no
         // existing classification changes shape.
         //
-        // The action class is `record`, never `restart`. ADR-0026 §2.5 already hard-transitions a // ticket-ref-ok: the envelope this classification must not contradict
+        // The action class is `record`, never `restart`.
+        // ADR-0026 [not-ticket-ref: decision-record authority] §2.5 already hard-transitions a
         // rate-exhausted service to alarm-only; churn is that same situation occurring OUTSIDE our
         // envelope, driven by the runtime's own restart policy. Restarting a container that has
         // already restarted past the threshold is the one action its own history proves ineffective,
@@ -1334,8 +1338,9 @@ export class ContainerHealthDiagnosisService extends Base {
                 // already established `ambiguous` as the record-never-auto-restart class for exactly
                 // this reasoning: "blindly restarting a failed backup neither knows nor fixes the
                 // cause." Restarting a container that has already restarted past the threshold is the
-                // same move against the same logic. `crash` would be actively wrong — ADR-0026 §2.4's // ticket-ref-ok: names the mapping that makes `crash` unsafe here
-                // reactive controller maps transient-crash to restart.
+                // same move against the same logic. `crash` would be actively wrong:
+                // ADR-0026 [not-ticket-ref: decision-record authority] §2.4's reactive controller maps
+                // transient-crash to restart.
                 recoveryClass: 'ambiguous',
                 actionClass  : CONTAINER_HEALTH_ACTION_CLASSES.record,
                 confidence   : 0.9,
