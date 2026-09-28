@@ -266,7 +266,7 @@ test.describe('Neo.ai.daemons.services.DeploymentStateBridgeService', () => {
             status    : 'available',
             inspect   : {
                 image: 'ollama',
-                // Named `currentRun` since #466's third Fix bullet: these are the run happening now,
+                // Named `currentRun` because these are the run happening now,
                 // not the death that preceded a restart. The cause of a restart is in `deaths`.
                 currentRun: {status: 'running', health: 'unhealthy'}
             },
@@ -481,7 +481,7 @@ test.describe('Neo.ai.daemons.services.DeploymentStateBridgeService', () => {
         });
     });
 
-    // Grace's RA-2: both channel validators (a non-positive lookback, a non-integer death limit) threw
+    // Both channel validators (a non-positive lookback, a non-integer death limit) threw
     // OUTSIDE `read()`'s catch, with no per-service guard in `collectSnapshot` and a rethrowing
     // `writeSnapshotIfDue` above — so one bad leaf in an OPTIONAL channel stopped the snapshot for
     // every service, every cycle. This arm is the property that containment buys: the channel degrades,
@@ -2079,7 +2079,7 @@ test.describe('Neo.ai.daemons.services.DeploymentStateBridgeService', () => {
         expect(tornSnapshot.repos[0].corpusOutstanding).toBeNull();
         torn.destroy();
 
-        // RA-1 (@neo-gpt): every field individually well-typed, TOGETHER asserting a finished corpus
+        // Every field individually well-typed, TOGETHER asserting a finished corpus
         // with 42 chunks left. Presence-validation admits this; only coherence rejects it. Repairing it
         // to a count would invent an observation nobody made, so it degrades WHOLE.
         for (const incoherent of [
@@ -3767,7 +3767,7 @@ test.describe('probeReliability reaches the service record', () => {
  * The single decision separating "a wedged container gets restarted" from "a healthy container gets
  * restarted every sweep". Tested against the PURE classifier rather than through the config lookup,
  * so every failure shape is reachable without a live server and without mutating the AiConfig
- * singleton (ADR-0019 B4). Each arm below is a distinct way to get this wrong. // ticket-ref-ok: the ADR clause is why these tests avoid the singleton, not background reading
+ * singleton (ADR-0019 [not-ticket-ref: decision-record authority] B4). Each arm below is a distinct way to get this wrong.
  */
 test.describe('classifyDirectProbeOutcome — a probe fault is not a service fault (#16766)', () => {
     function timeoutError(verdict) {
