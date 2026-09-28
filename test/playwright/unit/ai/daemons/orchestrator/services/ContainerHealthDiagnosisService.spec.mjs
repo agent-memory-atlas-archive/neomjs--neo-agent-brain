@@ -480,16 +480,17 @@ test.describe('Neo.ai.daemons.services.ContainerHealthDiagnosisService', () => {
     });
 
     /**
-     * The ADR-0025 §2.4 pair, stated as a test rather than as a comment: a `container-unhealthy` state // ticket-ref-ok: the ADR clause is the contract this test encodes
-     * is authoritative ONLY alongside a failed DIRECT endpoint probe. All three arms below are needed,
-     * because an earlier revision of this suite kept only the last one and stayed green over the
-     * unsafe reading.
+     * The ADR-0025 [not-ticket-ref: decision-record authority] §2.4 pair, stated as a test rather than
+     * as a comment: a `container-unhealthy` state is authoritative ONLY alongside a failed DIRECT
+     * endpoint probe. All three arms below are needed, because an earlier revision of this suite kept
+     * only the last one and stayed green over the unsafe reading.
      *
      * The middle arm is the one that matters, and it is a regression control with a name. An earlier
      * revision let a lone authoritative `unhealthy` fact classify to `restart`, on the argument that
      * the runtime's verdict is already debounced by `retries x interval`. Debouncing answers NOISE and
      * cannot answer CONTRADICTION: repeated evaluations of one probe are still one evidence channel,
-     * and that channel can be measuring the wrong thing. ADR-0025 §2.1 names the live case — a // ticket-ref-ok: the ADR clause is the empirical anchor for this control
+     * and that channel can be measuring the wrong thing.
+     * ADR-0025 [not-ticket-ref: decision-record authority] §2.1 names the live case — a
      * provider-dependent canary false-fails while the service answers and persists — so restarting on
      * it is a self-inflicted outage.
      */
@@ -1616,7 +1617,7 @@ test.describe('sustained window is measured, not asserted', () => {
                 .details.unavailableReason).toBe('not-deployed');
         });
 
-        // ---- Window provenance (@neo-gpt, PR review RA-1/RA-2). -----------------------------------
+        // ---- Window provenance. -------------------------------------------------------------------
         // The window must be measured from the SUBJECT's own observation times, not from the Docker
         // polls that happened to read them, and every arm short of full pairable coverage must stay
         // advisory rather than reaching either `healthy` or the container ratio.
