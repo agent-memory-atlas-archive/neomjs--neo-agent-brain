@@ -1884,7 +1884,8 @@ class WakeSubscriptionService extends Base {
      * @summary The current unread SENT_TO_ME set for a subscription's owner — the answer to a
      * WATERMARK-LESS poll, derived from state rather than from log history.
      *
-     * Enumerates the owner's inbound `SENT_TO` edges through the edge store's target index and hands
+     * Enumerates the owner's inbound `SENT_TO` (direct message) and `DELIVERED_TO` (receipt-backed
+     * broadcast) edges through the edge store's target index and hands
      * each to {@link WakeSubscriptionService#_evaluateEdgeAgainstSubscription}, so the unread gate
      * stays the shared `match()` predicate this service and the standalone daemon already share. The
      * index is used rather than a mailbox query so the delivery-shape logic is not re-implemented
@@ -1911,7 +1912,7 @@ class WakeSubscriptionService extends Base {
         const events  = [];
 
         for (const edge of inbound) {
-            if (edge?.type !== 'SENT_TO') continue;
+            if (edge?.type !== 'SENT_TO' && edge?.type !== 'DELIVERED_TO') continue;
 
             const matched = this._evaluateEdgeAgainstSubscription({id: edge.id}, subscription, head);
             if (matched) events.push(matched);
