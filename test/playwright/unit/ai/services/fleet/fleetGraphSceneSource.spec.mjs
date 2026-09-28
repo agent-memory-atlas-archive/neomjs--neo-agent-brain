@@ -11,10 +11,10 @@ import {
 // modules against whatever ambient state the worker happened to inherit.
 await import('neo.mjs/src/Neo.mjs');
 
-const {default: FleetControlBridge} = await import('../../../../../../ai/services/fleet/FleetControlBridge.mjs');
-const {wireFleetGraphSceneSource} = await import('../../../../../../ai/services/fleet/wireFleetGraphSceneSource.mjs');
+const {default: FleetControlBridge}                        = await import('../../../../../../ai/services/fleet/FleetControlBridge.mjs');
+const {wireFleetGraphSceneSource}                          = await import('../../../../../../ai/services/fleet/wireFleetGraphSceneSource.mjs');
 const {FLEET_METHOD_SCOPE_CLASSES, FLEET_S1_METHOD_POLICY} = await import('../../../../../../ai/services/fleet/fleetServerPolicy.mjs');
-const {FLEET_WIRE_METHODS} = await import('../../../../../../src/fleet/contract/wire.mjs');
+const {FLEET_WIRE_METHODS}                                 = await import('../../../../../../src/fleet/contract/wire.mjs');
 
 const
     NOW    = '2026-09-27T09:00:00.000Z',
@@ -72,6 +72,11 @@ function seams(overrides = {}) {
 }
 
 test.describe('fleetGraphSceneSource', () => {
+    test('a foreign fallback cannot relabel implicit ids, while qualified identities survive it', () => {
+        expect(() => qualifyNodeId('issue-1', 'neomjs/other')).toThrow(/implicit/i);
+        expect(qualifyNodeId('neomjs/other#issue-1', 'neomjs/other')).toBe('neomjs/other#issue-1');
+    });
+
     test('the scene is the graph, and the route rides as its overlay', async () => {
         const read = await createFleetGraphSceneSource(seams()).readGraphScene();
 

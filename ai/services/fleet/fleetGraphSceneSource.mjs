@@ -46,6 +46,7 @@ const
  *
  * An id that already carries an origin is left alone, so a caller may pass either the graph's
  * origin-implicit form or an already-qualified one without the two disagreeing.
+ * Implicit ids belong to the neo-only corpus; a different fallback origin is refused before lookup.
  *
  * @param {String} id
  * @param {String} [origin=DEFAULT_ORIGIN]
@@ -54,7 +55,11 @@ const
 export function qualifyNodeId(id, origin = DEFAULT_ORIGIN) {
     const value = String(id ?? '');
 
-    return value.includes('#') ? value : `${origin}#${value}`
+    if (value.includes('#')) return value;
+    if (origin !== DEFAULT_ORIGIN) {
+        throw new Error('Origin-implicit graph ids require the neo-only corpus origin');
+    }
+    return `${origin}#${value}`
 }
 
 /**
@@ -105,6 +110,8 @@ function trimToBytes(scene, maxBytes) {
  *
  * Pure: the same answer gives the same scene whatever order its rows arrived in, which is what lets a
  * viewer's selection survive a refresh.
+ * Optional actor columns become role-specific identifiers only on their allowed node kinds. A null
+ * assignee list stays unknown; [] stays known empty. Older readers can omit all actor columns.
  *
  * @param {Object} input
  * @param {Object} input.graph The answer: `{kinds, types, nodes: {ids, kinds, labels}, edges, counts, budget, truncated}`.
@@ -117,9 +124,28 @@ export function projectScene({graph, route = [], maxBytes = DEFAULT_MAX_BYTES, o
     const
         {ids = [], kinds = [], labels = []} = graph.nodes ?? {},
         order     = (a, b) => a < b ? -1 : a > b ? 1 : 0,
+        actor     = code => Number.isInteger(code) && code >= 0 && typeof graph.actors?.[code] === 'string'
+            ? graph.actors[code]
+            : null,
         qualified = ids.map(id => qualifyNodeId(id, origin)),
         nodes     = qualified
-            .map((id, index) => ({id, label: labels[index] ?? null, kind: graph.kinds?.[kinds[index]] ?? null}))
+            .map((id, index) => {
+                const kind = graph.kinds?.[kinds[index]] ?? null,
+                      node = {id, label: labels[index] ?? null, kind};
+
+                // Older readers omit actor columns. Missing lists remain unknown, distinct from [].
+                if ((kind === 'ISSUE' || kind === 'PULL_REQUEST') && Array.isArray(graph.nodes.authoredBy)) {
+                    node.authoredBy = actor(graph.nodes.authoredBy[index]);
+                    const assigned = graph.nodes.assignedTo?.[index];
+                    node.assignedTo = Array.isArray(assigned) && assigned.every(code => actor(code) !== null)
+                        ? [...new Set(assigned.map(actor))].sort(order)
+                        : null;
+                } else if (kind === 'AGENT_MEMORY' && Array.isArray(graph.nodes.memoryOf)) {
+                    node.memoryOf = actor(graph.nodes.memoryOf[index]);
+                }
+
+                return node
+            })
             .sort((a, b) => order(a.id, b.id)),
         edges     = [];
 

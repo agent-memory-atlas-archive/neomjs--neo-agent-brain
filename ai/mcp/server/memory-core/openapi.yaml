@@ -2112,7 +2112,11 @@ paths:
         Reads every node the caller may see, and every relation between two of them, under the graph's
         row-level security. Answers columnar data, `{kinds, types, nodes: {ids, kinds, labels}, edges, counts,
         budget, truncated}`, where `edges` is a flat `[source, target, type, …]` list of indices into `nodes` and
-        `types`. It carries display fields only, never property bags. `counts.unlinked` names the answered nodes
+        `types`. The `actors` dictionary contains canonical AgentIdentity ids. Aligned node columns
+        `authoredBy`, `assignedTo` and `memoryOf` retain distinct source roles: issue/PR authors and assignees,
+        and agent-memory identity. Singular -1 and a null list mean unknown; [] means observed no assignees.
+        Attribution comes only from answered nodes after RLS and budget selection. It is historical attribution,
+        not current work or a change actor. It carries no property bags. `counts.unlinked` names the answered nodes
         with no visible relation. A budget keeps the best-connected nodes, and `truncated` reports only a budget cut.
       tags: [Graph]
       requestBody:
@@ -2137,6 +2141,52 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [actors, nodes]
+                properties:
+                  actors:
+                    type: array
+                    description: Canonical actor identifiers shared by the three attribution columns.
+                    items:
+                      type: string
+                  nodes:
+                    type: object
+                    required: [ids, kinds, labels, authoredBy, assignedTo, memoryOf]
+                    properties:
+                      ids:
+                        type: array
+                        items:
+                          type: string
+                      kinds:
+                        type: array
+                        items:
+                          type: integer
+                          minimum: 0
+                      labels:
+                        type: array
+                        items:
+                          type: string
+                          nullable: true
+                      authoredBy:
+                        type: array
+                        description: Actor index for an ISSUE or PULL_REQUEST author, or -1.
+                        items:
+                          type: integer
+                          minimum: -1
+                      assignedTo:
+                        type: array
+                        description: Actor indices for known issue/PR assignees; null is unknown, [] is known empty.
+                        items:
+                          type: array
+                          nullable: true
+                          items:
+                            type: integer
+                            minimum: 0
+                      memoryOf:
+                        type: array
+                        description: Actor index for an AGENT_MEMORY identity, or -1.
+                        items:
+                          type: integer
+                          minimum: -1
         '500':
           description: Internal server error.
           content:
