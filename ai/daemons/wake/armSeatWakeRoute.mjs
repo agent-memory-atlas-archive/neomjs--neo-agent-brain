@@ -22,8 +22,8 @@ export const INSTANCE_DIR_BY_HARNESS = Object.freeze({
     // A seat's OpenCode instance dir is a symlink to its real data home, so the string the
     // resolver matches in `--user-data-dir=` and the string the manifest publishes are the
     // same one, while the app keeps reading and writing where its data actually lives.
-    // Bridge, not a destination: #571's Terminal predicate retires pre-layout instance
-    // paths, and #562 is migrating GUI seats onto a session hook instead.
+    // Bridge, not a destination: the pre-layout instance paths are being retired in favour of
+    // the Fleet seat layout, and GUI seats are migrating onto a session hook instead.
     opencode: '.opencode-instances'
 });
 
