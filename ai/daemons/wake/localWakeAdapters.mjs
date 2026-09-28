@@ -694,7 +694,7 @@ async function deliverOsascript({adapterConfig, digest, effects, meta, record}) 
         instancePid,
         tabShortcut      : resolvedMeta.tabShortcut
     });
-    const outcome = await deliverOsascriptWithRetry(effects, args, record.subscriptionId);
+    const outcome = await spawnOsascriptOnce(effects, args, record.subscriptionId);
     return outcome;
 }
 
@@ -874,28 +874,48 @@ function buildOsascriptArgs({appName, digest, focusSeedKey, focusSeedSequence, i
  * @summary Retries only pre-submit frontmost races; post-submit restore races count delivered.
  * @private
  */
-async function deliverOsascriptWithRetry(effects, args, subscriptionId) {
-    for (let attempt = 1; attempt <= 4; attempt++) {
-        try {
-            await effects.spawnAsync('osascript', args);
-            return 'delivered';
-        } catch (error) {
-            const message = String(error.message || '');
-            const race    = /lost frontmost status|-2700/.test(message);
-            if (race && /user input restore/.test(message)) return 'delivered';
-            if (race && attempt < 4) {
-                await new Promise(resolve => setTimeout(resolve, 800));
-                continue;
-            }
-            // The captured stderr is the only in-band account of WHY this failed — a TCC denial, a
-            // missing target process, a script error. Reporting the id alone leaves an operator with
-            // a confident line and no cause, which is harder to notice than silence. Carried on the
-            // record too: a receiver under launchd writes stdout where nobody reads it.
-            effects.log.error?.(`[Wake Receiver] osascript failed for ${subscriptionId}: ${message}`);
-            return {outcome: 'failed', outcomeReason: message};
+/**
+ * @summary Delivers the osascript payload exactly once, then reports what actually happened.
+ *
+ * There is deliberately no retry. A retry is not a safety net here — it is a cause of the
+ * stranded-payload failure it was meant to prevent: the script pastes into the prompt field and
+ * only afterwards reaches steps that can abort, so a retried attempt can leave attempt N's text
+ * sitting in the field while attempt N+1 aborts at an earlier guard. The human-visible result is
+ * "the message is in my prompt but nothing happened", with no error to explain it.
+ *
+ * The guards that gate *typing* are unchanged and remain load-bearing — they are what stops a
+ * wake being pasted into a different seat's window. What is removed is the post-paste retry
+ * machinery: once a keystroke has landed in the target's text field, that keystroke is the
+ * confirmation, and a frontmost race inside the sub-second gap between paste and submit is not
+ * worth the damage this caused on every ordinary message.
+ *
+ * One classification is deliberately kept. A failure raised at a *post-submit* guard (the
+ * user-input restore path) still counts as `delivered`, because `key code 36` has already fired
+ * and the wake was in fact submitted — reporting that as a failure would hide real deliveries.
+ * Everything else that throws is `failed` and carries the reason.
+ *
+ * @param {Object} effects Injected effect surface (`spawnAsync`, `log`).
+ * @param {String[]} args `osascript` argv.
+ * @param {String} subscriptionId Subscription id, for the failure log line.
+ * @returns {Promise<String|{outcome: String, outcomeReason: String}>} `delivered`, or a failure with its reason.
+ * @private
+ */
+async function spawnOsascriptOnce(effects, args, subscriptionId) {
+    try {
+        await effects.spawnAsync('osascript', args);
+        return 'delivered'
+    } catch (error) {
+        // The captured stderr is the only in-band account of WHY this failed — a TCC denial, a
+        // missing target process, a script error. Reporting the id alone leaves an operator with
+        // a confident line and no cause, which is harder to notice than silence. Carried on the
+        // record too: a receiver under launchd writes stdout where nobody reads it.
+        const message = String(error.message || '');
+        if (/lost frontmost status|-2700/.test(message) && /user input restore/.test(message)) {
+            return 'delivered'
         }
+        effects.log.error?.(`[Wake Receiver] osascript failed for ${subscriptionId}: ${message}`);
+        return {outcome: 'failed', outcomeReason: message}
     }
-    return 'failed';
 }
 
 /**
