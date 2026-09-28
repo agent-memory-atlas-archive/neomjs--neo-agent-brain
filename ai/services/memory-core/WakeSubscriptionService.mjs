@@ -261,6 +261,17 @@ class WakeSubscriptionService extends Base {
     pumpBatchSize = 512
 
     /**
+     * @member {Number} pollDigestMaxPages=32
+     * Maximum GraphLog pages one `pollDigest` / `resync` call will walk. A work bound per CALL, not a
+     * range window: when it is reached the call returns the watermark it actually read, and the client
+     * continues from there on its next call, so nothing is dropped and no `boundedFrom` is reported.
+     * 32 pages of `pumpBatchSize` is ~16k rows per call — generous for a live seat, and bounded for a
+     * cold one replaying millions of rows since a stale watermark.
+     * @protected
+     */
+    pollDigestMaxPages = 32
+
+    /**
      * Evaluates recent GraphLog deltas and pushes matching events to active Shape A
      * (MCP notification) and Shape B (signed webhook) routes. Intended to be called by
      * mutation paths (e.g. MailboxService, PermissionService) for low-latency delivery.
@@ -1965,14 +1976,17 @@ class WakeSubscriptionService extends Base {
 
         const events = [];
 
-        // Paged, bounded, and never replayed from zero. This method is the shared path behind
-        // `resync` and `pollDigest`, both of which default `sinceLogId` to 0, so an unbounded read
-        // here is `SELECT ... WHERE log_id > 0` materialised whole: on this deployment that is
-        // 41,007,073 rows against a 3 GiB cgroup cap, which OOM-killed Memory Core twice in one
-        // morning (08:22, 11:10) and destroyed the evidence a seat needed to diagnose itself.
+        // Bounded per call, and never replayed from zero in one stretch. This is the shared path behind
+        // `resync` and `pollDigest`, both of which default `sinceLogId` to 0, so an unbounded read here
+        // is `SELECT ... WHERE log_id > 0` materialised whole — 41,007,073 rows against a 3 GiB cgroup
+        // cap, which OOM-killed Memory Core twice in one morning (08:22, 11:10) and destroyed the
+        // evidence a seat needed to diagnose itself.
         //
-        // The live pump already pages with `{limit, untilId}` against a snapshot head, so this
-        // mirrors that exact idiom rather than introducing a second one.
+        // The bound is on WORK PER CALL, not on the range: the walk stops at `pollDigestMaxPages` and
+        // returns the watermark it actually reached, so an offline client resumes from there on its next
+        // call. It is deliberately not a window — nothing is dropped, and no `boundedFrom` is reported.
+        // `match()` reconciles each candidate against current read state as it goes, so replaying from a
+        // stale watermark is semantically correct; only the cost of doing it in one call was wrong.
         const snapshotMaxLogId = typeof storage.getLatestLogId === 'function'
             ? storage.getLatestLogId()
             : null;
@@ -1980,25 +1994,27 @@ class WakeSubscriptionService extends Base {
 
         let cursor    = sinceLogId;
         let lastLogId = sinceLogId;
+        let pages     = 0;
 
-        while (cursor < head) {
+        while (pages < this.pollDigestMaxPages && cursor < head) {
             const delta = storage.getDeltaLog(cursor, {
                 limit  : this.pumpBatchSize,
                 untilId: snapshotMaxLogId
             });
-            const next = delta.lastLogId;
+            pages++;
+
+            if (Number.isFinite(delta.lastLogId)) lastLogId = delta.lastLogId;
 
             // Trigger evaluation walks the delta entities. SENT_TO_ME / PERMISSION_GRANTED examine
             // edges; generic nodes remain cache invalidation only. TASK_STATE_CHANGED consumes the
             // immutable typed-event rows returned separately by getDeltaLog().
-            // Filter spec is applied to the matched candidate's payload; non-matches are skipped.
             for (const edgeRef of delta.invalidEdges) {
-                const logId   = edgeRef.logId || delta.entityLogIds?.get(edgeRef.id) || next;
+                const logId   = edgeRef.logId || delta.entityLogIds?.get(edgeRef.id) || delta.lastLogId;
                 const matched = this._evaluateEdgeAgainstSubscription(edgeRef, subscription, logId);
                 if (matched) events.push(matched);
             }
             for (const nodeId of delta.invalidNodes) {
-                const logId   = delta.entityLogIds?.get(nodeId) || next;
+                const logId   = delta.entityLogIds?.get(nodeId) || delta.lastLogId;
                 const matched = this._evaluateNodeAgainstSubscription(nodeId, subscription, logId);
                 if (matched) events.push(matched);
             }
@@ -2007,17 +2023,20 @@ class WakeSubscriptionService extends Base {
                 if (matched) events.push(matched);
             }
 
-            if (Number.isFinite(next)) lastLogId = next;
+            // Pulses are read for THIS page's range, inside the loop. Reading them once over the whole
+            // range was the second unbounded read, and bounding that single read with
+            // `ORDER BY log_id ASC LIMIT ?` silently returned the OLDEST page — so on a long replay the
+            // only recent pulses, the ones a wake is about, were the ones dropped.
+            for (const pulseTrace of this._getHeartbeatPulseLogEntries(cursor, delta.lastLogId)) {
+                const matched = this._evaluateHeartbeatPulseAgainstSubscription(pulseTrace, subscription);
+                if (matched) events.push(matched);
+            }
 
-            // A page that did not advance the cursor would spin forever on the same rows. Stop
-            // instead, and report the cursor we actually reached.
-            if (!(next > cursor)) break;
-            cursor = next;
-        }
-
-        for (const pulseTrace of this._getHeartbeatPulseLogEntries(sinceLogId, lastLogId)) {
-            const matched = this._evaluateHeartbeatPulseAgainstSubscription(pulseTrace, subscription);
-            if (matched) events.push(matched);
+            // `hasMore` is the storage layer's own "this page was full" signal. The progress guard is
+            // independent of it: a cursor that cannot advance would otherwise spin on the same rows.
+            if (!delta.hasMore) break;
+            if (!(delta.lastLogId > cursor)) break;
+            cursor = delta.lastLogId;
         }
 
         return {events, lastLogId}
