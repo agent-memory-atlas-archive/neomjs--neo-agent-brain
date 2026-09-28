@@ -616,20 +616,7 @@ function buildDialogGateArgs({appName, instancePid}) {
         '-e', '    tell targetProcess',
         '-e', '      set focusedRole to missing value',
         '-e', '      try',
-        // `role of focused element of window 1` is NOT valid AppleScript — `focused element` is not a
-        // term, so the whole script fails to COMPILE with -2741 rather than raising inside the `try`.
-        // A compile error cannot be caught here, so the emitted script never ran at all, the
-        // `interactive dialog pending` branch below was unreachable, and the caller's message match
-        // missed a compile error — so the gate failed OPEN on every delivery and the guard it
-        // documents was inert. The focused element is read as the AX attribute instead.
-        // `role of focused element of window 1` is NOT valid AppleScript — `focused element` is not a
-        // term, so the whole script fails to COMPILE with -2741 rather than raising inside the `try`.
-        // A compile error cannot be caught here, so the emitted script never ran at all, the
-        // `interactive dialog pending` branch below was unreachable, and the caller's message match
-        // missed a compile error — so the gate failed OPEN on every delivery and the guard it
-        // documents was inert. The focused element is read as the AX attribute instead.
-        '-e', '        set focusedElement to value of attribute "AXFocusedUIElement" of window 1',
-        '-e', '        set focusedRole to role of focusedElement',
+        '-e', '        set focusedRole to role of focused element of window 1',
         '-e', '      end try',
         '-e', '      if focusedRole is not missing value and focusedRole is not in {"AXTextArea", "AXTextField"} then',
         '-e', '        error "interactive dialog pending at phase before input"',
