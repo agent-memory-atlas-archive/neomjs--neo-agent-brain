@@ -162,7 +162,14 @@ async function focusedRole(pid) {
         '  set focusedRole to missing value',
         '  tell targetProc',
         '    try',
-        '      set focusedRole to role of focused element of window 1',
+        // `role of focused element of window 1` is NOT valid AppleScript — `focused element` is not
+        // a term, so the script fails to COMPILE (-2741) and the `try` cannot catch it. This rig
+        // therefore always reported `(unreadable: …)`, which its own classifier reads as
+        // "never readable" — i.e. the instrument built to detect Electron AX role drift could never
+        // observe a role at all, and the drift it documents as surfacing here was untestable. The
+        // production gate carried the identical construct, so it failed open on every delivery.
+        '      set focusedElement to value of attribute "AXFocusedUIElement" of window 1',
+        '      set focusedRole to role of focusedElement',
         '    end try',
         '  end tell',
         'end tell',
