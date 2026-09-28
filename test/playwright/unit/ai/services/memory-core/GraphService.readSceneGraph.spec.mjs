@@ -13,12 +13,15 @@ setup({
     }
 });
 
-import {test, expect} from '@playwright/test';
-import Neo            from 'neo.mjs/src/Neo.mjs';
-import * as core      from 'neo.mjs/src/core/_export.mjs';
-import SQLite         from '../../../../../../ai/graph/storage/SQLite.mjs';
-import fs             from 'fs-extra';
-import path           from 'path';
+import {test, expect}                from '@playwright/test';
+import Neo                           from 'neo.mjs/src/Neo.mjs';
+import * as core                     from 'neo.mjs/src/core/_export.mjs';
+import SQLite                        from '../../../../../../ai/graph/storage/SQLite.mjs';
+import fs                            from 'fs-extra';
+import path                          from 'path';
+import Ajv                           from 'ajv';
+import * as yaml                     from 'js-yaml';
+import {createFleetGraphSceneSource} from '../../../../../../ai/services/fleet/fleetGraphSceneSource.mjs';
 
 /**
  * `GraphService.readSceneGraph` over a real SQLite store: the SQL RLS clause and the `isRlsVisible` recheck
@@ -145,6 +148,65 @@ test.describe('GraphService.readSceneGraph — the whole graph one viewer may se
 });
 
 test.describe('GraphService.readSceneGraph — paged across a large graph', () => {
+    test('the Fleet wire preserves two-origin attribution, unknown lists and RLS through projection', async () => {
+        const
+            GraphService                  = (await import('../../../../../../ai/services/memory-core/GraphService.mjs')).default,
+            {default: FleetControlBridge} = await import('../../../../../../ai/services/fleet/FleetControlBridge.mjs'),
+            originalDb                    = GraphService.db,
+            dbPath                        = path.resolve(process.cwd(), 'tmp', `graph-actors-${globalThis.crypto.randomUUID()}.sqlite`),
+            storage                       = Neo.create(SQLite, {dbPath});
+
+        try {
+            await storage.ready();
+            storage.RequestContextService = {getUserId: () => 'tenant-x'};
+            storage.addNodes([
+                node('neomjs/neo#issue-1', {author: 'alice', assignees: []}),
+                node('neomjs/brain#issue-1', {author: '@bob', assignees: ['bob', '@carol']}),
+                node('neomjs/neo#pr-2', {kind: 'PULL_REQUEST'}),
+                node('private-3', {userId: 'tenant-y', author: 'hidden-actor', assignees: ['hidden-assignee']}),
+                node('memory-1', {kind: 'AGENT_MEMORY', agentIdentity: '@alice', author: 'wrong-kind-author'}),
+                node('concept-1', {kind: 'CONCEPT', author: 'wrong-kind-concept'})
+            ]);
+            storage.addEdges([
+                edge('origins', 'neomjs/neo#issue-1', 'neomjs/brain#issue-1'),
+                edge('hidden', 'private-3', 'neomjs/neo#issue-1')
+            ]);
+            GraphService.db = {storage};
+            const wire = await GraphService.readSceneGraph();
+            expect([...wire.actors].sort()).toEqual(['@alice', '@bob', '@carol']);
+            const specification = yaml.load(await fs.readFile(path.resolve('ai/mcp/server/memory-core/openapi.yaml'), 'utf8'));
+            const validate      = new Ajv({strict: false}).compile(specification.paths['/graph/scene'].post.responses['200'].content['application/json'].schema);
+            expect(validate(wire), JSON.stringify(validate.errors)).toBe(true);
+            expect(validate({...wire, nodes: {...wire.nodes, assignedTo: [[-1]]}})).toBe(false);
+            const source = createFleetGraphSceneSource({
+                getGraphScene   : () => GraphService.readSceneGraph(),
+                getComputedRoute: async () => ({status: 'available', route: {route: {items: [{id: 'neomjs/brain#issue-1'}]}}})
+            });
+            const read = await FleetControlBridge.fleetGraphScene.call({graphSceneSource: source});
+            const byId = new Map(read.scene.nodes.map(row => [row.id, row]));
+            expect(byId.get('neomjs/neo#issue-1')).toMatchObject({authoredBy: '@alice', assignedTo: []});
+            expect(byId.get('neomjs/brain#issue-1')).toMatchObject({authoredBy: '@bob', assignedTo: ['@bob', '@carol']});
+            expect(byId.get('neomjs/neo#pr-2')).toMatchObject({authoredBy: null, assignedTo: null});
+            expect(byId.get('neomjs/neo#memory-1')).toMatchObject({memoryOf: '@alice'});
+            expect(byId.get('neomjs/neo#concept-1')).not.toHaveProperty('authoredBy');
+            expect(JSON.stringify(read)).not.toMatch(/hidden-|private-3|wrong-kind/);
+            expect(read.scene.edges).toEqual([{from: 'neomjs/neo#issue-1', to: 'neomjs/brain#issue-1', type: 'REL'}]);
+            expect(read.scene.route).toEqual(['neomjs/brain#issue-1']);
+            expect((await source.readGraphScene()).snapshotId).toBe(read.snapshotId);
+            const bounded = await GraphService.readSceneGraph({maxNodes: 1});
+            expect(bounded.nodes.ids).toEqual(['neomjs/brain#issue-1']);
+            expect([...bounded.actors].sort()).toEqual(['@bob', '@carol']);
+            storage.addNodes([node('neomjs/neo#issue-1', {author: 'dana', assignees: []})]);
+            const changed = await source.readGraphScene();
+            expect(changed.snapshotId).not.toBe(read.snapshotId);
+            expect(changed.scene.nodes.find(row => row.id === 'neomjs/brain#issue-1').authoredBy).toBe('@bob');
+        } finally {
+            GraphService.db = originalDb;
+            if (storage.db?.open) storage.db.close();
+            for (const suffix of ['', '-wal', '-shm']) fs.removeSync(dbPath + suffix);
+        }
+    });
+
     test('every page lands, and the plane runs other work between pages', async () => {
         const
             GraphService = (await import('../../../../../../ai/services/memory-core/GraphService.mjs')).default,

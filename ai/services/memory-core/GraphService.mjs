@@ -5,6 +5,7 @@ import Base                            from 'neo.mjs/src/core/Base.mjs';
 import CoreDatabase                    from '../../../ai/graph/Database.mjs';
 import SQLite                          from '../../../ai/graph/storage/SQLite.mjs';
 import { IDENTITIES }                  from '../../../ai/graph/identityRoots.mjs';
+import {normalizeAgentIdentityNodeId}  from '../../graph/normalizeAgentIdentityNodeId.mjs';
 import {createGraphBootSeedManifest}   from '../../../ai/graph/bootSeedManifest.mjs';
 import {createGraphBootSeedNodeRecord} from '../../../ai/graph/bootSeedManifest.mjs';
 import {getGraphBootSeedNodeSpec}      from '../../../ai/graph/bootSeedManifest.mjs';
@@ -1327,11 +1328,11 @@ class GraphService extends Base {
     }
 
     /**
-     * @summary The whole graph one viewer may see, in display fields only: the bulk read behind the
-     * Fleet cockpit's Observatory.
+     * @summary The whole graph visible to a viewer, with display fields and historical issue/PR and
+     * agent-memory attribution for the Fleet cockpit's Observatory.
      *
      * One pass per table under the SQL RLS clause of {@link GraphService#listNodeRecordsByType}, with the
-     * `isRlsVisible` recheck at the return boundary. A node carries its id, kind and label, never its
+     * `isRlsVisible` recheck at the return boundary. A node carries display fields and allowed attribution, never its
      * property bag. An edge counts only when both endpoints are visible, and parallel edges of one type
      * collapse to one. `counts.unlinked` names the answered nodes without an answered edge, which a view
      * drawn by relations may want to place apart.
@@ -1349,10 +1350,14 @@ class GraphService extends Base {
      *
      * Only the durable store enumerates the whole graph, so without it the read throws rather than
      * answer the process cache as the graph.
+     *
+     * Actor columns contain dictionary codes for authored/assigned issue and PR identities, and
+     * agent-memory identity only. A missing assignee list is null; an observed empty list is [].
+     * The dictionary is built after RLS and budget selection, so excluded rows contribute no actors.
      * @param {Object} [data]
      * @param {Number} [data.maxNodes=250000]
      * @param {Number} [data.maxEdges=500000]
-     * @returns {Promise<Object>} `{kinds, types, nodes: {ids, kinds, labels}, edges, counts, budget, truncated}`
+     * @returns {Promise<Object>} `{kinds, types, actors, nodes, edges, counts, budget, truncated}`.
      */
     async readSceneGraph({maxNodes = 250000, maxEdges = 500000} = {}) {
         const sqlite = this.db?.storage?.db;
@@ -1375,6 +1380,10 @@ class GraphService extends Base {
             links     = new Map(),
             degree    = new Map(),
             text      = value => typeof value === 'string' ? value : null,
+            actor     = value => {
+                const id = normalizeAgentIdentityNodeId(text(value)?.trim());
+                return id && id !== '@' ? id : null;
+            },
             // every page is a whole statement: an iterator held open across a yield would leave this shared
             // connection busy for every request that runs in between
             pages     = async (table, visit) => {
@@ -1389,7 +1398,19 @@ class GraphService extends Base {
 
         await pages('Nodes', node => {
             if (isRlsVisible(node, rlsUserId)) {
-                visible.set(node.id, {id: node.id, kind: text(node.label), label: text(node.properties?.name) ?? text(node.properties?.title)})
+                const properties = node.properties || {},
+                      kind       = text(node.label),
+                      work       = kind === 'ISSUE' || kind === 'PULL_REQUEST',
+                      assigned   = work && Array.isArray(properties.assignees) ? properties.assignees.map(actor) : null;
+
+                visible.set(node.id, {
+                    id        : node.id,
+                    kind,
+                    label     : text(properties.name) ?? text(properties.title),
+                    authoredBy: work ? actor(properties.author) : null,
+                    assignedTo: assigned?.every(Boolean) ? [...new Set(assigned)].sort() : null,
+                    memoryOf  : kind === 'AGENT_MEMORY' ? actor(properties.agentIdentity) : null
+                })
             }
         });
 
@@ -1431,6 +1452,7 @@ class GraphService extends Base {
             },
             kinds      = dictionary(),
             types      = dictionary(),
+            actors     = dictionary(),
             position   = new Map(nodes.map((node, index) => [node.id, index])),
             flat       = new Array(edges.length * 3),
             linked     = new Set();
@@ -1443,12 +1465,16 @@ class GraphService extends Base {
         });
 
         return {
-            kinds    : kinds.list,
-            types    : types.list,
-            nodes    : {
-                ids   : nodes.map(node => node.id),
-                kinds : nodes.map(node => kinds.code(node.kind)),
-                labels: nodes.map(node => node.label)
+            kinds : kinds.list,
+            types : types.list,
+            actors: actors.list,
+            nodes : {
+                ids       : nodes.map(node => node.id),
+                kinds     : nodes.map(node => kinds.code(node.kind)),
+                labels    : nodes.map(node => node.label),
+                authoredBy: nodes.map(node => node.authoredBy === null ? -1 : actors.code(node.authoredBy)),
+                assignedTo: nodes.map(node => node.assignedTo === null ? null : node.assignedTo.map(actors.code)),
+                memoryOf  : nodes.map(node => node.memoryOf === null ? -1 : actors.code(node.memoryOf))
             },
             edges    : flat,
             counts   : {nodes: nodes.length, edges: edges.length, unlinked: nodes.length - linked.size},
