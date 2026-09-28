@@ -368,7 +368,7 @@ export class ContainerHealthDiagnosisService extends Base {
             })] : []),
             ...this.collectRestartChurnFacts({serviceKey, churn, observedAt}),
             ...this.collectLifecycleFacts({serviceKey, inspect, observedAt, logs, nodeCommand, declaredHeapCeilingMb}),
-            ...this.collectStatsFacts({serviceKey, stats, statsSamples, observedAt, nodeCommand, inspect}),
+            ...this.collectStatsFacts({serviceKey, stats, statsSamples, observedAt, nodeCommand, inspect, runtimeContainerId}),
             ...this.collectEndpointProbeFacts({serviceKey, endpointProbe, observedAt}),
             ...this.collectConfigFacts({serviceKey, configCheck, observedAt}),
             ...this.collectEvalAttributionFacts({serviceKey, ollamaEvalAttribution, observedAt}),
@@ -609,13 +609,19 @@ export class ContainerHealthDiagnosisService extends Base {
     /**
      * Collects resource saturation facts from Docker stats data. CPU is read against the container's
      * quota (`HostConfig.NanoCpus`), and the quota's own throttling counters become a fact of their own.
+     * Inspect and stats are separate reads, and a recreate between them lands them on different
+     * containers, so both need the proved identity every sample shares, the gate the provider-residual
+     * path applies. Without it CPU keeps the per-core reading, and no throttling fact is claimed.
      * @param {Object} options
      * @param {Object|null} [options.inspect=null] Docker inspect payload, for the CPU quota.
+     * @param {String|null} [options.runtimeContainerId=null] Inspect/stats proof identity.
      * @returns {Object[]}
      */
-    collectStatsFacts({serviceKey, stats, statsSamples, observedAt, nodeCommand = null, inspect = null}) {
+    collectStatsFacts({serviceKey, stats, statsSamples, observedAt, nodeCommand = null, inspect = null, runtimeContainerId = null}) {
         const samples = normalizeStatsSamples({stats, statsSamples});
         if (samples.length < this.configValues.minResourceSamples) return [];
+
+        const proved = typeof runtimeContainerId === 'string' && samples.every(sample => sample.containerId === runtimeContainerId);
 
         const
             facts           = [],
@@ -628,7 +634,7 @@ export class ContainerHealthDiagnosisService extends Base {
                 : this.configValues.memorySaturationPercent,
             // Against the quota where one is set: a percent counts cores, so without it one busy core of
             // a four-CPU container reads as saturated and a one-CPU container at its cap reads as 100.
-            cpuQuota        = resolveCpuQuota(inspect),
+            cpuQuota        = proved ? resolveCpuQuota(inspect) : null,
             cpuPercents     = samples.map(calculateDockerCpuPercent).filter(Number.isFinite).map(percent => cpuQuota ? percent / cpuQuota : percent),
             // A Node service's memory saturation is measured against its own heap, never against the
             // container. `heapScope` decides which numerator is legitimate for this service and
@@ -696,10 +702,11 @@ export class ContainerHealthDiagnosisService extends Base {
         // The quota's own verdict. A throttled period is one in which the service wanted CPU and the
         // scheduler refused it, so the ratio needs no threshold on a percent and no cgroup read: Docker
         // reports the counters in every sample. Non-authoritative, like restart churn: it records what
-        // the service is being denied and licenses no action (the classifier's last branch).
+        // the service is being denied and licenses no action (the classifier's last branch). Only a
+        // proved quota makes it "starved at its quota".
         const throttling = summarizeCpuThrottling(samples);
 
-        if (throttling.measured && throttling.observedWindowMs >= minWindowMs && throttling.ratio >= this.configValues.cpuThrottledRatio) {
+        if (cpuQuota && throttling.measured && throttling.observedWindowMs >= minWindowMs && throttling.ratio >= this.configValues.cpuThrottledRatio) {
             facts.push(this.createFact({
                 type         : CONTAINER_HEALTH_FACT_TYPES.cpuThrottling,
                 serviceKey,

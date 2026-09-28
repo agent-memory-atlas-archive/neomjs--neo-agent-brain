@@ -75,7 +75,7 @@ const RUNTIME_ACCESS_CONFIG_PATHS = [
 let restoreBridgeConfig,
     restoreRuntimeAccessConfig;
 
-function statsSample({cpuPercent = 0, memoryPercent = 0} = {}) {
+function statsSample({cpuPercent = 0, memoryPercent = 0, throttling = null} = {}) {
     const systemDelta = 1_000_000_000,
           cpuDelta    = (cpuPercent / 100) * systemDelta / 4,
           memoryLimit = 1000;
@@ -87,7 +87,9 @@ function statsSample({cpuPercent = 0, memoryPercent = 0} = {}) {
             cpu_usage       : {
                 total_usage : cpuDelta,
                 percpu_usage: [cpuDelta / 4, cpuDelta / 4, cpuDelta / 4, cpuDelta / 4]
-            }
+            },
+            // Docker's cumulative quota counters: `[periods, throttled_periods, throttled_time_ns]`
+            ...(throttling ? {throttling_data: {periods: throttling[0], throttled_periods: throttling[1], throttled_time: throttling[2]}} : {})
         },
         precpu_stats: {
             system_cpu_usage: 0,
@@ -1268,6 +1270,33 @@ test.describe('Neo.ai.daemons.services.DeploymentStateBridgeService', () => {
         expect(service.getStatsSamples('local-model')).toEqual([
             expect.objectContaining({containerId: 'container-B', observedAtMs: OBSERVED_AT})
         ]);
+    });
+
+    test('the CPU quota and the throttling window speak only for the container that inspect and stats both proved', async () => {
+        Object.assign(AiConfig.orchestrator.deploymentStateBridge, {allowedServices: ['mc-server'], includeLogs: false});
+
+        const throttlingOf = async (inspectId, statsId) => {
+            const
+                runtimeAccessService = {
+                    async readObserve({operation}) {
+                        return operation === 'inspect'
+                            ? {data: {State: {Status: 'running'}, HostConfig: {NanoCpus: 1e9}}, proof: {operation, target: {containerId: inspectId}}}
+                            : {data: statsSample({cpuPercent: 79, throttling: [20124, 11070, 0]}), proof: {operation, target: {containerId: statsId}}};
+                    }
+                },
+                diagnosisService = Neo.create(ContainerHealthDiagnosisService, {nowFn: () => OBSERVED_AT}),
+                service          = createService({runtimeAccessService, diagnosisService, nowFn: () => OBSERVED_AT});
+
+            // the window's first sample, from the container the inspect names
+            service.rememberStatsSample('mc-server', statsSample({cpuPercent: 79, throttling: [1000, 400, 0]}), OBSERVED_AT - 30_000, null, inspectId);
+
+            const snapshot = await service.collectSnapshot({generatedAt: OBSERVED_AT});
+
+            return snapshot.services.find(entry => entry.serviceKey === 'mc-server').diagnosis.facts.find(fact => fact.type === 'cpu-throttling') ?? null
+        };
+
+        expect((await throttlingOf('mc-A', 'mc-A'))?.details, 'one proved container: the fact, against its quota').toMatchObject({quotaCpus: 1, throttledPeriods: 10670, periods: 19124});
+        expect(await throttlingOf('mc-A', 'mc-B'), 'stats of B never speak under the inspect of A').toBeNull()
     });
 
     test('publishes an unavailable provider-work envelope instead of manufacturing idle', async () => {

@@ -2319,9 +2319,11 @@ test.describe('ContainerHealthDiagnosisService — CPU quota and throttling', ()
     const
         ONE_CPU   = {...runningInspect(), HostConfig: {NanoCpus: 1e9}},
         FOUR_CPU  = {...runningInspect(), HostConfig: {NanoCpus: 4e9}},
-        throttled = (from, to, {cpuPercent = 79} = {}) => [
-            statsSample({cpuPercent, observedAtMs: 1_000_000, throttling: from}),
-            statsSample({cpuPercent, observedAtMs: 1_030_000, throttling: to})
+        // the bridge's proof: inspect and stats resolved to one container, which every sample carries
+        PROVED    = {runtimeContainerId: 'c1'},
+        throttled = (from, to, {cpuPercent = 79, containerId = 'c1'} = {}) => [
+            statsSample({cpuPercent, observedAtMs: 1_000_000, throttling: from, containerId}),
+            statsSample({cpuPercent, observedAtMs: 1_030_000, throttling: to, containerId})
         ];
 
     test('summarizeCpuThrottling reads the throttled share of periods across the window, and the throttled time in ms', () => {
@@ -2349,6 +2351,7 @@ test.describe('ContainerHealthDiagnosisService — CPU quota and throttling', ()
 
     test('mc-server throttled in 56% of its periods at a 79% sampled CPU is diagnosed and RECORDED, never restarted', () => {
         const decision = createService().diagnose({
+            ...PROVED,
             serviceKey  : 'mc-server',
             nodeCommand : false,
             inspect     : ONE_CPU,
@@ -2369,18 +2372,19 @@ test.describe('ContainerHealthDiagnosisService — CPU quota and throttling', ()
     });
 
     test('below the declared ratio, or over a window shorter than the CPU clock, there is no fact', () => {
-        const light = createService().diagnose({serviceKey: 'mc-server', nodeCommand: false, inspect: ONE_CPU, statsSamples: throttled([0, 0, 0], [10000, 1000, 0])});
+        const light = createService().diagnose({...PROVED, serviceKey: 'mc-server', nodeCommand: false, inspect: ONE_CPU, statsSamples: throttled([0, 0, 0], [10000, 1000, 0])});
 
         expect(light.facts).toHaveLength(0);
         expect(light.status).toBe('healthy');
 
         const brief = createService().diagnose({
+            ...PROVED,
             serviceKey  : 'mc-server',
             nodeCommand : false,
             inspect     : ONE_CPU,
             statsSamples: [
-                statsSample({cpuPercent: 79, observedAtMs: 1_000_000, throttling: [0, 0, 0]}),
-                statsSample({cpuPercent: 79, observedAtMs: 1_005_000, throttling: [50, 40, 0]})
+                statsSample({cpuPercent: 79, observedAtMs: 1_000_000, throttling: [0, 0, 0], containerId: 'c1'}),
+                statsSample({cpuPercent: 79, observedAtMs: 1_005_000, throttling: [50, 40, 0], containerId: 'c1'})
             ]
         });
 
@@ -2389,11 +2393,13 @@ test.describe('ContainerHealthDiagnosisService — CPU quota and throttling', ()
 
     test('an actionable diagnosis keeps its route: throttling is the classifier\'s last word, never its first', () => {
         const decision = createService({cpuSaturationPercent: 90, memorySaturationPercent: 80}).diagnose({
+            ...PROVED,
             serviceKey  : 'model',
             nodeCommand : false,
+            inspect     : FOUR_CPU,
             statsSamples: [
-                statsSample({cpuPercent: 380, memoryPercent: 85, observedAtMs: 1_000_000, throttling: [0, 0, 0]}),
-                statsSample({cpuPercent: 360, memoryPercent: 82, observedAtMs: 1_030_000, throttling: [300, 200, 0]})
+                statsSample({cpuPercent: 380, memoryPercent: 85, observedAtMs: 1_000_000, throttling: [0, 0, 0], containerId: 'c1'}),
+                statsSample({cpuPercent: 360, memoryPercent: 82, observedAtMs: 1_030_000, throttling: [300, 200, 0], containerId: 'c1'})
             ]
         });
 
@@ -2403,11 +2409,31 @@ test.describe('ContainerHealthDiagnosisService — CPU quota and throttling', ()
 
     test('CPU saturation is read against the quota: one and a half busy cores of four is not saturation, and no quota keeps the per-core reading', () => {
         const
-            samples  = () => [statsSample({cpuPercent: 150, observedAtMs: 1_000_000}), statsSample({cpuPercent: 150, observedAtMs: 1_030_000})],
-            quota    = createService().diagnose({serviceKey: 'model', nodeCommand: false, inspect: FOUR_CPU, statsSamples: samples()}),
-            unquoted = createService().diagnose({serviceKey: 'model', nodeCommand: false, statsSamples: samples()});
+            samples  = () => [statsSample({cpuPercent: 150, observedAtMs: 1_000_000, containerId: 'c1'}), statsSample({cpuPercent: 150, observedAtMs: 1_030_000, containerId: 'c1'})],
+            quota    = createService().diagnose({...PROVED, serviceKey: 'model', nodeCommand: false, inspect: FOUR_CPU, statsSamples: samples()}),
+            unquoted = createService().diagnose({...PROVED, serviceKey: 'model', nodeCommand: false, statsSamples: samples()});
 
         expect(quota.facts.some(item => item.type === CONTAINER_HEALTH_FACT_TYPES.resourceSaturation)).toBe(false);
         expect(unquoted.facts.find(item => item.type === CONTAINER_HEALTH_FACT_TYPES.resourceSaturation)?.details).toMatchObject({quotaCpus: null, minPercent: 150})
+    });
+
+    test('an unproved identity lends no quota and forms no throttling window: no quota, a mismatched proof or a sample from another container', () => {
+        const
+            diagnose  = options => createService().diagnose({serviceKey: 'mc-server', nodeCommand: false, inspect: ONE_CPU, ...options}),
+            throttles = decision => decision.facts.some(item => item.type === CONTAINER_HEALTH_FACT_TYPES.cpuThrottling),
+            starved   = [[1000, 400, 0], [20124, 11070, 0]];
+
+        expect(throttles(diagnose({...PROVED, statsSamples: throttled(...starved)})), 'the positive control').toBe(true);
+        expect(throttles(diagnose({...PROVED, inspect: runningInspect(), statsSamples: throttled(...starved)})), 'no declared quota').toBe(false);
+        expect(throttles(diagnose({statsSamples: throttled(...starved, {containerId: null})})), 'the bridge proved no identity').toBe(false);
+        expect(throttles(diagnose({...PROVED, statsSamples: [
+            statsSample({cpuPercent: 79, observedAtMs: 1_000_000, throttling: starved[0], containerId: 'c0'}),
+            statsSample({cpuPercent: 79, observedAtMs: 1_030_000, throttling: starved[1], containerId: 'c1'})
+        ]})), 'a window spanning two containers').toBe(false);
+
+        const unproved = diagnose({statsSamples: throttled(...starved, {cpuPercent: 150, containerId: null})});
+
+        expect(unproved.facts.find(item => item.type === CONTAINER_HEALTH_FACT_TYPES.resourceSaturation)?.details, 'CPU keeps the per-core reading')
+            .toMatchObject({quotaCpus: null, minPercent: 150})
     });
 });
