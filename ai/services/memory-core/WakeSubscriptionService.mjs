@@ -1881,6 +1881,58 @@ class WakeSubscriptionService extends Base {
     }
 
     /**
+     * @summary The current unread SENT_TO_ME set for a subscription's owner — the answer to a
+     * WATERMARK-LESS poll, derived from state rather than from log history.
+     *
+     * Enumerates the owner's inbound `SENT_TO` edges through the edge store's target index and hands
+     * each to {@link WakeSubscriptionService#_evaluateEdgeAgainstSubscription}, so the unread gate
+     * stays the shared `match()` predicate this service and the standalone daemon already share. The
+     * index is used rather than a mailbox query so the delivery-shape logic is not re-implemented
+     * here: a second copy of "what counts as unread for this recipient" is how the two shapes
+     * (per-recipient `DELIVERED_TO` edge vs `readAt` on the MESSAGE) drifted before.
+     *
+     * Every surfaced message is anchored at the snapshot head, because from current state there is
+     * no per-message log position that means anything to a caller holding no watermark.
+     *
+     * @param {Object} subscription The cached WAKE_SUBSCRIPTION entry (id + properties).
+     * @returns {Object[]} Wake-event payloads for the owner's currently-unread messages.
+     * @protected
+     */
+    _collectCurrentUnreadEvents(subscription) {
+        const identity = subscription?.agentIdentity;
+        const node     = identity ? GraphService.db?.nodes?.get(identity) : null;
+
+        // No identity node means no addressable inbox, and an empty answer is the honest reading —
+        // never a guess at a route.
+        if (!node) return [];
+
+        const inbound = GraphService.db.edges.getByIndex('target', node.id) || [];
+        const head    = this._getSnapshotHead();
+        const events  = [];
+
+        for (const edge of inbound) {
+            if (edge?.type !== 'SENT_TO') continue;
+
+            const matched = this._evaluateEdgeAgainstSubscription({id: edge.id}, subscription, head);
+            if (matched) events.push(matched);
+        }
+
+        return events;
+    }
+
+    /**
+     * @summary The current GraphLog head, used as the watermark a no-walk poll reports.
+     * @returns {Number} The highest committed log id, or 0 when no log is reachable.
+     * @protected
+     */
+    _getSnapshotHead() {
+        const storage = GraphService.db?.storage;
+        const head    = typeof storage?.getLatestLogId === 'function' ? storage.getLatestLogId() : null;
+
+        return Number.isFinite(head) ? head : 0;
+    }
+
+    /**
      * @summary Derives the caller's wake digest AT READ TIME — the pull half of wake delivery
      * for clients without host-reachable listeners.
      *
@@ -1926,7 +1978,22 @@ class WakeSubscriptionService extends Base {
             logger.warn(`[WakeSubscription] lastPollAt stamp failed for ${subscriptionId}: ${error?.message ?? error}`);
         }
 
-        const {events, lastLogId} = this._collectSubscriptionEvents(subscription, sinceLogId);
+        // A WATERMARK-LESS poll walks no log. `sinceLogId` defaults to 0, and 0 is the "I have no
+        // watermark" answer, not "give me rows 1..N": walking from 0 over a long-lived log reads
+        // history whose rows are almost all already read, so the shared unread gate in `match()`
+        // yields NOTHING for the work — and a bounded walk makes that worse rather than better, by
+        // returning a watermark a caller must grind forward over thousands of calls before a
+        // message sent a minute ago is reachable. So the no-watermark case answers from CURRENT
+        // state and reports the snapshot head; the delta walk is for watermarked callers only.
+        //
+        // The consequence is deliberate and not a gap: `TASK_STATE_CHANGED` is an immutable
+        // transition fact with no current state to re-derive, so a no-walk poll cannot report one.
+        // The first call establishes the watermark at head, and every later watermarked poll carries
+        // the transitions. The message half — the half that HAS read state — is exactly the half that
+        // can be answered from state, which is why this is the right seam to split on.
+        const {events, lastLogId} = sinceLogId
+            ? this._collectSubscriptionEvents(subscription, sinceLogId)
+            : {events: this._collectCurrentUnreadEvents(subscription), lastLogId: this._getSnapshotHead()};
 
         const messages = [], tasks = [], permissions = [], heartbeats = [];
 
