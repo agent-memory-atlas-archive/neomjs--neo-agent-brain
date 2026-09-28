@@ -1662,11 +1662,11 @@ test.describe('Neo.ai.services.memory-core.WakeSubscriptionService', () => {
         });
     });
 
-      // ---- #561 falsifiers: the walk must be bounded, and must not drop the recent end ----
+      // ---- walk-bound falsifiers: the walk must be bounded, and must not drop the recent end ----
       // Each arm is written to FAIL when its bound is removed. No other test here seeds a GraphLog
       // larger than one page, which is exactly why the unbounded reads survived a green suite.
 
-      test('(a) a watermark-less poll walks a BOUNDED number of pages and still answers (#561)', async () => {
+      test('(a) a watermark-less poll walks a BOUNDED number of pages and still answers', async () => {
           const {subscriptionId} = insertDurableSubscription({
               trigger      : 'TASK_STATE_CHANGED',
               harnessTarget: 'mcp-notifications'
@@ -1735,7 +1735,7 @@ test.describe('Neo.ai.services.memory-core.WakeSubscriptionService', () => {
           expect(result.pending).toBeGreaterThan(0);
       });
 
-      test('(b) a delta larger than the page budget returns a CONTINUING watermark, not the head (#561)', async () => {
+      test('(b) a delta larger than the page budget returns a CONTINUING watermark, not the head', async () => {
           const {subscriptionId} = insertDurableSubscription({
               trigger      : 'TASK_STATE_CHANGED',
               harnessTarget: 'mcp-notifications'
@@ -1803,7 +1803,7 @@ test.describe('Neo.ai.services.memory-core.WakeSubscriptionService', () => {
           expect(total).toBe(24);
       });
 
-      test('(c) a heartbeat pulse past the first page of a range is not dropped (#561)', async () => {
+      test('(c) a heartbeat pulse past the first page of a range is not dropped', async () => {
           const {subscriptionId} = insertDurableSubscription({
               trigger      : 'TASK_STATE_CHANGED',
               harnessTarget: 'mcp-notifications'
