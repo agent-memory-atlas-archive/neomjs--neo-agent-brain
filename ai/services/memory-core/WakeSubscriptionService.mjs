@@ -1963,33 +1963,64 @@ class WakeSubscriptionService extends Base {
             return {events: [], lastLogId: sinceLogId};
         }
 
-        const delta  = storage.getDeltaLog(sinceLogId);
         const events = [];
 
-        // Trigger evaluation walks the delta entities. SENT_TO_ME / PERMISSION_GRANTED examine
-        // edges; generic nodes remain cache invalidation only. TASK_STATE_CHANGED consumes the
-        // immutable typed-event rows returned separately by getDeltaLog().
-        // Filter spec is applied to the matched candidate's payload; non-matches are skipped.
-        for (const edgeRef of delta.invalidEdges) {
-            const logId   = edgeRef.logId || delta.entityLogIds?.get(edgeRef.id) || delta.lastLogId;
-            const matched = this._evaluateEdgeAgainstSubscription(edgeRef, subscription, logId);
-            if (matched) events.push(matched);
+        // Paged, bounded, and never replayed from zero. This method is the shared path behind
+        // `resync` and `pollDigest`, both of which default `sinceLogId` to 0, so an unbounded read
+        // here is `SELECT ... WHERE log_id > 0` materialised whole: on this deployment that is
+        // 41,007,073 rows against a 3 GiB cgroup cap, which OOM-killed Memory Core twice in one
+        // morning (08:22, 11:10) and destroyed the evidence a seat needed to diagnose itself.
+        //
+        // The live pump already pages with `{limit, untilId}` against a snapshot head, so this
+        // mirrors that exact idiom rather than introducing a second one.
+        const snapshotMaxLogId = typeof storage.getLatestLogId === 'function'
+            ? storage.getLatestLogId()
+            : null;
+        const head = Number.isFinite(snapshotMaxLogId) ? snapshotMaxLogId : Number.MAX_SAFE_INTEGER;
+
+        let cursor    = sinceLogId;
+        let lastLogId = sinceLogId;
+
+        while (cursor < head) {
+            const delta = storage.getDeltaLog(cursor, {
+                limit  : this.pumpBatchSize,
+                untilId: snapshotMaxLogId
+            });
+            const next = delta.lastLogId;
+
+            // Trigger evaluation walks the delta entities. SENT_TO_ME / PERMISSION_GRANTED examine
+            // edges; generic nodes remain cache invalidation only. TASK_STATE_CHANGED consumes the
+            // immutable typed-event rows returned separately by getDeltaLog().
+            // Filter spec is applied to the matched candidate's payload; non-matches are skipped.
+            for (const edgeRef of delta.invalidEdges) {
+                const logId   = edgeRef.logId || delta.entityLogIds?.get(edgeRef.id) || next;
+                const matched = this._evaluateEdgeAgainstSubscription(edgeRef, subscription, logId);
+                if (matched) events.push(matched);
+            }
+            for (const nodeId of delta.invalidNodes) {
+                const logId   = delta.entityLogIds?.get(nodeId) || next;
+                const matched = this._evaluateNodeAgainstSubscription(nodeId, subscription, logId);
+                if (matched) events.push(matched);
+            }
+            for (const trace of delta.events || []) {
+                const matched = this._evaluateTypedEventAgainstSubscription(trace, subscription);
+                if (matched) events.push(matched);
+            }
+
+            if (Number.isFinite(next)) lastLogId = next;
+
+            // A page that did not advance the cursor would spin forever on the same rows. Stop
+            // instead, and report the cursor we actually reached.
+            if (!(next > cursor)) break;
+            cursor = next;
         }
-        for (const nodeId of delta.invalidNodes) {
-            const logId   = delta.entityLogIds?.get(nodeId) || delta.lastLogId;
-            const matched = this._evaluateNodeAgainstSubscription(nodeId, subscription, logId);
-            if (matched) events.push(matched);
-        }
-        for (const trace of delta.events || []) {
-            const matched = this._evaluateTypedEventAgainstSubscription(trace, subscription);
-            if (matched) events.push(matched);
-        }
-        for (const pulseTrace of this._getHeartbeatPulseLogEntries(sinceLogId)) {
+
+        for (const pulseTrace of this._getHeartbeatPulseLogEntries(sinceLogId, lastLogId)) {
             const matched = this._evaluateHeartbeatPulseAgainstSubscription(pulseTrace, subscription);
             if (matched) events.push(matched);
         }
 
-        return {events, lastLogId: delta.lastLogId}
+        return {events, lastLogId}
     }
 
     /**
@@ -2007,12 +2038,17 @@ class WakeSubscriptionService extends Base {
     }
 
     /**
-     * Reads heartbeat pulse GraphLog rows after a cursor.
+     * Reads heartbeat pulse GraphLog rows in `(sinceLogId, untilLogId]`.
+     *
+     * Bounded on both ends. This runs once per `pollDigest` / `resync` call, and both default
+     * `sinceLogId` to 0 — so the previous unbounded `.all()` over `log_id > 0` read every
+     * heartbeat pulse row ever written, the same 41M-row class of read as the delta walk above.
      * @protected
-     * @param {Number} sinceLogId Client watermark.
+     * @param {Number} sinceLogId Client watermark (exclusive lower bound).
+     * @param {Number} [untilLogId] Page head reached by the delta walk (exclusive upper bound).
      * @returns {Object[]} GraphLog heartbeat pulse rows.
      */
-    _getHeartbeatPulseLogEntries(sinceLogId) {
+    _getHeartbeatPulseLogEntries(sinceLogId, untilLogId = Number.MAX_SAFE_INTEGER) {
         const sqlite = GraphService.db?.storage?.db;
         if (!sqlite?.prepare) return [];
 
@@ -2020,9 +2056,11 @@ class WakeSubscriptionService extends Base {
             SELECT log_id, entity_id, entity_type
             FROM GraphLog
             WHERE log_id > ?
+              AND log_id <= ?
               AND entity_type = ?
             ORDER BY log_id ASC
-        `).all(sinceLogId, this.heartbeatPulseEntityType);
+            LIMIT ?
+        `).all(sinceLogId, untilLogId, this.heartbeatPulseEntityType, this.pumpBatchSize);
     }
 
     /**
