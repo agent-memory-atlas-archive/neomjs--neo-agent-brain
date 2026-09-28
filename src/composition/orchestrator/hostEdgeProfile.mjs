@@ -15,13 +15,13 @@
  * portable: launchd supervises, this module declares, and the two cannot drift because the plist no
  * longer restates what it supervises.
  *
- * **Deployment inputs, not config policy.** It keeps provider/tenant choices, network
- * placement, and privileged capabilities as deployment inputs rather than leaves. That boundary is
- * ADR 0019 [not-ticket-ref: §10.8, the Accepted decision this module implements]. This module is a
- * producer of those inputs — the same class of artifact as a Compose `environment:` block or the
- * plist's `EnvironmentVariables` dict, expressed portably. It therefore declares NO provider or
- * model selection: the local overlay's LM Studio host/model pinning is THIS machine's choice and
- * stays in the LaunchAgent, where a change to it stays a reviewed change.
+ * **Deployment inputs, not config policy.** The deployment boundary keeps provider/tenant choices,
+ * network placement, and privileged capabilities as deployment inputs rather than leaves. That
+ * boundary is ADR 0019 [not-ticket-ref: decision-record authority] §10.8, the Accepted decision this
+ * module implements. This module is a producer of those inputs — the same class of artifact as a
+ * Compose `environment:` block or the plist's `EnvironmentVariables` dict, expressed portably. It
+ * therefore declares NO provider or model selection: the local overlay's LM Studio host/model pinning
+ * is THIS machine's choice and stays in the LaunchAgent, where a change to it stays a reviewed change.
  *
  * One env-fragment function is the product profile, consumed identically by the real boot and by
  * its proof. Product harness launch behavior belongs to Agent Institution.
@@ -79,9 +79,10 @@ export function resolveHostEdgeStateDir({homeDir = os.homedir(), platform = proc
  *    but an unstated flag leaves the operator reading a config default that the filter silently
  *    overrides; stating the closure makes the elected lane set legible in one place.
  *
- * The host edge elects two lanes: LM Studio supervision — ADR 0019 [not-ticket-ref: §10.7 elects it] —
- * and the Neural Link bridge, the loopback WebSocket hub every seat's MCP server and the cockpit
- * dial on one port. A contributor without LM Studio installed sets
+ * The host edge elects two lanes: LM Studio supervision, which
+ * ADR 0019 [not-ticket-ref: decision-record authority] §10.7 elects, and the Neural Link bridge, the
+ * loopback WebSocket hub every seat's MCP server and the cockpit dial on one port. A contributor
+ * without LM Studio installed sets
  * `NEO_ORCHESTRATOR_LMS_ENABLED=false`, one who runs a bridge by hand sets
  * `NEO_ORCHESTRATOR_NL_BRIDGE_ENABLED=false` — every key here yields to an explicit environment
  * value, so each is a one-variable opt-out with no fork of this profile.
