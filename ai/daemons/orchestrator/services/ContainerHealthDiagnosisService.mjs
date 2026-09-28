@@ -128,6 +128,10 @@ export function isStoreBackedService(serviceKey) {
 
 export const DEFAULT_CONTAINER_HEALTH_DIAGNOSIS_CONFIG = Object.freeze({
     cpuSaturationPercent   : 90,
+    // The share of CPU scheduling periods in which the container exhausted its quota. A service that
+    // hits its cap in bursts averages below `cpuSaturationPercent` while waiting on the scheduler in a
+    // quarter of all periods, which a sampled percent cannot show and throttling counters state directly.
+    cpuThrottledRatio      : 0.25,
     memorySaturationPercent: 90,
     // Stores cross their ceiling by GROWING, monotonically and predictably, so the transient
     // threshold is late for them: at sustained 90% the remaining headroom is smaller than one
@@ -364,7 +368,7 @@ export class ContainerHealthDiagnosisService extends Base {
             })] : []),
             ...this.collectRestartChurnFacts({serviceKey, churn, observedAt}),
             ...this.collectLifecycleFacts({serviceKey, inspect, observedAt, logs, nodeCommand, declaredHeapCeilingMb}),
-            ...this.collectStatsFacts({serviceKey, stats, statsSamples, observedAt, nodeCommand}),
+            ...this.collectStatsFacts({serviceKey, stats, statsSamples, observedAt, nodeCommand, inspect, runtimeContainerId}),
             ...this.collectEndpointProbeFacts({serviceKey, endpointProbe, observedAt}),
             ...this.collectConfigFacts({serviceKey, configCheck, observedAt}),
             ...this.collectEvalAttributionFacts({serviceKey, ollamaEvalAttribution, observedAt}),
@@ -603,13 +607,21 @@ export class ContainerHealthDiagnosisService extends Base {
     }
 
     /**
-     * Collects resource saturation facts from Docker stats data.
+     * Collects resource saturation facts from Docker stats data. CPU is read against the container's
+     * quota (`HostConfig.NanoCpus`), and the quota's own throttling counters become a fact of their own.
+     * Inspect and stats are separate reads, and a recreate between them lands them on different
+     * containers, so both need the proved identity every sample shares, the gate the provider-residual
+     * path applies. Without it CPU keeps the per-core reading, and no throttling fact is claimed.
      * @param {Object} options
+     * @param {Object|null} [options.inspect=null] Docker inspect payload, for the CPU quota.
+     * @param {String|null} [options.runtimeContainerId=null] Inspect/stats proof identity.
      * @returns {Object[]}
      */
-    collectStatsFacts({serviceKey, stats, statsSamples, observedAt, nodeCommand = null}) {
+    collectStatsFacts({serviceKey, stats, statsSamples, observedAt, nodeCommand = null, inspect = null, runtimeContainerId = null}) {
         const samples = normalizeStatsSamples({stats, statsSamples});
         if (samples.length < this.configValues.minResourceSamples) return [];
+
+        const proved = typeof runtimeContainerId === 'string' && samples.every(sample => sample.containerId === runtimeContainerId);
 
         const
             facts           = [],
@@ -620,7 +632,10 @@ export class ContainerHealthDiagnosisService extends Base {
             memoryThreshold = serviceClassification.serviceClass === SERVICE_CLASSES.store
                 ? this.configValues.storeMemorySaturationPercent
                 : this.configValues.memorySaturationPercent,
-            cpuPercents     = samples.map(calculateDockerCpuPercent).filter(Number.isFinite),
+            // Against the quota where one is set: a percent counts cores, so without it one busy core of
+            // a four-CPU container reads as saturated and a one-CPU container at its cap reads as 100.
+            cpuQuota        = proved ? resolveCpuQuota(inspect) : null,
+            cpuPercents     = samples.map(calculateDockerCpuPercent).filter(Number.isFinite).map(percent => cpuQuota ? percent / cpuQuota : percent),
             // A Node service's memory saturation is measured against its own heap, never against the
             // container. `heapScope` decides which numerator is legitimate for this service and
             // whether one is available at all; see `resolveMemorySaturationScope`.
@@ -670,6 +685,7 @@ export class ContainerHealthDiagnosisService extends Base {
                     scope                   : cpuScope.scope,
                     subjectUnavailableReason: cpuScope.reason,
                     threshold               : this.configValues.cpuSaturationPercent,
+                    quotaCpus               : cpuQuota,
                     sampleCount             : samples.length,
                     // The window as MEASURED, beside the minimum enforced. Reporting only the
                     // configured value put an unobserved claim inside the evidence a heal decision
@@ -679,6 +695,34 @@ export class ContainerHealthDiagnosisService extends Base {
                     minPercent      : cpuWindow.min,
                     maxPercent      : cpuWindow.max,
                     meanPercent     : cpuWindow.mean
+                }
+            }));
+        }
+
+        // The quota's own verdict. A throttled period is one in which the service wanted CPU and the
+        // scheduler refused it, so the ratio needs no threshold on a percent and no cgroup read: Docker
+        // reports the counters in every sample. Non-authoritative, like restart churn: it records what
+        // the service is being denied and licenses no action (the classifier's last branch). Only a
+        // proved quota makes it "starved at its quota".
+        const throttling = summarizeCpuThrottling(samples);
+
+        if (cpuQuota && throttling.measured && throttling.observedWindowMs >= minWindowMs && throttling.ratio >= this.configValues.cpuThrottledRatio) {
+            facts.push(this.createFact({
+                type         : CONTAINER_HEALTH_FACT_TYPES.cpuThrottling,
+                serviceKey,
+                observedAt,
+                severity     : 'warning',
+                authoritative: false,
+                details      : {
+                    metric          : 'cpu',
+                    quotaCpus       : cpuQuota,
+                    throttledRatio  : throttling.ratio,
+                    throttledPeriods: throttling.throttledPeriods,
+                    periods         : throttling.periods,
+                    throttledTimeMs : throttling.throttledTimeMs,
+                    threshold       : this.configValues.cpuThrottledRatio,
+                    observedWindowMs: throttling.observedWindowMs,
+                    requiredWindowMs: minWindowMs
                 }
             }));
         }
@@ -1349,6 +1393,21 @@ export class ContainerHealthDiagnosisService extends Base {
             };
         }
 
+        // After churn, for the same reason: a service starved at its CPU quota produced no diagnosis
+        // at all. `ambiguous` + `record` for churn's reasoning too — a restart adds no CPU, and the
+        // lifecycle actuator admits no shed or ceiling raise for CPU, so recording is the only honest
+        // terminal until one exists.
+        const throttlingFacts = facts.filter(fact => fact.type === CONTAINER_HEALTH_FACT_TYPES.cpuThrottling);
+        if (throttlingFacts.length > 0) {
+            return {
+                recoveryClass: 'ambiguous',
+                actionClass  : CONTAINER_HEALTH_ACTION_CLASSES.record,
+                confidence   : 0.8,
+                evidenceFacts: this.selectEvidenceFacts(facts, throttlingFacts),
+                reason       : 'cpu-throttling-recorded'
+            };
+        }
+
         return null;
     }
 
@@ -1658,6 +1717,50 @@ export function calculateDockerCpuPercent(stats) {
         (Array.isArray(cpuStats.cpu_usage?.percpu_usage) ? cpuStats.cpu_usage.percpu_usage.length : 1);
 
     return (cpuDelta / systemDelta) * onlineCpus * 100;
+}
+
+/**
+ * @summary The container's CPU quota in whole-CPU units (`HostConfig.NanoCpus` / 1e9), or `null`
+ * when none is set. Docker's percent counts cores, so a container capped at one CPU tops out near
+ * 100 and one capped at four near 400; the quota is what makes a percent comparable to a threshold.
+ * @param {Object|null} inspect Docker inspect payload.
+ * @returns {Number|null}
+ */
+export function resolveCpuQuota(inspect) {
+    const nanoCpus = Number(inspect?.HostConfig?.NanoCpus);
+
+    return Number.isFinite(nanoCpus) && nanoCpus > 0 ? nanoCpus / 1e9 : null;
+}
+
+/**
+ * @summary The share of CPU scheduling periods in which the container exhausted its quota, across the
+ * sampled window, from the cumulative `cpu_stats.throttling_data` counters every Docker stats sample
+ * carries. The counters reset with the container, so a window that crosses a restart is unmeasured
+ * rather than negative, and a container with no quota accrues no periods and is unmeasured too.
+ * @param {Object[]} samples Docker stats samples in observation order, stamped with `observedAtMs`.
+ * @returns {{measured: Boolean, ratio: (Number|null), periods: (Number|null), throttledPeriods: (Number|null), throttledTimeMs: (Number|null), observedWindowMs: (Number|null)}}
+ */
+export function summarizeCpuThrottling(samples) {
+    const
+        first            = samples[0],
+        last             = samples[samples.length - 1],
+        periods          = Number(last?.cpu_stats?.throttling_data?.periods) - Number(first?.cpu_stats?.throttling_data?.periods),
+        throttledPeriods = Number(last?.cpu_stats?.throttling_data?.throttled_periods) - Number(first?.cpu_stats?.throttling_data?.throttled_periods),
+        throttledTimeNs  = Number(last?.cpu_stats?.throttling_data?.throttled_time) - Number(first?.cpu_stats?.throttling_data?.throttled_time),
+        observedWindowMs = Number(last?.observedAtMs) - Number(first?.observedAtMs);
+
+    if (samples.length < 2 || !Number.isFinite(periods) || !Number.isFinite(throttledPeriods) || periods <= 0 || throttledPeriods < 0) {
+        return {measured: false, ratio: null, periods: null, throttledPeriods: null, throttledTimeMs: null, observedWindowMs: null};
+    }
+
+    return {
+        measured        : true,
+        ratio           : throttledPeriods / periods,
+        periods,
+        throttledPeriods,
+        throttledTimeMs : Number.isFinite(throttledTimeNs) && throttledTimeNs >= 0 ? throttledTimeNs / 1e6 : null,
+        observedWindowMs: Number.isFinite(observedWindowMs) ? observedWindowMs : null
+    };
 }
 
 /**
