@@ -1734,6 +1734,71 @@ test.describe('Neo.ai.services.memory-core.WakeSubscriptionService', () => {
           expect(result.digest).toContain('sent a minute ago');
       });
 
+      test('a watermark-less poll surfaces an unread receipt-backed broadcast, and not a read one', async () => {
+          const {subscriptionId} = insertDurableSubscription({
+              trigger      : 'SENT_TO_ME',
+              harnessTarget: 'mcp-notifications'
+          });
+
+          GraphService.upsertNode({id: '@alice', type: 'AGENT', name: 'Alice', properties: {}});
+
+          // A fan-out broadcast keeps its read state on the recipient's DELIVERED_TO edge, not on the MESSAGE.
+          for (const [id, subject, readAt] of [
+              ['MESSAGE:nowalk-receipt-open', 'broadcast awaiting a read',   null],
+              ['MESSAGE:nowalk-receipt-read', 'broadcast the seat has read', '2026-09-28T17:01:00.000Z']
+          ]) {
+              GraphService.upsertNode({id, type: 'MESSAGE', properties: {from: '@bob', to: 'AGENT:*', subject, readAt: null}});
+              GraphService.linkNodes(id, 'AGENT:*', 'SENT_TO', 1.0);
+              GraphService.linkNodes(id, '@alice', 'DELIVERED_TO', 1.0, {
+                  deliveredAt : '2026-09-28T17:00:00.000Z',
+                  readAt,
+                  deliveryKind: 'broadcast'
+              });
+          }
+
+          const result = await RequestContextService.run({agentIdentityNodeId: '@alice'},
+              () => WakeSubscriptionService.pollDigest({subscriptionId}));
+
+          expect(result.pending).toBe(1);
+          expect(result.digest).toContain('broadcast awaiting a read');
+          expect(result.digest).not.toContain('broadcast the seat has read');
+      });
+
+      test('a watermark-less poll keeps a wake-suppressed broadcast out', async () => {
+          const {subscriptionId} = insertDurableSubscription({
+              trigger      : 'SENT_TO_ME',
+              harnessTarget: 'mcp-notifications'
+          });
+
+          GraphService.upsertNode({id: '@alice', type: 'AGENT', name: 'Alice', properties: {}});
+          GraphService.upsertNode({
+              id        : 'MESSAGE:nowalk-receipt-quiet',
+              type      : 'MESSAGE',
+              properties: {from: '@bob', to: 'AGENT:*', subject: 'broadcast sent quietly', readAt: null, wakeSuppressed: true}
+          });
+          GraphService.linkNodes('MESSAGE:nowalk-receipt-quiet', 'AGENT:*', 'SENT_TO', 1.0);
+          GraphService.linkNodes('MESSAGE:nowalk-receipt-quiet', '@alice', 'DELIVERED_TO', 1.0, {
+              deliveredAt : '2026-09-28T17:00:00.000Z',
+              readAt      : null,
+              deliveryKind: 'broadcast'
+          });
+
+          // The unread direct message proves the poll answers, so the broadcast's absence is a verdict.
+          GraphService.upsertNode({
+              id        : 'MESSAGE:nowalk-direct',
+              type      : 'MESSAGE',
+              properties: {subject: 'direct message still unread', author: '@bob', sentAt: new Date().toISOString()}
+          });
+          GraphService.linkNodes('MESSAGE:nowalk-direct', '@alice', 'SENT_TO', 1, {});
+
+          const result = await RequestContextService.run({agentIdentityNodeId: '@alice'},
+              () => WakeSubscriptionService.pollDigest({subscriptionId}));
+
+          expect(result.pending).toBe(1);
+          expect(result.digest).toContain('direct message still unread');
+          expect(result.digest).not.toContain('broadcast sent quietly');
+      });
+
       test('(b) a delta larger than the page budget returns a CONTINUING watermark, not the head', async () => {
           const {subscriptionId} = insertDurableSubscription({
               trigger      : 'TASK_STATE_CHANGED',
