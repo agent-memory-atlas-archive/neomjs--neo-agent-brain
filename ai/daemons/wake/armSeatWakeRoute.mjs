@@ -28,6 +28,15 @@ export const INSTANCE_DIR_BY_HARNESS = Object.freeze({
 });
 
 /**
+ * The adapter this arming path exists to produce. Every harness in {@link INSTANCE_DIR_BY_HARNESS}
+ * is a GUI harness, and the reason the arm carries a `userDataDir` tuple instead of a pid or a port
+ * is restart durability. Named as a constant because the adapter is declared by the subscription
+ * rather than by this module, so arming can only VERIFY the switch, never perform it.
+ * @type {String}
+ */
+export const ARMED_ADAPTER = 'osascript';
+
+/**
  * `userDataDir` rather than `pid`: a pid tuple is invalidated by the next harness restart, which is
  * the exact event this arming path exists to survive.
  * @type {String}
@@ -217,10 +226,39 @@ export async function armSeatWakeRoute({
             };
         }
 
+        // Owning a route is not the same as being reachable BY IT. Every harness in
+        // INSTANCE_DIR_BY_HARNESS is a GUI harness, so this path exists to arm the `osascript`
+        // route — the one whose address is a restart-durable userDataDir. The adapter itself is
+        // declared by the SUBSCRIPTION, not by this function: `harness` only chooses the instance
+        // directory. So a subscription still declaring a non-GUI adapter publishes cleanly, keeps
+        // this seat's own route, and leaves `armed: true` describing a tuple while the delivery
+        // path is unchanged. Measured on a live seat: `armed: true, routeCount: 1, skipped: []`
+        // with the published adapter still `opencode-server`, and the seat still unwakeable.
+        // Reporting success there is the same lie as the nine-routes case above, one layer in.
+        //
+        // `route.adapter` is the adapter the route will actually USE, read by the builder at
+        // publish time — not a default, and not a re-read of the input subscription. Reading the
+        // input here instead would compare the request with itself and always agree.
+        const publishedAdapters = [...new Set(ownRoutes
+            .map(route => route?.adapter)
+            .filter(Boolean))];
+
+        if (!publishedAdapters.includes(ARMED_ADAPTER)) {
+            return {
+                armed     : false,
+                identity  : tuple.identity,
+                routeCount: ownRoutes.length,
+                adapter   : publishedAdapters.join(', ') || 'none',
+                reason    : `the route for ${tuple.identity} is published on adapter '${publishedAdapters.join(', ') || 'none'}', but arming harness '${harness}' arms '${ARMED_ADAPTER}' — the instance tuple was derived and the delivery path was NOT switched; update the subscription's adapter to '${ARMED_ADAPTER}' with this instanceAddress and re-arm`,
+                skipped   : result?.skipped ?? []
+            };
+        }
+
         return {
             armed     : true,
             identity  : tuple.identity,
             routeCount: ownRoutes.length,
+            adapter   : ARMED_ADAPTER,
             skipped   : result?.skipped ?? []
         }
     } catch (error) {
