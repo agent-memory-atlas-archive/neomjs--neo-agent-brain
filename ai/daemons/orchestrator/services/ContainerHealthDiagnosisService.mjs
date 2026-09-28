@@ -1848,16 +1848,39 @@ export function classifyHeapExhaustion({logs, nodeCommand, declaredHeapCeilingMb
     }
 }
 
+/**
+ * @summary The memory a container holds that the kernel will not reclaim first: `usage` minus the inactive
+ * file cache, as `docker stats` counts it. The kernel drops inactive file pages before it OOM-kills a cgroup,
+ * so a store that reads its files through the page cache would otherwise show that cache as exhaustion.
+ * A sample without the counter keeps its raw usage.
+ * @param {Object} stats Docker stats sample.
+ * @returns {Number|null} Bytes, or null when the usage is unreadable.
+ */
+export function calculateDockerMemoryInUseBytes(stats) {
+    const
+        usage    = Number(stats?.memory_stats?.usage),
+        inactive = Number(stats?.memory_stats?.stats?.inactive_file);
+
+    if (!Number.isFinite(usage) || usage < 0) return null;
+
+    return Number.isFinite(inactive) && inactive >= 0 && inactive < usage ? usage - inactive : usage;
+}
+
+/**
+ * @summary A container's memory in use against its limit, in percent. See {@link calculateDockerMemoryInUseBytes}.
+ * @param {Object} stats Docker stats sample.
+ * @returns {Number|null}
+ */
 export function calculateDockerMemoryPercent(stats) {
     const
-        usage = Number(stats.memory_stats?.usage),
-        limit = Number(stats.memory_stats?.limit);
+        inUse = calculateDockerMemoryInUseBytes(stats),
+        limit = Number(stats?.memory_stats?.limit);
 
-    if (!Number.isFinite(usage) || !Number.isFinite(limit) || usage < 0 || limit <= 0) {
+    if (inUse === null || !Number.isFinite(limit) || limit <= 0) {
         return null;
     }
 
-    return (usage / limit) * 100;
+    return (inUse / limit) * 100;
 }
 
 /**
