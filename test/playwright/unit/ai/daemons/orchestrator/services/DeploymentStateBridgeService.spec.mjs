@@ -75,7 +75,7 @@ const RUNTIME_ACCESS_CONFIG_PATHS = [
 let restoreBridgeConfig,
     restoreRuntimeAccessConfig;
 
-function statsSample({cpuPercent = 0, memoryPercent = 0} = {}) {
+function statsSample({cpuPercent = 0, memoryPercent = 0, throttling = null} = {}) {
     const systemDelta = 1_000_000_000,
           cpuDelta    = (cpuPercent / 100) * systemDelta / 4,
           memoryLimit = 1000;
@@ -87,7 +87,9 @@ function statsSample({cpuPercent = 0, memoryPercent = 0} = {}) {
             cpu_usage       : {
                 total_usage : cpuDelta,
                 percpu_usage: [cpuDelta / 4, cpuDelta / 4, cpuDelta / 4, cpuDelta / 4]
-            }
+            },
+            // Docker's cumulative quota counters: `[periods, throttled_periods, throttled_time_ns]`
+            ...(throttling ? {throttling_data: {periods: throttling[0], throttled_periods: throttling[1], throttled_time: throttling[2]}} : {})
         },
         precpu_stats: {
             system_cpu_usage: 0,
@@ -264,7 +266,7 @@ test.describe('Neo.ai.daemons.services.DeploymentStateBridgeService', () => {
             status    : 'available',
             inspect   : {
                 image: 'ollama',
-                // Named `currentRun` since #466's third Fix bullet: these are the run happening now,
+                // Named `currentRun` because these are the run happening now,
                 // not the death that preceded a restart. The cause of a restart is in `deaths`.
                 currentRun: {status: 'running', health: 'unhealthy'}
             },
@@ -479,7 +481,7 @@ test.describe('Neo.ai.daemons.services.DeploymentStateBridgeService', () => {
         });
     });
 
-    // Grace's RA-2: both channel validators (a non-positive lookback, a non-integer death limit) threw
+    // Both channel validators (a non-positive lookback, a non-integer death limit) threw
     // OUTSIDE `read()`'s catch, with no per-service guard in `collectSnapshot` and a rethrowing
     // `writeSnapshotIfDue` above — so one bad leaf in an OPTIONAL channel stopped the snapshot for
     // every service, every cycle. This arm is the property that containment buys: the channel degrades,
@@ -1270,6 +1272,33 @@ test.describe('Neo.ai.daemons.services.DeploymentStateBridgeService', () => {
         ]);
     });
 
+    test('the CPU quota and the throttling window speak only for the container that inspect and stats both proved', async () => {
+        Object.assign(AiConfig.orchestrator.deploymentStateBridge, {allowedServices: ['mc-server'], includeLogs: false});
+
+        const throttlingOf = async (inspectId, statsId) => {
+            const
+                runtimeAccessService = {
+                    async readObserve({operation}) {
+                        return operation === 'inspect'
+                            ? {data: {State: {Status: 'running'}, HostConfig: {NanoCpus: 1e9}}, proof: {operation, target: {containerId: inspectId}}}
+                            : {data: statsSample({cpuPercent: 79, throttling: [20124, 11070, 0]}), proof: {operation, target: {containerId: statsId}}};
+                    }
+                },
+                diagnosisService = Neo.create(ContainerHealthDiagnosisService, {nowFn: () => OBSERVED_AT}),
+                service          = createService({runtimeAccessService, diagnosisService, nowFn: () => OBSERVED_AT});
+
+            // the window's first sample, from the container the inspect names
+            service.rememberStatsSample('mc-server', statsSample({cpuPercent: 79, throttling: [1000, 400, 0]}), OBSERVED_AT - 30_000, null, inspectId);
+
+            const snapshot = await service.collectSnapshot({generatedAt: OBSERVED_AT});
+
+            return snapshot.services.find(entry => entry.serviceKey === 'mc-server').diagnosis.facts.find(fact => fact.type === 'cpu-throttling') ?? null
+        };
+
+        expect((await throttlingOf('mc-A', 'mc-A'))?.details, 'one proved container: the fact, against its quota').toMatchObject({quotaCpus: 1, throttledPeriods: 10670, periods: 19124});
+        expect(await throttlingOf('mc-A', 'mc-B'), 'stats of B never speak under the inspect of A').toBeNull()
+    });
+
     test('publishes an unavailable provider-work envelope instead of manufacturing idle', async () => {
         Object.assign(AiConfig.orchestrator.deploymentStateBridge, {
             allowedServices: ['local-model'],
@@ -2050,7 +2079,7 @@ test.describe('Neo.ai.daemons.services.DeploymentStateBridgeService', () => {
         expect(tornSnapshot.repos[0].corpusOutstanding).toBeNull();
         torn.destroy();
 
-        // RA-1 (@neo-gpt): every field individually well-typed, TOGETHER asserting a finished corpus
+        // Every field individually well-typed, TOGETHER asserting a finished corpus
         // with 42 chunks left. Presence-validation admits this; only coherence rejects it. Repairing it
         // to a count would invent an observation nobody made, so it degrades WHOLE.
         for (const incoherent of [
@@ -3738,7 +3767,7 @@ test.describe('probeReliability reaches the service record', () => {
  * The single decision separating "a wedged container gets restarted" from "a healthy container gets
  * restarted every sweep". Tested against the PURE classifier rather than through the config lookup,
  * so every failure shape is reachable without a live server and without mutating the AiConfig
- * singleton (ADR-0019 B4). Each arm below is a distinct way to get this wrong. // ticket-ref-ok: the ADR clause is why these tests avoid the singleton, not background reading
+ * singleton (ADR-0019 [not-ticket-ref: decision-record authority] B4). Each arm below is a distinct way to get this wrong.
  */
 test.describe('classifyDirectProbeOutcome — a probe fault is not a service fault (#16766)', () => {
     function timeoutError(verdict) {
