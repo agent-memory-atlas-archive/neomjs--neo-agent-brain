@@ -18,7 +18,13 @@ import {runManifestBuilder} from './buildReceiverManifest.mjs';
  */
 export const INSTANCE_DIR_BY_HARNESS = Object.freeze({
     claude: '.claude-instances',
-    codex : '.codex-instances'
+    codex : '.codex-instances',
+    // A seat's OpenCode instance dir is a symlink to its real data home, so the string the
+    // resolver matches in `--user-data-dir=` and the string the manifest publishes are the
+    // same one, while the app keeps reading and writing where its data actually lives.
+    // Bridge, not a destination: #571's Terminal predicate retires pre-layout instance
+    // paths, and #562 is migrating GUI seats onto a session hook instead.
+    opencode: '.opencode-instances'
 });
 
 /**
