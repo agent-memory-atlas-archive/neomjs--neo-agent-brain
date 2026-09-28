@@ -261,6 +261,17 @@ class WakeSubscriptionService extends Base {
     pumpBatchSize = 512
 
     /**
+     * @member {Number} pollDigestMaxPages=32
+     * Maximum GraphLog pages one `pollDigest` / `resync` call will walk. A work bound per CALL, not a
+     * range window: when it is reached the call returns the watermark it actually read, and the client
+     * continues from there on its next call, so nothing is dropped and no `boundedFrom` is reported.
+     * 32 pages of `pumpBatchSize` is ~16k rows per call — generous for a live seat, and bounded for a
+     * cold one replaying millions of rows since a stale watermark.
+     * @protected
+     */
+    pollDigestMaxPages = 32
+
+    /**
      * Evaluates recent GraphLog deltas and pushes matching events to active Shape A
      * (MCP notification) and Shape B (signed webhook) routes. Intended to be called by
      * mutation paths (e.g. MailboxService, PermissionService) for low-latency delivery.
@@ -1870,6 +1881,58 @@ class WakeSubscriptionService extends Base {
     }
 
     /**
+     * @summary The current unread SENT_TO_ME set for a subscription's owner — the answer to a
+     * WATERMARK-LESS poll, derived from state rather than from log history.
+     *
+     * Enumerates the owner's inbound `SENT_TO` edges through the edge store's target index and hands
+     * each to {@link WakeSubscriptionService#_evaluateEdgeAgainstSubscription}, so the unread gate
+     * stays the shared `match()` predicate this service and the standalone daemon already share. The
+     * index is used rather than a mailbox query so the delivery-shape logic is not re-implemented
+     * here: a second copy of "what counts as unread for this recipient" is how the two shapes
+     * (per-recipient `DELIVERED_TO` edge vs `readAt` on the MESSAGE) drifted before.
+     *
+     * Every surfaced message is anchored at the snapshot head, because from current state there is
+     * no per-message log position that means anything to a caller holding no watermark.
+     *
+     * @param {Object} subscription The cached WAKE_SUBSCRIPTION entry (id + properties).
+     * @returns {Object[]} Wake-event payloads for the owner's currently-unread messages.
+     * @protected
+     */
+    _collectCurrentUnreadEvents(subscription) {
+        const identity = subscription?.agentIdentity;
+        const node     = identity ? GraphService.db?.nodes?.get(identity) : null;
+
+        // No identity node means no addressable inbox, and an empty answer is the honest reading —
+        // never a guess at a route.
+        if (!node) return [];
+
+        const inbound = GraphService.db.edges.getByIndex('target', node.id) || [];
+        const head    = this._getSnapshotHead();
+        const events  = [];
+
+        for (const edge of inbound) {
+            if (edge?.type !== 'SENT_TO') continue;
+
+            const matched = this._evaluateEdgeAgainstSubscription({id: edge.id}, subscription, head);
+            if (matched) events.push(matched);
+        }
+
+        return events;
+    }
+
+    /**
+     * @summary The current GraphLog head, used as the watermark a no-walk poll reports.
+     * @returns {Number} The highest committed log id, or 0 when no log is reachable.
+     * @protected
+     */
+    _getSnapshotHead() {
+        const storage = GraphService.db?.storage;
+        const head    = typeof storage?.getLatestLogId === 'function' ? storage.getLatestLogId() : null;
+
+        return Number.isFinite(head) ? head : 0;
+    }
+
+    /**
      * @summary Derives the caller's wake digest AT READ TIME — the pull half of wake delivery
      * for clients without host-reachable listeners.
      *
@@ -1915,7 +1978,22 @@ class WakeSubscriptionService extends Base {
             logger.warn(`[WakeSubscription] lastPollAt stamp failed for ${subscriptionId}: ${error?.message ?? error}`);
         }
 
-        const {events, lastLogId} = this._collectSubscriptionEvents(subscription, sinceLogId);
+        // A WATERMARK-LESS poll walks no log. `sinceLogId` defaults to 0, and 0 is the "I have no
+        // watermark" answer, not "give me rows 1..N": walking from 0 over a long-lived log reads
+        // history whose rows are almost all already read, so the shared unread gate in `match()`
+        // yields NOTHING for the work — and a bounded walk makes that worse rather than better, by
+        // returning a watermark a caller must grind forward over thousands of calls before a
+        // message sent a minute ago is reachable. So the no-watermark case answers from CURRENT
+        // state and reports the snapshot head; the delta walk is for watermarked callers only.
+        //
+        // The consequence is deliberate and not a gap: `TASK_STATE_CHANGED` is an immutable
+        // transition fact with no current state to re-derive, so a no-walk poll cannot report one.
+        // The first call establishes the watermark at head, and every later watermarked poll carries
+        // the transitions. The message half — the half that HAS read state — is exactly the half that
+        // can be answered from state, which is why this is the right seam to split on.
+        const {events, lastLogId} = sinceLogId
+            ? this._collectSubscriptionEvents(subscription, sinceLogId)
+            : {events: this._collectCurrentUnreadEvents(subscription), lastLogId: this._getSnapshotHead()};
 
         const messages = [], tasks = [], permissions = [], heartbeats = [];
 
@@ -1963,33 +2041,72 @@ class WakeSubscriptionService extends Base {
             return {events: [], lastLogId: sinceLogId};
         }
 
-        const delta  = storage.getDeltaLog(sinceLogId);
         const events = [];
 
-        // Trigger evaluation walks the delta entities. SENT_TO_ME / PERMISSION_GRANTED examine
-        // edges; generic nodes remain cache invalidation only. TASK_STATE_CHANGED consumes the
-        // immutable typed-event rows returned separately by getDeltaLog().
-        // Filter spec is applied to the matched candidate's payload; non-matches are skipped.
-        for (const edgeRef of delta.invalidEdges) {
-            const logId   = edgeRef.logId || delta.entityLogIds?.get(edgeRef.id) || delta.lastLogId;
-            const matched = this._evaluateEdgeAgainstSubscription(edgeRef, subscription, logId);
-            if (matched) events.push(matched);
-        }
-        for (const nodeId of delta.invalidNodes) {
-            const logId   = delta.entityLogIds?.get(nodeId) || delta.lastLogId;
-            const matched = this._evaluateNodeAgainstSubscription(nodeId, subscription, logId);
-            if (matched) events.push(matched);
-        }
-        for (const trace of delta.events || []) {
-            const matched = this._evaluateTypedEventAgainstSubscription(trace, subscription);
-            if (matched) events.push(matched);
-        }
-        for (const pulseTrace of this._getHeartbeatPulseLogEntries(sinceLogId)) {
-            const matched = this._evaluateHeartbeatPulseAgainstSubscription(pulseTrace, subscription);
-            if (matched) events.push(matched);
+        // Bounded per call, and never replayed from zero in one stretch. This is the shared path behind
+        // `resync` and `pollDigest`, both of which default `sinceLogId` to 0, so an unbounded read here
+        // is `SELECT ... WHERE log_id > 0` materialised whole — 41,007,073 rows against a 3 GiB cgroup
+        // cap, which OOM-killed Memory Core twice in one morning (08:22, 11:10) and destroyed the
+        // evidence a seat needed to diagnose itself.
+        //
+        // The bound is on WORK PER CALL, not on the range: the walk stops at `pollDigestMaxPages` and
+        // returns the watermark it actually reached, so an offline client resumes from there on its next
+        // call. It is deliberately not a window — nothing is dropped, and no `boundedFrom` is reported.
+        // `match()` reconciles each candidate against current read state as it goes, so replaying from a
+        // stale watermark is semantically correct; only the cost of doing it in one call was wrong.
+        const snapshotMaxLogId = typeof storage.getLatestLogId === 'function'
+            ? storage.getLatestLogId()
+            : null;
+        const head = Number.isFinite(snapshotMaxLogId) ? snapshotMaxLogId : Number.MAX_SAFE_INTEGER;
+
+        let cursor    = sinceLogId;
+        let lastLogId = sinceLogId;
+        let pages     = 0;
+
+        while (pages < this.pollDigestMaxPages && cursor < head) {
+            const delta = storage.getDeltaLog(cursor, {
+                limit  : this.pumpBatchSize,
+                untilId: snapshotMaxLogId
+            });
+            pages++;
+
+            if (Number.isFinite(delta.lastLogId)) lastLogId = delta.lastLogId;
+
+            // Trigger evaluation walks the delta entities. SENT_TO_ME / PERMISSION_GRANTED examine
+            // edges; generic nodes remain cache invalidation only. TASK_STATE_CHANGED consumes the
+            // immutable typed-event rows returned separately by getDeltaLog().
+            for (const edgeRef of delta.invalidEdges) {
+                const logId   = edgeRef.logId || delta.entityLogIds?.get(edgeRef.id) || delta.lastLogId;
+                const matched = this._evaluateEdgeAgainstSubscription(edgeRef, subscription, logId);
+                if (matched) events.push(matched);
+            }
+            for (const nodeId of delta.invalidNodes) {
+                const logId   = delta.entityLogIds?.get(nodeId) || delta.lastLogId;
+                const matched = this._evaluateNodeAgainstSubscription(nodeId, subscription, logId);
+                if (matched) events.push(matched);
+            }
+            for (const trace of delta.events || []) {
+                const matched = this._evaluateTypedEventAgainstSubscription(trace, subscription);
+                if (matched) events.push(matched);
+            }
+
+            // Pulses are read for THIS page's range, inside the loop. Reading them once over the whole
+            // range was the second unbounded read, and bounding that single read with
+            // `ORDER BY log_id ASC LIMIT ?` silently returned the OLDEST page — so on a long replay the
+            // only recent pulses, the ones a wake is about, were the ones dropped.
+            for (const pulseTrace of this._getHeartbeatPulseLogEntries(cursor, delta.lastLogId)) {
+                const matched = this._evaluateHeartbeatPulseAgainstSubscription(pulseTrace, subscription);
+                if (matched) events.push(matched);
+            }
+
+            // `hasMore` is the storage layer's own "this page was full" signal. The progress guard is
+            // independent of it: a cursor that cannot advance would otherwise spin on the same rows.
+            if (!delta.hasMore) break;
+            if (!(delta.lastLogId > cursor)) break;
+            cursor = delta.lastLogId;
         }
 
-        return {events, lastLogId: delta.lastLogId}
+        return {events, lastLogId}
     }
 
     /**
@@ -2007,12 +2124,17 @@ class WakeSubscriptionService extends Base {
     }
 
     /**
-     * Reads heartbeat pulse GraphLog rows after a cursor.
+     * Reads heartbeat pulse GraphLog rows in `(sinceLogId, untilLogId]`.
+     *
+     * Bounded on both ends. This runs once per `pollDigest` / `resync` call, and both default
+     * `sinceLogId` to 0 — so the previous unbounded `.all()` over `log_id > 0` read every
+     * heartbeat pulse row ever written, the same 41M-row class of read as the delta walk above.
      * @protected
-     * @param {Number} sinceLogId Client watermark.
+     * @param {Number} sinceLogId Client watermark (exclusive lower bound).
+     * @param {Number} [untilLogId] Page head reached by the delta walk (exclusive upper bound).
      * @returns {Object[]} GraphLog heartbeat pulse rows.
      */
-    _getHeartbeatPulseLogEntries(sinceLogId) {
+    _getHeartbeatPulseLogEntries(sinceLogId, untilLogId = Number.MAX_SAFE_INTEGER) {
         const sqlite = GraphService.db?.storage?.db;
         if (!sqlite?.prepare) return [];
 
@@ -2020,9 +2142,11 @@ class WakeSubscriptionService extends Base {
             SELECT log_id, entity_id, entity_type
             FROM GraphLog
             WHERE log_id > ?
+              AND log_id <= ?
               AND entity_type = ?
             ORDER BY log_id ASC
-        `).all(sinceLogId, this.heartbeatPulseEntityType);
+            LIMIT ?
+        `).all(sinceLogId, untilLogId, this.heartbeatPulseEntityType, this.pumpBatchSize);
     }
 
     /**

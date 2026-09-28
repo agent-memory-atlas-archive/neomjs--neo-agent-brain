@@ -1662,6 +1662,211 @@ test.describe('Neo.ai.services.memory-core.WakeSubscriptionService', () => {
         });
     });
 
+      // ---- walk-bound falsifiers: the walk must be bounded, and must not drop the recent end ----
+      // Each arm is written to FAIL when its bound is removed. No other test here seeds a GraphLog
+      // larger than one page, which is exactly why the unbounded reads survived a green suite.
+
+      test('(a) a watermark-less poll walks NO log and still surfaces an unread message near the head', async () => {
+          const {subscriptionId} = insertDurableSubscription({
+              trigger      : 'SENT_TO_ME',
+              harnessTarget: 'mcp-notifications'
+          });
+          const storage = GraphService.db.storage;
+          const reads   = [];
+          const real    = storage.getDeltaLog.bind(storage);
+
+          // The walk is the thing under test, so the spy classifies by whether an options object was
+          // passed — `Database.sync()`'s catch-up read passes none and fires on every node write,
+          // including this poll's own `lastPollAt` stamp. A watermark-less call is specifically a call
+          // with `sinceId === 0`.
+          storage.getDeltaLog = (sinceId, opts) => {
+              reads.push({paged: opts !== undefined, sinceId});
+              return real(sinceId, opts)
+          };
+
+          // Deep history, so a walk from 0 would be many pages of already-read rows and could never
+          // reach the end of the log within any sane cap.
+          for (let i = 0; i < 60; i++) {
+              appendTaskEvent({
+                  eventId       : `nowalk-history-${i}`,
+                  previousState : 'Submitted',
+                  newState      : 'Working',
+                  lastModifiedAt: new Date(Date.UTC(2026, 7, 9, 14, 5, 2, i * 7)).toISOString()
+              });
+          }
+
+          // The message that matters: UNREAD, addressed to the owner, and written LAST — so its log
+          // position is at the head, far past anything a bounded walk from 0 would reach.
+          const messageId = 'MESSAGE:nowalk-head';
+          GraphService.upsertNode({id: '@alice', type: 'AGENT', name: 'Alice', properties: {}});
+          GraphService.upsertNode({
+              id        : messageId,
+              type      : 'MESSAGE',
+              name      : 'head message',
+              properties: {subject: 'sent a minute ago', author: '@bob', sentAt: new Date().toISOString()}
+          });
+          GraphService.linkNodes(messageId, '@alice', 'SENT_TO', 1, {});
+
+          const originalBatch = WakeSubscriptionService.pumpBatchSize;
+          const originalPages = WakeSubscriptionService.pollDigestMaxPages;
+          WakeSubscriptionService.pumpBatchSize      = 4;
+          WakeSubscriptionService.pollDigestMaxPages = 2;
+
+          let result;
+          try {
+              result = await RequestContextService.run({agentIdentityNodeId: '@alice'},
+                  () => WakeSubscriptionService.pollDigest({subscriptionId}));
+          } finally {
+              storage.getDeltaLog                       = real;
+              WakeSubscriptionService.pumpBatchSize     = originalBatch;
+              WakeSubscriptionService.pollDigestMaxPages = originalPages;
+          }
+
+          // Half one: it walked nothing. A call from sinceId 0 is the defect this arm exists to
+          // forbid — that is the read which materialised 41,007,073 rows.
+          expect(reads.filter(read => read.sinceId === 0)).toHaveLength(0);
+
+          // Half two: and it still answered, from current state. The unread message at the head is
+          // reported on the FIRST call, which is the property a bounded walk cannot deliver.
+          expect(result.pending).toBeGreaterThan(0);
+          // The digest is RENDERED TEXT, not a structure carrying message ids — so assert on the
+          // subject that rendered, which is what the seat actually receives.
+          expect(result.digest).toContain('sent a minute ago');
+      });
+
+      test('(b) a delta larger than the page budget returns a CONTINUING watermark, not the head', async () => {
+          const {subscriptionId} = insertDurableSubscription({
+              trigger      : 'TASK_STATE_CHANGED',
+              harnessTarget: 'mcp-notifications'
+          });
+          const sqlite = GraphService.db.storage.db;
+
+          // A DELTA arm: capture a real watermark first, because `sinceLogId: 0` now
+          // means "I have no watermark" and answers from current state, not a walk.
+          const before = GraphService.db.storage.getLatestLogId();
+
+          for (let i = 0; i < 24; i++) {
+              appendTaskEvent({
+                  eventId       : `continuing-wm-${i}`,
+                  previousState : 'Submitted',
+                  newState      : 'Working',
+                  lastModifiedAt: new Date(Date.UTC(2026, 7, 9, 15, 5, 2, i * 7)).toISOString()
+              });
+          }
+
+          const head = sqlite.prepare('SELECT MAX(log_id) AS maxId FROM GraphLog').get().maxId || 0;
+
+          const originalBatch = WakeSubscriptionService.pumpBatchSize;
+          const originalPages = WakeSubscriptionService.pollDigestMaxPages;
+          WakeSubscriptionService.pumpBatchSize      = 4;
+          WakeSubscriptionService.pollDigestMaxPages = 2;
+
+          let result;
+          try {
+              result = await RequestContextService.run({agentIdentityNodeId: '@alice'},
+                  () => WakeSubscriptionService.pollDigest({subscriptionId, sinceLogId: before}));
+          } finally {
+              WakeSubscriptionService.pumpBatchSize      = originalBatch;
+              WakeSubscriptionService.pollDigestMaxPages = originalPages;
+          }
+
+          // A watermark the client can resume from — short of the head, so the next call continues.
+          expect(result.watermark).toBeGreaterThan(0);
+          expect(result.watermark).toBeLessThan(head);
+
+          // Resuming from a short watermark must DRAIN the rest rather than skip it. This is what
+          // makes returning a continuing watermark honest rather than data loss: every event is
+          // reported exactly once across the calls, and the final watermark reaches the head.
+          const resumeBatch = WakeSubscriptionService.pumpBatchSize;
+          const resumePages = WakeSubscriptionService.pollDigestMaxPages;
+          WakeSubscriptionService.pumpBatchSize      = 4;
+          WakeSubscriptionService.pollDigestMaxPages = 2;
+
+          // `cursor === head` is deliberately NOT the exit condition: every poll appends its own
+          // `lastPollAt` observational stamp, so `head` advances by at least one row per call and a
+          // tight loop would chase its own tail forever. (Benign for a real client, whose cursor is
+          // already past the stamp it created — but it means "watermark reaches head" is not a
+          // stable invariant to assert.) The property that matters is DRAIN: it terminates dry, and
+          // every event was reported exactly once.
+          let cursor = result.watermark, total = result.pending, calls = 0;
+          try {
+              while (total < 24 && calls < 25) {
+                  const next = await RequestContextService.run({agentIdentityNodeId: '@alice'},
+                      () => WakeSubscriptionService.pollDigest({subscriptionId, sinceLogId: cursor}));
+                  total += next.pending;
+                  cursor = next.watermark;
+                  calls++;
+              }
+          } finally {
+              WakeSubscriptionService.pumpBatchSize      = resumeBatch;
+              WakeSubscriptionService.pollDigestMaxPages = resumePages;
+          }
+
+          expect(calls).toBeLessThan(25);
+          expect(total).toBe(24);
+      });
+
+      test('(c) a heartbeat pulse past the first page of a range is not dropped', async () => {
+          const {subscriptionId} = insertDurableSubscription({
+              trigger      : 'TASK_STATE_CHANGED',
+              harnessTarget: 'mcp-notifications'
+          });
+          const sqlite     = GraphService.db.storage.db;
+          const insertPulse = (logId, id) => sqlite
+              .prepare('INSERT INTO GraphLog (log_id, entity_id, entity_type) VALUES (?, ?, ?)')
+              .run(logId, id, WakeSubscriptionService.heartbeatPulseEntityType);
+
+          // A DELTA arm, so the watermark is captured FIRST — before any pulse is inserted. Placing
+          // it after the older pulses would leave them outside the delta range, the whole-range read
+          // would then hold only the one recent pulse, and ASC-truncation could not drop anything:
+          // the arm would go green against the very defect it exists to catch. That is the second
+          // time this fixture's ordering has silently disarmed it.
+          const before = GraphService.db.storage.getLatestLogId();
+
+          // TWO older pulses next, so the range holds more pulses than the read's own `LIMIT`. A
+          // single pulse in range cannot be dropped by an ASC-truncation at all.
+          const earlyBase = sqlite.prepare('SELECT MAX(log_id) AS maxId FROM GraphLog').get().maxId;
+          insertPulse(earlyBase + 1, 'PULSE:bound-early-1');
+          insertPulse(earlyBase + 2, 'PULSE:bound-early-2');
+
+          for (let i = 0; i < 12; i++) {
+              appendTaskEvent({
+                  eventId       : `pulse-range-${i}`,
+                  previousState : 'Submitted',
+                  newState      : 'Working',
+                  lastModifiedAt: new Date(Date.UTC(2026, 7, 9, 16, 5, 2, i * 7)).toISOString()
+              });
+          }
+
+          // The recent pulse, well past the first page's range. Reading pulses ONCE over the whole
+          // range with `ORDER BY log_id ASC LIMIT ?` returns the OLDEST page instead, so on a long
+          // replay the only recent pulses -- the ones a wake is about -- were the ones dropped.
+          const afterFirstPage = sqlite.prepare('SELECT MAX(log_id) AS maxId FROM GraphLog').get().maxId + 30;
+          const pulseId        = `PULSE:bound-${afterFirstPage}`;
+          insertPulse(afterFirstPage, pulseId);
+
+          const seen = [];
+          const real  = WakeSubscriptionService._evaluateHeartbeatPulseAgainstSubscription
+              .bind(WakeSubscriptionService);
+          WakeSubscriptionService._evaluateHeartbeatPulseAgainstSubscription = (pulse, sub) => {
+              seen.push(pulse.entity_id);
+              return real(pulse, sub)
+          };
+
+          const originalBatch = WakeSubscriptionService.pumpBatchSize;
+          WakeSubscriptionService.pumpBatchSize = 2;
+
+          try {
+              await RequestContextService.run({agentIdentityNodeId: '@alice'},
+                  () => WakeSubscriptionService.pollDigest({subscriptionId, sinceLogId: before}));
+          } finally {
+              WakeSubscriptionService._evaluateHeartbeatPulseAgainstSubscription = real;
+              WakeSubscriptionService.pumpBatchSize                             = originalBatch;
+          }
+
+          expect(seen).toContain(pulseId);
+      });
+
     test('poll-digest rejects a subscription owned by a different identity', async () => {
         let subscriptionId;
         await RequestContextService.run({agentIdentityNodeId: '@alice'}, async () => {
