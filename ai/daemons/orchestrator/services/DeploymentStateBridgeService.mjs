@@ -102,6 +102,7 @@ import {
 } from '../../../services/memory-core/helpers/healEventLedgerStore.mjs';
 import {
     calculateDockerCpuPercent,
+    calculateDockerMemoryInUseBytes,
     calculateDockerMemoryPercent
 } from './ContainerHealthDiagnosisService.mjs';
 import {
@@ -2802,6 +2803,8 @@ function summarizeStats(stats) {
         cpuPercent      : calculateDockerCpuPercent(stats),
         memoryPercent   : calculateDockerMemoryPercent(stats),
         memoryUsageBytes: Number.isFinite(memoryUsage) ? memoryUsage : null,
+        // what the percent counts: usage without the file cache the kernel reclaims first
+        memoryInUseBytes: calculateDockerMemoryInUseBytes(stats),
         memoryLimitBytes: Number.isFinite(memoryLimit) ? memoryLimit : null,
         pidsCurrent     : Number.isFinite(Number(stats.pids_stats?.current)) ? Number(stats.pids_stats.current) : null
     };

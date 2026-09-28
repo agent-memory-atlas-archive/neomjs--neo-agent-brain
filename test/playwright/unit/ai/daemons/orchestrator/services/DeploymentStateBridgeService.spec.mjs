@@ -75,7 +75,7 @@ const RUNTIME_ACCESS_CONFIG_PATHS = [
 let restoreBridgeConfig,
     restoreRuntimeAccessConfig;
 
-function statsSample({cpuPercent = 0, memoryPercent = 0} = {}) {
+function statsSample({cpuPercent = 0, memoryPercent = 0, inactiveFile = null} = {}) {
     const systemDelta = 1_000_000_000,
           cpuDelta    = (cpuPercent / 100) * systemDelta / 4,
           memoryLimit = 1000;
@@ -95,7 +95,9 @@ function statsSample({cpuPercent = 0, memoryPercent = 0} = {}) {
         },
         memory_stats: {
             usage: memoryLimit * memoryPercent / 100,
-            limit: memoryLimit
+            limit: memoryLimit,
+            // the reclaimable file cache, in the same units as `usage`
+            ...(inactiveFile === null ? {} : {stats: {inactive_file: inactiveFile}})
         }
     };
 }
@@ -1268,6 +1270,24 @@ test.describe('Neo.ai.daemons.services.DeploymentStateBridgeService', () => {
         expect(service.getStatsSamples('local-model')).toEqual([
             expect.objectContaining({containerId: 'container-B', observedAtMs: OBSERVED_AT})
         ]);
+    });
+
+    test('the snapshot publishes the memory in use beside the raw usage, and its percent reads the in-use share', async () => {
+        Object.assign(AiConfig.orchestrator.deploymentStateBridge, {allowedServices: ['chroma'], includeLogs: false});
+
+        const
+            runtimeAccessService = {
+                async readObserve({operation}) {
+                    return {
+                        data : operation === 'inspect' ? {State: {Status: 'running'}} : statsSample({memoryPercent: 84.42, inactiveFile: 140}),
+                        proof: {operation}
+                    };
+                }
+            },
+            snapshot = await createService({runtimeAccessService}).collectSnapshot();
+
+        expect(snapshot.services[0].stats).toMatchObject({memoryUsageBytes: 844.2, memoryInUseBytes: 704.2, memoryLimitBytes: 1000});
+        expect(snapshot.services[0].stats.memoryPercent).toBeCloseTo(70.42, 6)
     });
 
     test('publishes an unavailable provider-work envelope instead of manufacturing idle', async () => {

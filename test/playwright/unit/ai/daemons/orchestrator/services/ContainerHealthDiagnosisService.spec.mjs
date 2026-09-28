@@ -23,6 +23,7 @@ import {
     CPU_SATURATION_SCOPES,
     calculateDockerCpuPercent,
     resolveCpuSaturationScope,
+    calculateDockerMemoryInUseBytes,
     calculateDockerMemoryPercent,
     calculateHeapSaturationPercent,
     classifyHeapExhaustion
@@ -85,7 +86,7 @@ function runningInspect(overrides = {}) {
  * window nothing observed — which is precisely the defect these fixtures used to encode, so it is a
  * required argument in spirit even though it defaults for the single-sample cases.
  */
-function statsSample({cpuPercent = 0, memoryPercent = 0, observedAtMs, containerId = null} = {}) {
+function statsSample({cpuPercent = 0, memoryPercent = 0, observedAtMs, containerId = null, inactiveFile = null} = {}) {
     const systemDelta = 1_000_000_000,
           cpuDelta    = (cpuPercent / 100) * systemDelta / 4,
           memoryLimit = 1000;
@@ -107,7 +108,9 @@ function statsSample({cpuPercent = 0, memoryPercent = 0, observedAtMs, container
         },
         memory_stats: {
             usage: memoryLimit * memoryPercent / 100,
-            limit: memoryLimit
+            limit: memoryLimit,
+            // the reclaimable file cache, in the same units as `usage`
+            ...(inactiveFile === null ? {} : {stats: {inactive_file: inactiveFile}})
         }
     };
 }
@@ -167,6 +170,25 @@ test.describe('Neo.ai.daemons.services.ContainerHealthDiagnosisService', () => {
 
         expect(calculateDockerCpuPercent(stats)).toBe(280);
         expect(calculateDockerMemoryPercent(stats)).toBe(75);
+    });
+
+    test('memory in use leaves out the inactive file cache the kernel reclaims first, and a sample without the counter keeps its usage', () => {
+        const cached = statsSample({memoryPercent: 84.42, inactiveFile: 140});
+
+        expect(calculateDockerMemoryInUseBytes(cached)).toBeCloseTo(704.2, 6);
+        expect(calculateDockerMemoryPercent(cached)).toBeCloseTo(70.42, 6);
+        expect(calculateDockerMemoryPercent(statsSample({memoryPercent: 84.42}))).toBeCloseTo(84.42, 6);
+        expect(calculateDockerMemoryInUseBytes(statsSample({memoryPercent: 10, inactiveFile: 500})), 'a counter past the usage is not trusted').toBe(100)
+    });
+
+    test('a store whose excess is reclaimable file cache is not exhausted: Chroma\'s measured split', () => {
+        const
+            service = createService({storeMemorySaturationPercent: 80}),
+            window  = inactiveFile => [1_000_000, 1_032_000].map(observedAtMs => statsSample({memoryPercent: 84.42, inactiveFile, observedAtMs})),
+            memory  = decision => decision.facts.find(fact => fact.type === CONTAINER_HEALTH_FACT_TYPES.memorySaturation);
+
+        expect(memory(service.diagnose({serviceKey: 'chroma', nodeCommand: false, statsSamples: window(140)})), '70.42 % in use, under the store\'s 80').toBeUndefined();
+        expect(memory(service.diagnose({serviceKey: 'chroma', nodeCommand: false, statsSamples: window(null)}))?.details.minPercent, 'without the counter, the raw usage').toBeCloseTo(84.42, 2)
     });
 
     test.describe('calculateHeapSaturationPercent — the V8-scoped numerator (#16630 Slice B)', () => {
