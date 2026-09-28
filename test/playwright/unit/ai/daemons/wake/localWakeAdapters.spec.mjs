@@ -1,4 +1,8 @@
 import {test, expect} from '@playwright/test';
+import {execFileSync}    from 'child_process';
+import fs               from 'fs-extra';
+import os               from 'os';
+import path             from 'path';
 
 import {
     dispatchLocalWake,
@@ -304,6 +308,58 @@ test.describe.serial('ai/daemons/wake/localWakeAdapters', () => {
             outcomeReason: 'opencode-server authority tuple changed during coordinate rebind; refusing session retarget'
         });
         expect(fetchCount).toBe(1);
+    });
+
+    test('the emitted dialog-gate script COMPILES — a gate that cannot compile can never fire', async () => {
+        // The gate's whole job is to notice that focus is NOT a text input and defer instead of typing a
+        // wake into whatever owns the input path. It read focus with `role of focused element of window
+        // 1`, which is not valid AppleScript: the script failed to COMPILE (-2741) rather than raising
+        // inside its `try`, so the `interactive dialog pending` branch was unreachable, the caller's
+        // message match missed a compile error, and every delivery failed OPEN. The guard documented
+        // as armed was inert, and no test could see it — nothing here ever compiled the emitted argv.
+        //
+        // So compile it. `osacompile` is pure syntax and needs no Accessibility permission, so this runs
+        // where the probe itself cannot.
+        test.skip(process.platform !== 'darwin', 'AppleScript compilation is darwin-only');
+
+        let probeArgs = null;
+        const uiRecord = record('osascript', {
+            route: {
+                agentIdentity,
+                harnessTargetMetadata: {adapter: 'osascript', appName: 'OpenCode'},
+                adapterConfig        : {attemptTimeoutMs: 1000}
+            }
+        });
+
+        await dispatchLocalWake(uiRecord, {
+            platform        : 'darwin',
+            getDefaultTarget: async () => ({status: 'resolved', pid: 4321, instanceCount: 1, bundleName: 'OpenCode'}),
+            spawnAsync      : async (_command, args) => {
+                if (args.some(a => String(a).includes('interactiveDialogProbe'))) probeArgs = args;
+                return {stdout: '', stderr: ''}
+            }
+        });
+
+        expect(probeArgs).not.toBeNull();
+
+        // The argv is a flat `-e <fragment>` sequence; osascript concatenates them into one script.
+        const script = probeArgs.reduce((acc, fragment, i) =>
+            probeArgs[i - 1] === '-e' ? `${acc}${fragment}\n` : acc, '');
+        const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gate-')), 'gate.applescript');
+
+        fs.writeFileSync(file, script);
+
+        let compileError = null;
+        try {
+            execFileSync('osacompile', ['-o', file.replace(/\.applescript$/, '.scpt'), file], {stdio: 'pipe'});
+        } catch (error) {
+            compileError = String(error?.stderr || error?.message || error);
+        }
+
+        // The exact construct that made the gate inert, asserted absent as well as compiled — a green
+        // compile plus a readable script is the difference between a gate and a comment.
+        expect(script).not.toContain('role of focused element of');
+        expect(compileError).toBeNull();
     });
 
     test('a post-submit draft-restore focus race is delivered and never retried', async () => {
