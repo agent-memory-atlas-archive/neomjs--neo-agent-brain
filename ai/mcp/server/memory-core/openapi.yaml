@@ -2154,9 +2154,16 @@ paths:
                       type: string
                   activitySources:
                     type: object
-                    description: The field each node kind's `lastActivityAt` is read from; a kind absent here has no source.
+                    description: Per node kind, the field its `lastActivityAt` is read from, and when the store captured that source. `sourceCapturedAt` is null because the store keeps no capture time, so each source's freshness is unknown; a reader's own read time is not it. A kind absent here has no source.
                     additionalProperties:
-                      type: string
+                      type: object
+                      required: [field, sourceCapturedAt]
+                      properties:
+                        field:
+                          type: string
+                        sourceCapturedAt:
+                          type: integer
+                          nullable: true
                   nodes:
                     type: object
                     required: [ids, kinds, labels, authoredBy, assignedTo, memoryOf, gravityWell, strategicWeight, lastActivityAt]

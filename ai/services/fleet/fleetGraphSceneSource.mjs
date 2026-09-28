@@ -115,7 +115,9 @@ function trimToBytes(scene, maxBytes) {
  *
  * A scene carries `activitySources` only when the answer has the geometry columns. Its nodes then hold
  * `gravityWell: true` on a strategic anchor and `strategicWeight` where the Brain has one. `lastActivityAt`
- * (epoch ms, or null when the node lacks the field) appears on every node of a kind the map names.
+ * (epoch ms, or null when the node lacks the field) appears on every node of a kind the map names. Each
+ * kind's `sourceCapturedAt` passes through as the Brain states it; the envelope's `capturedAt` is this read's
+ * time, never a source's.
  *
  * @param {Object} input
  * @param {Object} input.graph The answer: `{kinds, types, nodes: {ids, kinds, labels}, edges, counts, budget, truncated}`.

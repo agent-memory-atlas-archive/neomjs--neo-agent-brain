@@ -232,7 +232,9 @@ test.describe('GraphService.readSceneGraph — paged across a large graph', () =
                 wire = await GraphService.readSceneGraph(),
                 row  = id => ['gravityWell', 'strategicWeight', 'lastActivityAt'].map(column => wire.nodes[column][wire.nodes.ids.indexOf(id)]);
 
-            expect(wire.activitySources).toEqual(GraphService.sceneActivitySources);
+            expect(Object.keys(wire.activitySources)).toEqual(Object.keys(GraphService.sceneActivitySources));
+            expect(wire.activitySources.ISSUE, 'no source records its capture time, so its freshness is stated unknown').toEqual({field: 'updatedAt', sourceCapturedAt: null});
+            expect(wire.activitySources.FILE).toEqual({field: 'mtimeMs', sourceCapturedAt: null});
             expect(wire.nodes.ids).toEqual(['concept-1', 'file-1', 'issue-1', 'issue-2', 'issue-3', 'memory-1']);
             expect(row('issue-1')).toEqual([1, 0.8, Date.parse('2026-09-28T10:00:00.000Z')]);
             expect(row('issue-2'), 'a mapped kind without its field').toEqual([0, null, null]);

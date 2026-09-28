@@ -1375,8 +1375,9 @@ class GraphService extends Base {
      *
      * Geometry columns carry the Brain's own meaning, never the property bag: `gravityWell` (1 for a REM
      * strategic anchor, else 0), `strategicWeight` (a number or null) and `lastActivityAt` (epoch ms or null),
-     * read from the field {@link GraphService#sceneActivitySources} names for the node's kind, which the answer
-     * repeats as `activitySources`. The store records no per-node capture time.
+     * read from the field {@link GraphService#sceneActivitySources} names for the node's kind. The answer's
+     * `activitySources` names that field per kind with `sourceCapturedAt: null`: the store keeps no capture time
+     * for any source, so a value's freshness is unknown, and a reader's own read time is not it.
      * @param {Object} [data]
      * @param {Number} [data.maxNodes=250000]
      * @param {Number} [data.maxEdges=500000]
@@ -1500,7 +1501,7 @@ class GraphService extends Base {
             kinds          : kinds.list,
             types          : types.list,
             actors         : actors.list,
-            activitySources: {...sources},
+            activitySources: Object.fromEntries(Object.entries(sources).map(([kind, field]) => [kind, {field, sourceCapturedAt: null}])),
             nodes          : {
                 ids            : nodes.map(node => node.id),
                 kinds          : nodes.map(node => kinds.code(node.kind)),
