@@ -381,9 +381,10 @@ class IngestionService extends Base {
             if (embeddableChunks.length > 0) {
                 this.updateIngestionProgress({phase: 'embedding'});
                 await this.embedChunkGroups({
-                    chunks               : embeddableChunks,
-                    onProviderTimeout    : controls.onProviderTimeout,
-                    replayEmbeddingPoison: controls.replayEmbeddingPoison === true,
+                    chunks                : embeddableChunks,
+                    replaceSourceRevisions: trustBoundary.trusted && summary.errors.length === 0,
+                    onProviderTimeout     : controls.onProviderTimeout,
+                    replayEmbeddingPoison : controls.replayEmbeddingPoison === true,
                     // Fourth member of the control envelope, alongside signal / onProviderTimeout /
                     // poison replay. Optional by construction: an absent predicate leaves
                     // `embedChunks` on its `() => false` default, so a caller that supplies no
@@ -573,6 +574,8 @@ class IngestionService extends Base {
      * @param {AbortSignal} [options.signal] Shared tenant-sweep provider circuit signal.
      * @param {Function} [options.onProviderTimeout] Synchronous native-provider timeout hook.
      * @param {Boolean} [options.replayEmbeddingPoison=false] Process-local operator replay control.
+     * @param {Boolean} [options.replaceSourceRevisions=false] Clean, trusted profile input contains
+     *                                                       every current chunk of each emitted source.
      * @param {Boolean} [options.viaMcp=true] Forwarded to `VectorService.embed`; `true` keeps
      *                                        the MCP work-volume gate, `false` (bulk CLI)
      *                                        bypasses it.
@@ -586,6 +589,7 @@ class IngestionService extends Base {
         viaMcp = true,
         signal,
         onProviderTimeout,
+        replaceSourceRevisions = false,
         replayEmbeddingPoison = false,
         shouldYield
     }) {
@@ -607,6 +611,7 @@ class IngestionService extends Base {
                 const result = await this.vectorService.embed(tempFile, {
                     deleteStale  : false,
                     onProviderTimeout,
+                    replaceSourceRevisions,
                     replayEmbeddingPoison,
                     shouldYield,
                     signal,
@@ -717,6 +722,9 @@ class IngestionService extends Base {
                 summary.embeddingsGenerated += Number.isSafeInteger(result?.embedded) && result.embedded >= 0
                     ? result.embedded
                     : 0;
+                summary.deleted += Number.isSafeInteger(result?.deleted) && result.deleted >= 0
+                    ? result.deleted
+                    : 0;
 
                 // A slice that stopped early is not a corpus that finished. Sticky across groups:
                 // one yielded group means the run as a whole did not exhaust its work, and a later
@@ -727,6 +735,7 @@ class IngestionService extends Base {
 
                 this.updateIngestionProgress({
                     embeddedChunks : summary.embeddingsGenerated,
+                    deletedRows    : summary.deleted,
                     errorCount     : summary.errors.length,
                     remainingChunks: summary.remaining,
                     settledChunks  : summary.settled

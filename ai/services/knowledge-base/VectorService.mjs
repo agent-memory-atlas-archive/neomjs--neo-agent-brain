@@ -2420,6 +2420,9 @@ class VectorService extends Base {
      * @param {Boolean} [opts.deleteStale=true]    True applies full-corpus stale-id deletion.
      *                                             Incremental ingestion pushes pass `false` and
      *                                             use explicit deletion signaling instead.
+     * @param {Boolean} [opts.replaceSourceRevisions=false] Internal trusted-profile mode: retire
+     *                                             prior profile rows for supplied sources only after
+     *                                             all current chunks land. Legacy unprofiled rows stay.
      * @param {String}  [opts.staleStrategy]       Stale handling strategy. `delete-upfront`
      *                                             preserves the historical behavior;
      *                                             `shadow-swap` rebuilds into a fresh collection
@@ -2440,6 +2443,7 @@ class VectorService extends Base {
         viaMcp = false,
         tenantContext = {},
         deleteStale = true,
+        replaceSourceRevisions = false,
         staleStrategy,
         shouldYield = () => false,
         signal,
@@ -2582,6 +2586,9 @@ class VectorService extends Base {
         // Convert existingIds Set to Array for filtering, as existingDocs object is no longer available
         const existingIdsArray = Array.from(existingIds);
         const idsToDelete      = resolvedStaleStrategy === STALE_STRATEGY_SKIP ? [] : existingIdsArray.filter(id => !allIds.has(id));
+        const idsToReplace     = replaceSourceRevisions && resolvedStaleStrategy === STALE_STRATEGY_SKIP
+            ? await this.getSupersededSourceIds({collection, chunks: expandedKnowledgeBase, ownedScope, allIds})
+            : [];
         const shouldShadowSwap = resolvedStaleStrategy === 'shadow-swap' && (chunksToProcess.length > 0 || idsToDelete.length > 0);
         const workVolume       = shouldShadowSwap ? expandedKnowledgeBase.length : chunksToProcess.length;
 
@@ -2601,20 +2608,20 @@ class VectorService extends Base {
         // returned before the gate was ever evaluated, which made the largest possible
         // deletion the one case no guard saw. A mass delete is work.
         const mcpThreshold = aiConfig.mcpSyncMaxChunks;
-        if (viaMcp && Math.max(workVolume, idsToDelete.length) > mcpThreshold) {
+        if (viaMcp && Math.max(workVolume, idsToDelete.length + idsToReplace.length) > mcpThreshold) {
             // `logPath` is a Provider-owned leaf; read it directly so malformed config
             // shape fails loud instead of silently re-deriving a local default.
             const logDir       = aiConfig.logPath;
             const errorPayload = {
                 error  : `KB sync work volume exceeds MCP-callable threshold`,
-                message: `${workVolume} chunks need re-embedding and ${idsToDelete.length} need deleting ` +
+                message: `${workVolume} chunks need re-embedding and ${idsToDelete.length + idsToReplace.length} need deleting ` +
                          `(threshold: ${mcpThreshold}). ` +
                          `Synchronous work at this volume risks agent freeze. ` +
                          `Run via CLI: \`npm run ai:sync-kb\`. ` +
                          `Tail progress: \`tail -f ${logDir}/kb-server-$(date +%Y-%m-%d).log\`.`,
                 code           : 'KB_SYNC_VOLUME_EXCEEDED',
                 chunksToProcess: workVolume,
-                idsToDelete    : idsToDelete.length,
+                idsToDelete    : idsToDelete.length + idsToReplace.length,
                 threshold      : mcpThreshold
             };
             logger.warn(`[VectorService] ${errorPayload.error}: ${errorPayload.message}`);
@@ -2627,7 +2634,7 @@ class VectorService extends Base {
         // "No changes detected. Knowledge base is up to date." beside a large `deleted` count, a
         // success-shaped report for the opposite of no change. A delete-bearing pass now falls
         // through to the path below, which deletes and then states the resulting collection size.
-        if (!shouldShadowSwap && chunksToProcess.length === 0 && idsToDelete.length === 0) {
+        if (!shouldShadowSwap && chunksToProcess.length === 0 && idsToDelete.length === 0 && idsToReplace.length === 0) {
             const message = knownPoisonEntries.length > 0
                 ? `No recoverable changes detected; ${knownPoisonEntries.length} proven poison chunk(s) remain fenced for explicit replay or changed content.`
                 : 'No changes detected. Knowledge base is up to date.';
@@ -2679,10 +2686,21 @@ class VectorService extends Base {
             poisonGenerationId: poisonCoordinates.generationId
         });
 
-        const count          = await collection.count();
         const failedBatches  = embedResult.failedBatches || [];
         const poisonedChunks = embedResult.poisonedChunks || [];
-        const message        = failedBatches.length > 0
+        const replacedIds    = embedResult.remaining === 0 && embedResult.yielded !== true
+            && failedBatches.length === 0 && poisonedChunks.length === 0
+            ? idsToReplace
+            : [];
+
+        // Replacement is post-write, including retries where all current IDs already landed.
+        // An incomplete run retains its prior rows; absence from a partial batch is not a tombstone.
+        if (replacedIds.length > 0) {
+            await collection.delete({ids: replacedIds});
+        }
+
+        const count   = await collection.count();
+        const message = failedBatches.length > 0
             ? `Embedding complete with ${failedBatches.length} skipped batch(es). Collection now contains ${count} items.`
             : poisonedChunks.length > 0
                 ? `Embedding complete with ${poisonedChunks.length} proven poison chunk(s) fenced. Collection now contains ${count} items.`
@@ -2699,7 +2717,7 @@ class VectorService extends Base {
             // `chunksToProcess` before the provider call, but still count as settled here.
             settled  : allIds.size - embedResult.remaining,
             remaining: embedResult.remaining,
-            deleted  : idsToDelete.length,
+            deleted  : idsToDelete.length + replacedIds.length,
             failedBatches,
             poisonedChunks,
             // The discriminator between "this corpus is done" and "this slice stopped early". Dropping
@@ -2722,6 +2740,49 @@ class VectorService extends Base {
             deathGraduations   : embedResult.deathGraduations    || [],
             deathStrikeProgress: embedResult.deathStrikeProgress || []
         };
+    }
+
+    /**
+     * @summary Captures prior profile IDs for the complete sources in one trusted ingestion batch.
+     * @param {Object} options
+     * @param {Object} options.collection Target collection.
+     * @param {Object[]} options.chunks Current tenant-stamped chunks after input splitting.
+     * @param {Object} options.ownedScope Exact tenant/repository filter.
+     * @param {Set<String>} options.allIds Current IDs, including unchanged source elements.
+     * @returns {Promise<String[]>} Superseded IDs eligible for deletion after successful embedding.
+     * @protected
+     */
+    async getSupersededSourceIds({collection, chunks, ownedScope, allIds}) {
+        const paths = [...new Set(chunks
+            .filter(chunk => /^[a-f0-9]{64}$/u.test(chunk.extractionIdentity) && chunk.sourcePath)
+            .map(chunk => chunk.sourcePath))];
+        const ids   = [];
+        const limit = 2000;
+
+        // Enumerate IDs first. Metadata contains entire bodies, so inspect only superseded
+        // candidates, in bounded pages. Chroma's $ne also matches a missing field.
+        for (let start = 0; start < paths.length; start += limit) {
+            const where = {$and: [
+                ownedScope,
+                {sourcePath: {$in: paths.slice(start, start + limit)}}
+            ]};
+            let offset = 0, batch;
+
+            do {
+                batch = await collection.get({where, include: [], limit, offset});
+                const candidates = batch.ids.filter(id => !allIds.has(id));
+
+                for (let cursor = 0; cursor < candidates.length; cursor += 50) {
+                    const prior = await collection.get({ids: candidates.slice(cursor, cursor + 50), include: ['metadatas'], limit: 50});
+                    prior.ids.forEach((id, index) => {
+                        if (/^[a-f0-9]{64}$/u.test(prior.metadatas[index]?.extractionIdentity)) ids.push(id);
+                    });
+                }
+                offset += limit;
+            } while (batch.ids.length === limit);
+        }
+
+        return ids;
     }
 
     /**

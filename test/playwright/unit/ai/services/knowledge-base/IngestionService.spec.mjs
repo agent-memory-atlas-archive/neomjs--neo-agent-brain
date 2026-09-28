@@ -19,6 +19,8 @@ import {test, expect} from '@playwright/test';
 import Neo            from 'neo.mjs/src/Neo.mjs';
 import * as core      from 'neo.mjs/src/core/_export.mjs';
 import fs             from 'fs-extra';
+import os             from 'os';
+import path           from 'path';
 import aiConfig       from '../../../../../../ai/mcp/server/knowledge-base/config.template.mjs';
 import {
     KB_VECTOR_EMBED_UNDELIVERABLE_AT_GEOMETRY,
@@ -55,6 +57,16 @@ function validParsedChunk(overrides = {}) {
     };
 }
 
+/** @summary Applies the Chroma predicates used by ingestion and source lookup to fixture rows. */
+function matchesWhere(metadata, where) {
+    if (!where) return true;
+    if (where.$and) return where.$and.every(clause => matchesWhere(metadata, clause));
+    return Object.entries(where).every(([key, value]) => {
+        if (value?.$in) return value.$in.includes(metadata[key]);
+        return metadata[key] === (value?.$eq ?? value);
+    });
+}
+
 function createSpyCollection(rows = []) {
     const state = new Map(rows.map(row => [row.id, row]));
 
@@ -62,9 +74,9 @@ function createSpyCollection(rows = []) {
         state,
         name: 'spy-knowledge-base',
 
-        async get({where, limit = 2000, offset = 0, include = []} = {}) {
+        async get({ids, where, limit = 2000, offset = 0, include = []} = {}) {
             const all = Array.from(state.values())
-                .filter(row => !where?.tenantId || row.metadata.tenantId === where.tenantId);
+                .filter(row => (!ids || ids.includes(row.id)) && matchesWhere(row.metadata, where));
             const slice = all.slice(offset, offset + limit);
 
             return {
@@ -75,6 +87,14 @@ function createSpyCollection(rows = []) {
 
         async delete({ids}) {
             ids.forEach(id => state.delete(id));
+        },
+
+        async upsert({ids, metadatas}) {
+            ids.forEach((id, index) => state.set(id, {id, metadata: metadatas[index]}));
+        },
+
+        async count() {
+            return state.size;
         }
     };
 }
@@ -189,6 +209,156 @@ test.describe('IngestionService.ingestSourceFiles', () => {
         Object.assign(Service, originals);
     });
 
+    test('replaces successful profile source revisions through ingestion and ordinary source lookup', async () => {
+        const
+            {default: vector}         = await import('../../../../../../ai/services/knowledge-base/VectorService.mjs'),
+            {default: chroma}         = await import('../../../../../../ai/services/knowledge-base/ChromaManager.mjs'),
+            {default: embedding}      = await import('../../../../../../ai/services/memory-core/TextEmbeddingService.mjs'),
+            {default: query}          = await import('../../../../../../ai/services/knowledge-base/QueryService.mjs'),
+            {default: requestContext} = await import('../../../../../../ai/mcp/server/shared/services/RequestContextService.mjs'),
+            saved                     = {
+                getCollection : chroma.getKnowledgeBaseCollection,
+                embedTexts    : embedding.embedTexts,
+                embedChunks   : vector.embedChunks,
+                resumeStateDir: vector.resumeStateDir,
+                getUserId     : requestContext.getUserId
+            },
+            tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kb-revision-test-')),
+            sourcePath = 'neo/discussions/chunk-3/discussion-19151.md',
+            file = (name, content, overrides = {}) => ({
+                sourcePath,
+                repoSlug          : 'repo-a',
+                extractionIdentity: TEST_EXTRACTION_IDENTITY,
+                extractorId       : 'ConversationCorpusSource',
+                extractorVersion  : '1.0.0',
+                parserId          : 'conversation-corpus',
+                parserVersion     : '1.0.0',
+                profileChunk      : {source: sourcePath, kind: 'discussion', name, content},
+                ...overrides
+            }),
+            ingest = files => Service.ingestSourceFilesForTenantSync({tenantId: 'tenant-a', repoSlug: 'repo-a', files});
+
+        try {
+            chroma.getKnowledgeBaseCollection = async () => collection;
+            embedding.embedTexts = async texts => texts.map(() => new Array(384).fill(0));
+            requestContext.getUserId = () => 'tenant-a';
+            vector.resumeStateDir = tempDir;
+            Service.vectorService = vector;
+
+            const first = await ingest([
+                file('neo/discussion-19151#body', 'revision A'),
+                file('neo/discussion-19151#comment-0', 'removed in B'),
+                file('neo/discussion-19151#comment-1', 'unchanged')
+            ]);
+            expect(first.errors).toEqual([]);
+            expect((await query.findDocBySource(sourcePath)).metadata.content).toBe('revision A');
+
+            // These are outside this profile-source replacement, even when their paths collide.
+            for (const [id, metadata] of [
+                ['other-repo', {tenantId: 'tenant-a', repoSlug: 'repo-b', sourcePath}],
+                ['other-tenant', {tenantId: 'tenant-b', repoSlug: 'repo-a', sourcePath}],
+                ['other-source', {tenantId: 'tenant-a', repoSlug: 'repo-a', sourcePath: 'other.md'}],
+                ['legacy', {tenantId: 'tenant-a', repoSlug: 'repo-a', sourcePath, extractionIdentity: undefined}]
+            ]) {
+                collection.state.set(id, {id, metadata: {extractionIdentity: TEST_EXTRACTION_IDENTITY, ...metadata}});
+            }
+
+            const revisionB = [
+                file('neo/discussion-19151#body', 'revision B', {extractionIdentity: 'f'.repeat(64)}),
+                file('neo/discussion-19151#comment-1', 'unchanged'),
+                file('neo/discussion-19151#comment-2', 'new in B')
+            ];
+            const priorIds = [...collection.state.keys()];
+            vector.embedChunks = async () => { throw new Error('provider unavailable'); };
+            const failed = await ingest(revisionB);
+            expect(failed.errors).not.toEqual([]);
+            expect(failed.deleted).toBe(0);
+            expect([...collection.state.keys()]).toEqual(priorIds);
+
+            vector.embedChunks = async options => {
+                await saved.embedChunks.call(vector, {...options, chunksToProcess: options.chunksToProcess.slice(0, 1)});
+                return {embedded: 1, remaining: 1, yielded: true};
+            };
+            const partial = await ingest(revisionB);
+            expect(partial).toMatchObject({yielded: true, deleted: 0, embeddingsGenerated: 1});
+            expect(collection.state.size).toBe(priorIds.length + 1);
+            for (const id of priorIds) expect(collection.state.has(id)).toBe(true);
+
+            vector.embedChunks = async () => ({
+                embedded: 0, remaining: 0, poisonedChunks: [{chunkId: 'blocked', reasonCode: 'KB_VECTOR_EMBED_UNCLASSIFIED'}]
+            });
+            expect((await ingest(revisionB)).deleted).toBe(0);
+            for (const id of priorIds) expect(collection.state.has(id)).toBe(true);
+
+            vector.embedChunks = saved.embedChunks;
+            const invalid = await ingest([...revisionB, file('invalid', 'invalid', {parserId: undefined})]);
+            expect(invalid.errors).not.toEqual([]);
+            expect(invalid.deleted).toBe(0);
+            for (const id of priorIds) expect(collection.state.has(id)).toBe(true);
+
+            // All B chunks landed in the incomplete attempts. A clean replay must still retire A.
+            const second = await ingest(revisionB);
+            expect(second.errors).toEqual([]);
+            expect(second.embeddingsGenerated).toBe(0);
+            // Source lookup may choose any current element of the file, including an unchanged comment.
+            expect(['revision B', 'unchanged', 'new in B']).toContain((await query.findDocBySource(sourcePath)).metadata.content);
+            const bodies = [...collection.state.values()].filter(row => row.metadata.name === 'neo/discussion-19151#body');
+            expect(bodies.map(row => row.metadata.content)).toEqual(['revision B']);
+            expect(second.deleted).toBe(2);
+            for (const id of ['other-repo', 'other-tenant', 'other-source', 'legacy']) {
+                expect(collection.state.has(id), id).toBe(true);
+            }
+            const ids    = [...collection.state.keys()];
+            const repeat = await ingest(revisionB);
+            expect(repeat).toMatchObject({errors: [], embeddingsGenerated: 0, deleted: 0});
+            expect([...collection.state.keys()]).toEqual(ids);
+        } finally {
+            chroma.getKnowledgeBaseCollection = saved.getCollection;
+            embedding.embedTexts = saved.embedTexts;
+            vector.embedChunks = saved.embedChunks;
+            vector.resumeStateDir = saved.resumeStateDir;
+            requestContext.getUserId = saved.getUserId;
+            await fs.remove(tempDir);
+        }
+    });
+
+    test('replacement filter excludes missing profile metadata on run-scoped Chroma', async () => {
+        const
+            {ChromaClient}    = await import('chromadb'),
+            {default: vector} = await import('../../../../../../ai/services/knowledge-base/VectorService.mjs');
+
+        expect(process.env.NEO_CHROMA_PORT_TEST).toBeTruthy();
+        const client  = new ChromaClient({host: '127.0.0.1', port: Number(process.env.NEO_CHROMA_PORT_TEST), ssl: false});
+        const store   = await client.createCollection({name: `revision-scope-${process.pid}-${Date.now()}`, embeddingFunction: null});
+        const scope   = {tenantId: 'tenant-a', repoSlug: 'repo-a'};
+        const current = {...scope, sourcePath: 'discussion.md', extractionIdentity: TEST_EXTRACTION_IDENTITY};
+        const ids     = ['old', 'current', 'legacy', 'empty-profile', 'other-repo', 'other-tenant', 'other-source'];
+
+        try {
+            await store.upsert({
+                ids,
+                embeddings: ids.map(() => [1, 0, 0]),
+                metadatas : [
+                    {...current, extractionIdentity: 'f'.repeat(64)},
+                    current,
+                    {...scope, sourcePath: 'discussion.md'},
+                    {...current, extractionIdentity: ''},
+                    {...current, repoSlug: 'repo-b'},
+                    {...current, tenantId: 'tenant-b'},
+                    {...current, sourcePath: 'other.md'}
+                ]
+            });
+            expect(await vector.getSupersededSourceIds({
+                collection: store,
+                chunks    : [current],
+                ownedScope: vector.buildOwnedScopeFilter(scope),
+                allIds    : new Set(['current'])
+            })).toEqual(['old']);
+        } finally {
+            await client.deleteCollection({name: store.name});
+        }
+    });
+
     test('validates parsed-chunk-v1 records, routes them to VectorService, and records telemetry', async () => {
         const summary = await Service.ingestSourceFiles({
             tenantId: 'tenant-a',
@@ -202,6 +372,7 @@ test.describe('IngestionService.ingestSourceFiles', () => {
         expect(summary.errors).toEqual([]);
         expect(vectorCalls).toHaveLength(1);
         expect(vectorCalls[0].options.deleteStale).toBe(false);
+        expect(vectorCalls[0].options.replaceSourceRevisions).toBe(false);
         expect(vectorCalls[0].options.tenantContext).toMatchObject({
             tenantId           : 'tenant-a',
             repoSlug           : 'repo-a',
