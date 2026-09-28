@@ -1328,8 +1328,8 @@ class GraphService extends Base {
     }
 
     /**
-     * @summary The whole graph one viewer may see, in display fields only: the bulk read behind the
-     * Fleet cockpit's Observatory.
+     * @summary The whole graph visible to a viewer, with display fields and historical issue/PR and
+     * agent-memory attribution for the Fleet cockpit's Observatory.
      *
      * One pass per table under the SQL RLS clause of {@link GraphService#listNodeRecordsByType}, with the
      * `isRlsVisible` recheck at the return boundary. A node carries display fields and allowed attribution, never its

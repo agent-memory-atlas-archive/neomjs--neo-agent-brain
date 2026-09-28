@@ -2107,7 +2107,7 @@ paths:
       x-pass-as-object: true
       x-annotations:
         readOnlyHint: true
-      x-neo-tool-summary: Read the whole graph the caller may see, in display fields only (the Fleet Observatory's scene).
+      x-neo-tool-summary: Read the graph visible to the caller, with display fields and historical issue/PR and agent-memory attribution.
       description: >-
         Reads every node the caller may see, and every relation between two of them, under the graph's
         row-level security. Answers columnar data, `{kinds, types, nodes: {ids, kinds, labels}, edges, counts,
