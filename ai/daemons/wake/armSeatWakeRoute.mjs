@@ -239,17 +239,34 @@ export async function armSeatWakeRoute({
         // `route.adapter` is the adapter the route will actually USE, read by the builder at
         // publish time — not a default, and not a re-read of the input subscription. Reading the
         // input here instead would compare the request with itself and always agree.
+        // EVERY own route must be on the armed adapter. An `includes` check over the distinct adapter
+        // set is the same class of partial predicate as trusting a successful call: a mixed own set
+        // (`opencode-server` + `osascript`) satisfies it, and the aggregate then reports
+        // `armed: true` with `adapter: 'osascript'` while part of the seat cannot be reached.
+        //
+        // The predicate is per-ROUTE, not per-adapter-set, so a route carrying no adapter at all also
+        // fails — a set-derived check would see an empty set, find no foreign adapter, and wave it
+        // through.
         const publishedAdapters = [...new Set(ownRoutes
             .map(route => route?.adapter)
             .filter(Boolean))];
+        const nonArmedRoutes = ownRoutes.filter(route => route?.adapter !== ARMED_ADAPTER);
 
-        if (!publishedAdapters.includes(ARMED_ADAPTER)) {
+        if (nonArmedRoutes.length) {
+            const foreignAdapters = publishedAdapters.filter(adapter => adapter !== ARMED_ADAPTER);
+
+            // Two named shapes, because they need different repairs: a single stale route is a
+            // mis-pointed subscription, while a mixed set means the seat is half-migrated.
+            const reason = publishedAdapters.length > 1
+                ? `${nonArmedRoutes.length} of ${ownRoutes.length} route(s) for ${tuple.identity} are published on adapter '${foreignAdapters.join(', ')}' while arming harness '${harness}' arms '${ARMED_ADAPTER}' — this is a MIXED route set, and a seat with any route on another adapter is NOT reliably reachable; the delivery path was NOT switched for those routes, so update EVERY subscription for this seat to '${ARMED_ADAPTER}' with this instanceAddress and re-arm`
+                : `the route for ${tuple.identity} is published on adapter '${publishedAdapters.join(', ') || 'none'}', but arming harness '${harness}' arms '${ARMED_ADAPTER}' — the instance tuple was derived and the delivery path was NOT switched; update the subscription's adapter to '${ARMED_ADAPTER}' with this instanceAddress and re-arm`;
+
             return {
                 armed     : false,
                 identity  : tuple.identity,
                 routeCount: ownRoutes.length,
                 adapter   : publishedAdapters.join(', ') || 'none',
-                reason    : `the route for ${tuple.identity} is published on adapter '${publishedAdapters.join(', ') || 'none'}', but arming harness '${harness}' arms '${ARMED_ADAPTER}' — the instance tuple was derived and the delivery path was NOT switched; update the subscription's adapter to '${ARMED_ADAPTER}' with this instanceAddress and re-arm`,
+                reason,
                 skipped   : result?.skipped ?? []
             };
         }

@@ -56,7 +56,10 @@ function makeSubscription({agentIdentity = '@neo-preview', adapter = ARMED_ADAPT
     };
 }
 
-/** A builder stand-in: `routeSummaries` is the merged published table, exactly as the real one reports it. */
+/** A builder stand-in. `routeSummaries` carries every published route, including ones owned by other
+ * identities, so the caller's own-identity filter is exercised rather than bypassed. Shape fidelity
+ * beyond that is not claimed — this stand-in exists to drive the admission predicate, not to mirror
+ * the builder field-for-field. */
 function makeBuilder({routes = [], skipped = [], throws = null} = {}) {
     return async () => {
         if (throws) {
@@ -313,5 +316,40 @@ test.describe('armSeatWakeRoute — a success must mean a reachable seat', () =>
 
         expect(result.armed).toBe(false);
         expect(result.adapter).toBe('none');
+    });
+
+    test('a MIXED own route set is a named non-success, not an aggregate success', async () => {
+        // Red control. One own route on the armed adapter and one on another satisfies a partial
+        // `includes` check, so the aggregate used to report `armed: true` with `adapter: 'osascript'`
+        // while half this seat's routes could not reach it. A seat is reachable only if EVERY own
+        // route is on the armed adapter.
+        const result = await armSeatWakeRoute({
+            ...base(),
+            runBuilder: makeBuilder({routes: [
+                ownRouteOn(ARMED_ADAPTER),
+                ownRouteOn('opencode-server')
+            ]})
+        });
+
+        expect(result.armed).toBe(false);
+        expect(result.routeCount).toBe(2);
+        expect(result.adapter).toContain('opencode-server');
+        expect(result.reason).toContain('MIXED');
+    });
+
+    test('every own route on the armed adapter is the positive control for the mixed control', async () => {
+        // The same two-route shape, both correct: `armed` must be true, or the red control above
+        // would pass for the wrong reason (a count that rejects any multi-route seat).
+        const result = await armSeatWakeRoute({
+            ...base(),
+            runBuilder: makeBuilder({routes: [
+                ownRouteOn(ARMED_ADAPTER),
+                {...ownRouteOn(ARMED_ADAPTER), subscriptionId: SUBSCRIPTION_ID + ':2'}
+            ]})
+        });
+
+        expect(result.armed).toBe(true);
+        expect(result.routeCount).toBe(2);
+        expect(result.adapter).toBe(ARMED_ADAPTER);
     });
 });
