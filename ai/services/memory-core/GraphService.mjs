@@ -1373,6 +1373,10 @@ class GraphService extends Base {
      * agent-memory identity only. A missing assignee list is null; an observed empty list is [].
      * The dictionary is built after RLS and budget selection, so excluded rows contribute no actors.
      *
+     * The `state` column codes each issue's, PR's and discussion's stored `state` into the `states`
+     * dictionary, so a reader can tell merged or closed work from open work; -1 is a work item with no
+     * stored state, or any other kind.
+     *
      * Geometry columns carry the Brain's own meaning, never the property bag: `gravityWell` (1 for a REM
      * strategic anchor, else 0), `strategicWeight` (a number or null) and `lastActivityAt` (epoch ms or null),
      * read from the field {@link GraphService#sceneActivitySources} names for the node's kind. The answer's
@@ -1381,7 +1385,7 @@ class GraphService extends Base {
      * @param {Object} [data]
      * @param {Number} [data.maxNodes=250000]
      * @param {Number} [data.maxEdges=500000]
-     * @returns {Promise<Object>} `{kinds, types, actors, activitySources, nodes, edges, counts, budget, truncated}`.
+     * @returns {Promise<Object>} `{kinds, types, actors, states, activitySources, nodes, edges, counts, budget, truncated}`.
      */
     async readSceneGraph({maxNodes = 250000, maxEdges = 500000} = {}) {
         const sqlite = this.db?.storage?.db;
@@ -1440,6 +1444,7 @@ class GraphService extends Base {
                     authoredBy     : work ? actor(properties.author) : null,
                     assignedTo     : assigned?.every(Boolean) ? [...new Set(assigned)].sort() : null,
                     memoryOf       : kind === 'AGENT_MEMORY' ? actor(properties.agentIdentity) : null,
+                    state          : work || kind === 'DISCUSSION' ? text(properties.state) : null,
                     gravityWell    : properties.gravity_well === true ? 1 : 0,
                     strategicWeight: Number.isFinite(properties.strategic_weight) ? properties.strategic_weight : null,
                     lastActivityAt : Object.hasOwn(sources, kind) ? epochMs(properties[sources[kind]]) : null
@@ -1486,6 +1491,7 @@ class GraphService extends Base {
             kinds      = dictionary(),
             types      = dictionary(),
             actors     = dictionary(),
+            states     = dictionary(),
             position   = new Map(nodes.map((node, index) => [node.id, index])),
             flat       = new Array(edges.length * 3),
             linked     = new Set();
@@ -1501,6 +1507,7 @@ class GraphService extends Base {
             kinds          : kinds.list,
             types          : types.list,
             actors         : actors.list,
+            states         : states.list,
             activitySources: Object.fromEntries(Object.entries(sources).map(([kind, field]) => [kind, {field, sourceCapturedAt: null}])),
             nodes          : {
                 ids            : nodes.map(node => node.id),
@@ -1509,6 +1516,7 @@ class GraphService extends Base {
                 authoredBy     : nodes.map(node => node.authoredBy === null ? -1 : actors.code(node.authoredBy)),
                 assignedTo     : nodes.map(node => node.assignedTo === null ? null : node.assignedTo.map(actors.code)),
                 memoryOf       : nodes.map(node => node.memoryOf === null ? -1 : actors.code(node.memoryOf)),
+                state          : nodes.map(node => node.state === null ? -1 : states.code(node.state)),
                 gravityWell    : nodes.map(node => node.gravityWell),
                 strategicWeight: nodes.map(node => node.strategicWeight),
                 lastActivityAt : nodes.map(node => node.lastActivityAt)

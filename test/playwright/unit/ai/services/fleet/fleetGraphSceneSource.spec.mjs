@@ -58,11 +58,11 @@ const
     // The admission as the live plane writes it: a whole object, not a word, and this source never decides which
     // parts of it matter (`get_computed_route` on our plane, 2026-09-29T09:2xZ, `computed-route.v1` fresh).
     ADMISSION = {
-        admitted       : true,
-        fallback       : 'current',
-        reasonCode     : 'projection-current',
-        requiredFacets : ['issues', 'discussions'],
-        staleFacets    : []
+        admitted      : true,
+        fallback      : 'current',
+        reasonCode    : 'projection-current',
+        requiredFacets: ['issues', 'discussions'],
+        staleFacets   : []
     },
     ROUTE = {
         status   : 'available',
@@ -135,11 +135,11 @@ test.describe('fleetGraphSceneSource', () => {
         // source reports the route it was served and the admission beside it, and never re-decides the second.
         const
             lastGood = {
-                admitted       : false,
-                fallback       : 'last-known-good',
-                reasonCode     : 'projection-stale',
-                requiredFacets : ['issues', 'discussions'],
-                staleFacets    : ['discussions']
+                admitted      : false,
+                fallback      : 'last-known-good',
+                reasonCode    : 'projection-stale',
+                requiredFacets: ['issues', 'discussions'],
+                staleFacets   : ['discussions']
             },
             withheld = await createFleetGraphSceneSource(seams({
                 getComputedRoute: async () => ({...ROUTE, admission: lastGood})
@@ -257,6 +257,20 @@ test.describe('fleetGraphSceneSource — pure projection', () => {
 
         expect(older).not.toHaveProperty('activitySources');
         expect(older.nodes.map(node => Object.keys(node).join())).toEqual(['id,label,kind', 'id,label,kind', 'id,label,kind'])
+    });
+
+    test('the state column lands on issues, PRs and discussions only, and an answer without it projects as before', () => {
+        const
+            nodes = [...NODES, {id: 'discussion-3', kind: 'DISCUSSION', label: 'Three'}],
+            plain = answerOf(nodes, EDGES),
+            graph = {...plain, states: ['MERGED', 'OPEN'], nodes: {...plain.nodes, state: [-1, 0, -1, 1]}},
+            byId  = new Map(projectScene({graph}).nodes.map(node => [node.id, node]));
+
+        expect(byId.get('neomjs/neo#pr-101').state).toBe('MERGED');
+        expect(byId.get('neomjs/neo#discussion-3').state).toBe('OPEN');
+        expect(byId.get('neomjs/neo#issue-7'), 'a work item the store holds no state for').toHaveProperty('state', null);
+        expect(byId.get('neomjs/neo#concept-a'), 'a kind without a lifecycle carries none').not.toHaveProperty('state');
+        expect(projectScene({graph: plain}).nodes.some(node => Object.hasOwn(node, 'state')), 'an older answer').toBe(false)
     });
 
     test('a fresh read never stands in for when a source was captured', async () => {

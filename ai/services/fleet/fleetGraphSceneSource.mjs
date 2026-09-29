@@ -115,6 +115,9 @@ function trimToBytes(scene, maxBytes) {
  * Optional actor columns become role-specific identifiers only on their allowed node kinds. A null
  * assignee list stays unknown; [] stays known empty. Older readers can omit all actor columns.
  *
+ * With the answer's `state` column, an issue, PR or discussion carries its stored `state` (`OPEN`,
+ * `MERGED`, … as the Brain stores it), or null; an answer without the column projects no `state`.
+ *
  * A scene carries `activitySources` only when the answer has the geometry columns. Its nodes then hold
  * `gravityWell: true` on a strategic anchor and `strategicWeight` where the Brain has one. `lastActivityAt`
  * (epoch ms, or null when the node lacks the field) appears on every node of a kind the map names. Each
@@ -137,6 +140,9 @@ export function projectScene({graph, route = [], maxBytes = DEFAULT_MAX_BYTES, o
         actor     = code => Number.isInteger(code) && code >= 0 && typeof graph.actors?.[code] === 'string'
             ? graph.actors[code]
             : null,
+        stateOf   = code => Number.isInteger(code) && code >= 0 && typeof graph.states?.[code] === 'string'
+            ? graph.states[code]
+            : null,
         qualified = ids.map(id => qualifyNodeId(id, origin)),
         nodes     = qualified
             .map((id, index) => {
@@ -152,6 +158,10 @@ export function projectScene({graph, route = [], maxBytes = DEFAULT_MAX_BYTES, o
                         : null;
                 } else if (kind === 'AGENT_MEMORY' && Array.isArray(graph.nodes.memoryOf)) {
                     node.memoryOf = actor(graph.nodes.memoryOf[index]);
+                }
+
+                if ((kind === 'ISSUE' || kind === 'PULL_REQUEST' || kind === 'DISCUSSION') && Array.isArray(graph.nodes.state)) {
+                    node.state = stateOf(graph.nodes.state[index]);
                 }
 
                 if (sources) {

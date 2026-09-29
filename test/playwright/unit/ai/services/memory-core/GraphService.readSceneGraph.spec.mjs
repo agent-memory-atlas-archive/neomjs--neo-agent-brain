@@ -257,6 +257,50 @@ test.describe('GraphService.readSceneGraph — paged across a large graph', () =
         }
     });
 
+    test('the state column codes each issue, PR and discussion by its stored state, and -1 for every other kind', async () => {
+        const
+            GraphService = (await import('../../../../../../ai/services/memory-core/GraphService.mjs')).default,
+            originalDb   = GraphService.db,
+            dbPath       = path.resolve(process.cwd(), 'tmp', `graph-state-${globalThis.crypto.randomUUID()}.sqlite`),
+            storage      = Neo.create(SQLite, {dbPath});
+
+        try {
+            await storage.ready();
+            storage.RequestContextService = {getUserId: () => 'tenant-x'};
+            storage.addNodes([
+                node('issue-1',      {state: 'CLOSED'}),
+                node('issue-2'),
+                node('pr-3',         {kind: 'PULL_REQUEST', state: 'MERGED'}),
+                node('discussion-4', {kind: 'DISCUSSION', state: 'OPEN'}),
+                node('memory-5',     {kind: 'AGENT_MEMORY', state: 'OPEN'}),
+                node('private-6',    {userId: 'tenant-y', state: 'DRAFT'})
+            ]);
+            GraphService.db = {storage};
+
+            const
+                wire = await GraphService.readSceneGraph(),
+                code = id => wire.nodes.state[wire.nodes.ids.indexOf(id)];
+
+            expect(wire.nodes.ids).toEqual(['discussion-4', 'issue-1', 'issue-2', 'memory-5', 'pr-3']);
+            expect(['issue-1', 'pr-3', 'discussion-4'].map(id => wire.states[code(id)])).toEqual(['CLOSED', 'MERGED', 'OPEN']);
+            expect(code('issue-2'), 'a work item with no stored state').toBe(-1);
+            expect(code('memory-5'), 'a kind without a lifecycle codes -1, whatever it carries').toBe(-1);
+            expect([...wire.states].sort(), 'the dictionary holds the answered states only').toEqual(['CLOSED', 'MERGED', 'OPEN']);
+            expect(JSON.stringify(wire), 'the hidden node leaves no trace').not.toMatch(/private-6|DRAFT/);
+
+            const
+                specification = yaml.load(await fs.readFile(path.resolve('ai/mcp/server/memory-core/openapi.yaml'), 'utf8')),
+                validate      = new Ajv({strict: false}).compile(specification.paths['/graph/scene'].post.responses['200'].content['application/json'].schema);
+
+            expect(validate(wire), JSON.stringify(validate.errors)).toBe(true);
+            expect(validate({...wire, nodes: {...wire.nodes, state: wire.nodes.state.map(() => -2)}})).toBe(false)
+        } finally {
+            GraphService.db = originalDb;
+            if (storage.db?.open) storage.db.close();
+            for (const suffix of ['', '-wal', '-shm']) fs.removeSync(dbPath + suffix);
+        }
+    });
+
     test('every page lands, and the plane runs other work between pages', async () => {
         const
             GraphService = (await import('../../../../../../ai/services/memory-core/GraphService.mjs')).default,
