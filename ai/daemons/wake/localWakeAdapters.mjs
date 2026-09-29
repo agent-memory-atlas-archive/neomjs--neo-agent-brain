@@ -871,24 +871,38 @@ function buildOsascriptArgs({appName, digest, focusSeedKey, focusSeedSequence, i
 }
 
 /**
- * @summary Delivers the osascript payload exactly once, then reports what actually happened.
+ * @summary Delivers the osascript payload exactly once, then reports what the dispatch did.
  *
- * There is deliberately no retry. A retry is not a safety net here — it is a cause of the
- * stranded-payload failure it was meant to prevent: the script pastes into the prompt field and
- * only afterwards reaches steps that can abort, so a retried attempt can leave attempt N's text
- * sitting in the field while attempt N+1 aborts at an earlier guard. The human-visible result is
- * "the message is in my prompt but nothing happened", with no error to explain it.
+ * **`delivered` means the script was dispatched and exited cleanly. It does not mean a turn
+ * started.** A digest can reach the prompt field, the script can exit 0, and the seat can still
+ * need a human to press Return; this harness has no Accessibility consent (`-25211`) and so has
+ * no turn-start oracle. A record reading `delivered` is evidence of dispatch, and any stronger
+ * reading of it belongs to the reader, not to the script.
+ *
+ * There is deliberately no retry, and the reason is a ruling rather than a diagnosis: on
+ * 2026-09-28 the operator's simplification read was that the machinery was more dangerous than
+ * the failure it guarded against, and that stands on its own. The stronger claim — that a retry
+ * *caused* the stranded-payload failure — is **not** established: it is the hypothesis that
+ * motivated the removal, and this PR found a no-retry path still fails intermittently (one wake
+ * started a turn, the very next did not).
+ *
+ * The hypothesis, recorded because it is what the removal was aimed at: the script pastes into
+ * the prompt field and only afterwards reaches steps that can abort, so a retried attempt can
+ * leave attempt N's text sitting in the field while attempt N+1 aborts at an earlier guard. The
+ * human-visible result is "the message is in my prompt but nothing happened", with no error to
+ * explain it. **Untested on this path.**
  *
  * The guards that gate *typing* are unchanged and remain load-bearing — they are what stops a
  * wake being pasted into a different seat's window. What is removed is the post-paste retry
- * machinery: once a keystroke has landed in the target's text field, that keystroke is the
- * confirmation, and a frontmost race inside the sub-second gap between paste and submit is not
- * worth the damage this caused on every ordinary message.
+ * machinery. A keystroke landing in the text field is evidence that the *paste* landed, and
+ * nothing more: the submit keystroke sits after it, and this function cannot know whether that
+ * one took.
  *
- * One classification is deliberately kept. A failure raised at a *post-submit* guard (the
- * user-input restore path) still counts as `delivered`, because `key code 36` has already fired
- * and the wake was in fact submitted — reporting that as a failure would hide real deliveries.
- * Everything else that throws is `failed` and carries the reason.
+ * One classification is deliberately kept, and it is about the script rather than the outcome.
+ * A failure raised at a *post-submit* guard (the user-input restore path) still counts as
+ * `delivered`, because `key code 36` has already been SENT by that point — sending it is a fact
+ * about the script's progress, and reporting a later cleanup failure as a delivery failure would
+ * hide real dispatches. It still does not assert a turn.
  *
  * @param {Object} effects Injected effect surface (`spawnAsync`, `log`).
  * @param {String[]} args `osascript` argv.
