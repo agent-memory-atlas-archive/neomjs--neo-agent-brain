@@ -55,7 +55,11 @@ const
         {source: 'pr-101', target: 'issue-7',   type: 'RESOLVES'},
         {source: 'pr-101', target: 'concept-a', type: 'TAGGED_CONCEPT'}
     ],
-    ROUTE = {status: 'available', route: {route: {items: [{id: 'issue-7'}, {id: 'pr-101'}]}}};
+    ROUTE = {
+        status   : 'available',
+        admission: {admitted: true, reasonCode: null},
+        route    : {route: {items: [{id: 'issue-7'}, {id: 'pr-101'}]}}
+    };
 
 /**
  * @summary The two operations a source reads through, answering the fixture graph and route.
@@ -97,13 +101,44 @@ test.describe('fleetGraphSceneSource', () => {
     });
 
     test('a route that cannot be read leaves the overlay empty and never withholds the graph', async () => {
-        for (const getComputedRoute of [async () => { throw new Error('down') }, async () => ({status: 'missing', reason: 'route-sidecar-missing'})]) {
+        // Two failures with two different reasons, and neither may read as a served plan.
+        for (const [getComputedRoute, reason] of [
+            [async () => { throw new Error('down') }, 'route-read-failed'],
+            [async () => ({status: 'missing', reason: 'route-sidecar-missing'}), 'route-sidecar-missing'],
+            [async () => ({status: 'available'}), 'route-answer-malformed']
+        ]) {
             const read = await createFleetGraphSceneSource(seams({getComputedRoute})).readGraphScene();
 
-            expect(read.capability.state).toBe('current');
+            expect(read.capability, `"${reason}" names the axis that failed`).toEqual({state: 'degraded', reason});
             expect(read.scene.route).toEqual([]);
-            expect(read.scene.nodes).toHaveLength(3)
+            expect(read.scene.nodes, 'the graph is served either way').toHaveLength(3);
+            expect(read.admission, 'no route answered, so no admission is claimed').toBeNull()
         }
+    });
+
+    test('the route\'s admission rides the envelope untouched, never re-derived', async () => {
+        const
+            current = await createFleetGraphSceneSource(seams()).readGraphScene();
+
+        expect(current.admission, "the producer's own admission, as written").toEqual({admitted: true, reasonCode: null});
+
+        // A withheld admission is a fact about the producer's freshness, and the pane is what renders it: this
+        // source reports the route it was served and the admission beside it, and never re-decides the second.
+        const withheld = await createFleetGraphSceneSource(seams({
+            getComputedRoute: async () => ({...ROUTE, admission: {admitted: false, reasonCode: 'projection-stale'}})
+        })).readGraphScene();
+
+        expect(withheld.capability.state, 'the operation served a route, so the scene read is current').toBe('current');
+        expect(withheld.admission).toEqual({admitted: false, reasonCode: 'projection-stale'})
+    });
+
+    test('a served route with no items is a current read of an empty plan, which is what makes `degraded` mean something', async () => {
+        const read = await createFleetGraphSceneSource(seams({
+            getComputedRoute: async () => ({...ROUTE, route: {route: {items: []}}})
+        })).readGraphScene();
+
+        expect(read.capability).toEqual({state: 'current', reason: null});
+        expect(read.scene.route).toEqual([])
     });
 
     test('the graph read receives the budget it was asked for, and a cut there reads truncated with that budget', async () => {
@@ -148,7 +183,7 @@ test.describe('fleetGraphSceneSource', () => {
         const failed    = await createFleetGraphSceneSource(seams({getGraphScene: async () => { throw new Error('down') }})).readGraphScene(),
               malformed = await createFleetGraphSceneSource(seams({getGraphScene: async () => ({nodes: []})})).readGraphScene();
 
-        expect(failed).toEqual({capability: {state: 'unavailable', reason: 'graph-read-failed'}, scene: null, snapshotId: null, capturedAt: NOW});
+        expect(failed).toEqual({capability: {state: 'unavailable', reason: 'graph-read-failed'}, admission: null, scene: null, snapshotId: null, capturedAt: NOW});
         expect(malformed.capability).toEqual({state: 'unavailable', reason: 'graph-answer-malformed'});
         expect(malformed.scene).toBeNull()
     });
