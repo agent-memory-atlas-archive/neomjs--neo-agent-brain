@@ -10,7 +10,9 @@ import {createHash} from 'node:crypto';
  * The Observatory draws one graph with an optional route, so the scene is the graph and the route is a list of
  * ids in it. One Memory Core read, `get_graph_scene`, answers the graph under the graph's own row-level
  * security; the route rides `get_computed_route`. A route that cannot be read leaves the overlay empty and
- * never withholds the graph.
+ * never withholds the graph — but the envelope names the failure, because an unserved route rendered as an
+ * empty one is a plan the fleet has against a plan it does not. The route's `admission` rides along
+ * untouched: freshness is the producer's fact and the pane's call.
  *
  * ## The two cuts, and why they are not the same cut
  *
@@ -220,7 +222,7 @@ export function createFleetGraphSceneSource({
          * @param {Number} [query.maxNodes] Handed to the graph read.
          * @param {Number} [query.maxEdges] Handed to the graph read.
          * @param {Number} [query.maxBytes]
-         * @returns {Promise<Object>} The read envelope.
+         * @returns {Promise<Object>} The read envelope: `{capability, admission, scene, snapshotId, capturedAt}`.
          */
         async readGraphScene({maxNodes, maxEdges, maxBytes} = {}) {
             const
@@ -231,6 +233,7 @@ export function createFleetGraphSceneSource({
                 answer         = graph.value,
                 unavailable    = reason => ({
                     capability: {state: 'unavailable', reason},
+                    admission : null,
                     scene     : null,
                     snapshotId: null,
                     capturedAt: new Date(now()).toISOString()
@@ -246,14 +249,32 @@ export function createFleetGraphSceneSource({
                 return unavailable('graph-answer-malformed')
             }
 
-            // The route operation answers an envelope, `{status, route: {route: {items}}}`, and names an item by `id`.
+            // The route operation answers an envelope, `{status, reason, route, admission}`. Its admission rides
+            // this read exactly as the operation wrote it: whether a withheld admission may be read as current is
+            // the pane's call, and re-deciding it here would be a second opinion on a producer's own fact.
+            // `available` alone does not serve a route: the sibling Golden Path source requires the items too, and
+            // a tolerant reader here would render a renamed envelope as a plan the fleet has.
             const
-                items = route.status === 'fulfilled' && route.value?.status === 'available' ? route.value.route?.route?.items ?? [] : [],
-                scene = projectScene({graph: answer, route: items.map(item => qualifyNodeId(String(item?.id ?? item), origin)), maxBytes, origin});
+                answerRoute = route.status === 'fulfilled' ? route.value : null,
+                served      = answerRoute?.status === 'available' && Array.isArray(answerRoute.route?.route?.items),
+                items       = served ? answerRoute.route.route.items : [],
+                admission   = answerRoute?.admission && typeof answerRoute.admission === 'object' ? answerRoute.admission : null,
+                routeReason = served
+                    ? null
+                    : route.status === 'rejected'
+                        ? 'route-read-failed'
+                        : (typeof answerRoute?.reason === 'string' && answerRoute.reason ? answerRoute.reason : 'route-answer-malformed'),
+                scene       = projectScene({graph: answer, route: items.map(item => qualifyNodeId(String(item?.id ?? item), origin)), maxBytes, origin});
 
             return {
-                // an empty read is not evidence that the fleet has no graph
-                capability: scene.nodes.length ? {state: 'current', reason: null} : {state: 'degraded', reason: 'no-rows-resolved'},
+                // an empty read is not evidence that the fleet has no graph, and an unserved route is not evidence
+                // that the fleet has no plan: the read is current only when it served both
+                capability: !scene.nodes.length
+                    ? {state: 'degraded', reason: 'no-rows-resolved'}
+                    : routeReason
+                        ? {state: 'degraded', reason: routeReason}
+                        : {state: 'current', reason: null},
+                admission,
                 scene,
                 snapshotId: identityOf(scene),
                 capturedAt: new Date(now()).toISOString()

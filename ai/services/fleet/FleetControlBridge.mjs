@@ -682,8 +682,11 @@ class FleetControlBridge extends Base {
      * scene always reports the budget it was read under and whether it is whole, because a viewer
      * that cannot tell a capped graph from a complete one renders a slice as though it were the
      * graph; a node the viewer may not see leaves with its edges and is NOT reported as truncation,
-     * because a permission is not a budget. The source envelope passes through untouched; an
-     * unwired source is named as unavailable, never as an empty graph.
+     * because a permission is not a budget. The same discipline covers the overlay: a route the
+     * operation did not serve is named in `capability.reason` instead of arriving as an empty plan, and
+     * the route's `admission` rides beside it untouched, because a withheld admission is the producer's
+     * freshness and the pane's to render. The source envelope passes through untouched; an unwired
+     * source is named as unavailable, never as an empty graph.
      * @param {Object} [params]
      * @returns {Promise<Object>|Object}
      */
@@ -692,6 +695,7 @@ class FleetControlBridge extends Base {
             ? this.graphSceneSource.readGraphScene(params)
             : {
                 capability: {state: 'unavailable', reason: 'fleet graph scene source not wired'},
+                admission : null,
                 scene     : null,
                 snapshotId: null,
                 capturedAt: null
