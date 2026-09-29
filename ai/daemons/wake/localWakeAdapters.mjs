@@ -694,7 +694,7 @@ async function deliverOsascript({adapterConfig, digest, effects, meta, record}) 
         instancePid,
         tabShortcut      : resolvedMeta.tabShortcut
     });
-    const outcome = await deliverOsascriptWithRetry(effects, args, record.subscriptionId);
+    const outcome = await spawnOsascriptOnce(effects, args, record.subscriptionId);
     return outcome;
 }
 
@@ -871,31 +871,61 @@ function buildOsascriptArgs({appName, digest, focusSeedKey, focusSeedSequence, i
 }
 
 /**
- * @summary Retries only pre-submit frontmost races; post-submit restore races count delivered.
+ * @summary Delivers the osascript payload exactly once, then reports what the dispatch did.
+ *
+ * **`delivered` means the script was dispatched and exited cleanly. It does not mean a turn
+ * started.** A digest can reach the prompt field, the script can exit 0, and the seat can still
+ * need a human to press Return; this harness has no Accessibility consent (`-25211`) and so has
+ * no turn-start oracle. A record reading `delivered` is evidence of dispatch, and any stronger
+ * reading of it belongs to the reader, not to the script.
+ *
+ * There is deliberately no retry, and the reason is a ruling rather than a diagnosis: on
+ * 2026-09-28 the operator's simplification read was that the machinery was more dangerous than
+ * the failure it guarded against, and that stands on its own. The stronger claim — that a retry
+ * *caused* the stranded-payload failure — is **not** established: it is the hypothesis that
+ * motivated the removal, and this PR found a no-retry path still fails intermittently (one wake
+ * started a turn, the very next did not).
+ *
+ * The hypothesis, recorded because it is what the removal was aimed at: the script pastes into
+ * the prompt field and only afterwards reaches steps that can abort, so a retried attempt can
+ * leave attempt N's text sitting in the field while attempt N+1 aborts at an earlier guard. The
+ * human-visible result is "the message is in my prompt but nothing happened", with no error to
+ * explain it. **Untested on this path.**
+ *
+ * The guards that gate *typing* are unchanged and remain load-bearing — they are what stops a
+ * wake being pasted into a different seat's window. What is removed is the post-paste retry
+ * machinery. A keystroke landing in the text field is evidence that the *paste* landed, and
+ * nothing more: the submit keystroke sits after it, and this function cannot know whether that
+ * one took.
+ *
+ * One classification is deliberately kept, and it is about the script rather than the outcome.
+ * A failure raised at a *post-submit* guard (the user-input restore path) still counts as
+ * `delivered`, because `key code 36` has already been SENT by that point — sending it is a fact
+ * about the script's progress, and reporting a later cleanup failure as a delivery failure would
+ * hide real dispatches. It still does not assert a turn.
+ *
+ * @param {Object} effects Injected effect surface (`spawnAsync`, `log`).
+ * @param {String[]} args `osascript` argv.
+ * @param {String} subscriptionId Subscription id, for the failure log line.
+ * @returns {Promise<String|{outcome: String, outcomeReason: String}>} `delivered`, or a failure with its reason.
  * @private
  */
-async function deliverOsascriptWithRetry(effects, args, subscriptionId) {
-    for (let attempt = 1; attempt <= 4; attempt++) {
-        try {
-            await effects.spawnAsync('osascript', args);
-            return 'delivered';
-        } catch (error) {
-            const message = String(error.message || '');
-            const race    = /lost frontmost status|-2700/.test(message);
-            if (race && /user input restore/.test(message)) return 'delivered';
-            if (race && attempt < 4) {
-                await new Promise(resolve => setTimeout(resolve, 800));
-                continue;
-            }
-            // The captured stderr is the only in-band account of WHY this failed — a TCC denial, a
-            // missing target process, a script error. Reporting the id alone leaves an operator with
-            // a confident line and no cause, which is harder to notice than silence. Carried on the
-            // record too: a receiver under launchd writes stdout where nobody reads it.
-            effects.log.error?.(`[Wake Receiver] osascript failed for ${subscriptionId}: ${message}`);
-            return {outcome: 'failed', outcomeReason: message};
+async function spawnOsascriptOnce(effects, args, subscriptionId) {
+    try {
+        await effects.spawnAsync('osascript', args);
+        return 'delivered'
+    } catch (error) {
+        // The captured stderr is the only in-band account of WHY this failed — a TCC denial, a
+        // missing target process, a script error. Reporting the id alone leaves an operator with
+        // a confident line and no cause, which is harder to notice than silence. Carried on the
+        // record too: a receiver under launchd writes stdout where nobody reads it.
+        const message = String(error.message || '');
+        if (/lost frontmost status|-2700/.test(message) && /user input restore/.test(message)) {
+            return 'delivered'
         }
+        effects.log.error?.(`[Wake Receiver] osascript failed for ${subscriptionId}: ${message}`);
+        return {outcome: 'failed', outcomeReason: message}
     }
-    return 'failed';
 }
 
 /**

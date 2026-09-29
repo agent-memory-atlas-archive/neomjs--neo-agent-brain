@@ -179,7 +179,11 @@ test.describe.serial('ai/daemons/wake/localWakeAdapters', () => {
         })).toBe('skipped');
     });
 
-    test('UI delivery preserves bundle identity, draft restore, and post-submit retry boundary', async () => {
+    // `delivered` here is a claim about the DISPATCH, never about a turn starting: the arm below proves the
+    // script was built and spawned, and `key code 36` was *sent* by it. This harness has no Accessibility
+    // consent and therefore no turn-start oracle, so an arm that read `delivered` as turn-start evidence
+    // would be asserting something it cannot observe — the exact overclaim the source JSDoc now disclaims.
+    test('UI delivery preserves bundle identity, draft restore, and the post-submit boundary — dispatch, not turn-start', async () => {
         let osascriptArgs;
         const uiRecord = record('osascript', {
             route: {
@@ -209,6 +213,8 @@ test.describe.serial('ai/daemons/wake/localWakeAdapters', () => {
         const script = osascriptArgs.join('\n');
         expect(script).toContain('bundle identifier of frontmostProcess');
         expect(script).toContain('before prompt clear');
+        // `key code 36` is the submit keystroke being SENT. The arm asserts the script sends it and the
+        // spawn resolves; it cannot assert the seat acted on it, so it does not claim to.
         expect(script).toContain('key code 36');
         expect(script).toContain('before user input restore paste');
         expect(script).toContain('set the clipboard to savedClipboard');
@@ -333,6 +339,36 @@ test.describe.serial('ai/daemons/wake/localWakeAdapters', () => {
         })).toBe('delivered');
         expect(deliveryAttempts).toBe(1);
         expect(probeAttempts).toBe(1);
+    });
+
+    // The counterpart the previous arm needs: `-2700` is the sentinel the SCRIPT raises once `key code 36`
+    // has been sent, so it is the one failure that still counts as a dispatch. This arm pins the other side —
+    // a failure raised BEFORE the submit keystroke is a real failure and must say so. Without it, the
+    // post-submit tolerance above could widen to cover pre-submit aborts and the `delivered` field would
+    // report a wake that never reached the prompt.
+    test('a pre-submit failure is failed, not delivered — the post-submit tolerance does not reach back', async () => {
+        const uiRecord = record('osascript', {
+            route: {
+                agentIdentity,
+                harnessTargetMetadata: {adapter: 'osascript', appName: 'Claude'},
+                adapterConfig        : {attemptTimeoutMs: 1000}
+            }
+        });
+
+        const outcome = await dispatchLocalWake(uiRecord, {
+            platform        : 'darwin',
+            getDefaultTarget: async () => ({status: 'resolved', pid: 4321, instanceCount: 1, bundleName: 'Claude'}),
+            spawnAsync      : async (command, args) => {
+                if (args.some(a => String(a).includes('interactiveDialogProbe'))) {
+                    throw new Error('AX tree unavailable for dialog probe')
+                }
+                // no `-2700`: the script aborts at the frontmost guard, before the submit keystroke
+                throw new Error('Target app is not frontmost (-2700 pre-submit)')
+            }
+        });
+
+        expect(outcome).toMatchObject({outcome: 'failed'});
+        expect(outcome, 'and it names why, rather than reporting a clean dispatch').toHaveProperty('outcomeReason')
     });
 
     test('a terminal osascript failure reports the captured stderr, in the log and on the outcome (#16259)', async () => {
