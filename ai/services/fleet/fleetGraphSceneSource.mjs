@@ -113,6 +113,12 @@ function trimToBytes(scene, maxBytes) {
  * Optional actor columns become role-specific identifiers only on their allowed node kinds. A null
  * assignee list stays unknown; [] stays known empty. Older readers can omit all actor columns.
  *
+ * A scene carries `activitySources` only when the answer has the geometry columns. Its nodes then hold
+ * `gravityWell: true` on a strategic anchor and `strategicWeight` where the Brain has one. `lastActivityAt`
+ * (epoch ms, or null when the node lacks the field) appears on every node of a kind the map names. Each
+ * kind's `sourceCapturedAt` passes through as the Brain states it; the envelope's `capturedAt` is this read's
+ * time, never a source's.
+ *
  * @param {Object} input
  * @param {Object} input.graph The answer: `{kinds, types, nodes: {ids, kinds, labels}, edges, counts, budget, truncated}`.
  * @param {String[]} [input.route] Origin-qualified route ids: the overlay.
@@ -123,6 +129,8 @@ function trimToBytes(scene, maxBytes) {
 export function projectScene({graph, route = [], maxBytes = DEFAULT_MAX_BYTES, origin = DEFAULT_ORIGIN}) {
     const
         {ids = [], kinds = [], labels = []} = graph.nodes ?? {},
+        // older readers answer no geometry columns, and their scene projects as before
+        sources   = Array.isArray(graph.nodes?.gravityWell) && graph.activitySources ? graph.activitySources : null,
         order     = (a, b) => a < b ? -1 : a > b ? 1 : 0,
         actor     = code => Number.isInteger(code) && code >= 0 && typeof graph.actors?.[code] === 'string'
             ? graph.actors[code]
@@ -142,6 +150,12 @@ export function projectScene({graph, route = [], maxBytes = DEFAULT_MAX_BYTES, o
                         : null;
                 } else if (kind === 'AGENT_MEMORY' && Array.isArray(graph.nodes.memoryOf)) {
                     node.memoryOf = actor(graph.nodes.memoryOf[index]);
+                }
+
+                if (sources) {
+                    if (graph.nodes.gravityWell[index] === 1) node.gravityWell = true;
+                    if (Number.isFinite(graph.nodes.strategicWeight?.[index])) node.strategicWeight = graph.nodes.strategicWeight[index];
+                    if (Object.hasOwn(sources, kind)) node.lastActivityAt = graph.nodes.lastActivityAt?.[index] ?? null;
                 }
 
                 return node
@@ -168,7 +182,8 @@ export function projectScene({graph, route = [], maxBytes = DEFAULT_MAX_BYTES, o
         edges,
         counts      : {nodes: 0, edges: 0, seeds: route.length, unlinked: 0},
         budget      : {maxNodes: graph.budget?.maxNodes ?? null, maxEdges: graph.budget?.maxEdges ?? null, maxBytes},
-        completeness: graph.truncated?.nodes || graph.truncated?.edges ? 'truncated' : 'complete'
+        completeness: graph.truncated?.nodes || graph.truncated?.edges ? 'truncated' : 'complete',
+        ...(sources ? {activitySources: {...sources}} : {})
     };
 
     countScene(scene);
