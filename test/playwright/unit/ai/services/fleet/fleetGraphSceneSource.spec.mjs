@@ -55,9 +55,18 @@ const
         {source: 'pr-101', target: 'issue-7',   type: 'RESOLVES'},
         {source: 'pr-101', target: 'concept-a', type: 'TAGGED_CONCEPT'}
     ],
+    // The admission as the live plane writes it: a whole object, not a word, and this source never decides which
+    // parts of it matter (`get_computed_route` on our plane, 2026-09-29T09:2xZ, `computed-route.v1` fresh).
+    ADMISSION = {
+        admitted       : true,
+        fallback       : 'current',
+        reasonCode     : 'projection-current',
+        requiredFacets : ['issues', 'discussions'],
+        staleFacets    : []
+    },
     ROUTE = {
         status   : 'available',
-        admission: {admitted: true, reasonCode: null},
+        admission: ADMISSION,
         route    : {route: {items: [{id: 'issue-7'}, {id: 'pr-101'}]}}
     };
 
@@ -120,16 +129,24 @@ test.describe('fleetGraphSceneSource', () => {
         const
             current = await createFleetGraphSceneSource(seams()).readGraphScene();
 
-        expect(current.admission, "the producer's own admission, as written").toEqual({admitted: true, reasonCode: null});
+        expect(current.admission, "the producer's own admission, whole, as written").toEqual(ADMISSION);
 
         // A withheld admission is a fact about the producer's freshness, and the pane is what renders it: this
         // source reports the route it was served and the admission beside it, and never re-decides the second.
-        const withheld = await createFleetGraphSceneSource(seams({
-            getComputedRoute: async () => ({...ROUTE, admission: {admitted: false, reasonCode: 'projection-stale'}})
-        })).readGraphScene();
+        const
+            lastGood = {
+                admitted       : false,
+                fallback       : 'last-known-good',
+                reasonCode     : 'projection-stale',
+                requiredFacets : ['issues', 'discussions'],
+                staleFacets    : ['discussions']
+            },
+            withheld = await createFleetGraphSceneSource(seams({
+                getComputedRoute: async () => ({...ROUTE, admission: lastGood})
+            })).readGraphScene();
 
         expect(withheld.capability.state, 'the operation served a route, so the scene read is current').toBe('current');
-        expect(withheld.admission).toEqual({admitted: false, reasonCode: 'projection-stale'})
+        expect(withheld.admission, 'the stale facets ride along too — the pane decides what they mean').toEqual(lastGood)
     });
 
     test('a served route with no items is a current read of an empty plan, which is what makes `degraded` mean something', async () => {
