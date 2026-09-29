@@ -1,28 +1,27 @@
 import path from 'node:path';
 
 /**
- * @summary Fail-closed preflight for the Brain-side post-release sync — the safety envelope the
+ * @summary Fail-closed preflight for the Brain-side post-release lifecycle — the safety envelope the
  * split command no longer inherits.
  *
- * While KB upload, full sync, and the archive commit lived inside `publish.mjs`, they inherited
- * its preconditions: the branch check had already run, `git checkout dev` had already happened,
- * and the working tree held exactly what the release process itself had produced. Splitting the
- * command turned those inherited preconditions into PROTOCOL FIELDS — implicit while one process,
- * they must be explicit (and mechanically asserted) when the second half is independently
- * runnable from an arbitrary checkout state. This module owns that assertion, deliberately free
- * of any service import so it is unit-testable without booting the Brain.
+ * While the KB upload lived inside `publish.mjs`, it inherited that script's preconditions: the
+ * branch check had already run, `git checkout dev` had already happened, and the working tree held
+ * exactly what the release process itself had produced. Splitting the command turned those
+ * inherited preconditions into PROTOCOL FIELDS — implicit while one process, they must be explicit
+ * (and mechanically asserted) when the second half is independently runnable from an arbitrary
+ * checkout state. This module owns that assertion, deliberately free of any service import so it
+ * is unit-testable without booting the Brain.
  *
  * Four gates, all before the first irreversible mutation:
  *
  * 1. **Target root** — explicitly supplied, Engine-identified, and distinct from the Brain runtime.
- * 2. **Branch** — the archive commit and `git push origin dev` are only coherent from `dev`.
+ * 2. **Branch** — the upload reads the released `dev` state, so it runs from `dev` only.
  * 3. **Version** — derived from the target's `package.json` ONLY (no CLI flag: an interpolated flag was both
  *    an injection surface and a version-mismatch class; removal beats validation) and still
  *    shape-checked as strict semver before it reaches a shell string.
- * 4. **Starting state** — the only admissible dirt is the staging release note's deletion, which
- *    `publish.mjs` performs on disk and this command's archive commit persists. Anything else is
- *    named and refused: the temporal gap between the two commands makes unrelated dirt newly
- *    capturable by the broad `git add .`, and a fail-open here publishes it.
+ * 4. **Starting state** — the working tree is clean. `publish.mjs` leaves nothing behind, since the
+ *    release note stays where it was authored, so any dirt is named and refused rather than
+ *    uploaded as if it had been released.
  */
 
 /**
@@ -129,7 +128,7 @@ export function resolveReleaseVersion({readPackageJson}) {
 }
 
 /**
- * Asserts the current branch is `dev` — the only branch the archive commit and push are coherent on.
+ * Asserts the current branch is `dev` — the release is cut from it, so the upload reads its state.
  * @param {Object} config
  * @param {Function} config.getCurrentBranch Returns the current branch name (test seam).
  * @returns {void}
@@ -140,46 +139,38 @@ export function assertOnDevBranch({getCurrentBranch}) {
 
     if (branch !== 'dev') {
         throw new Error(
-            `Post-release sync refused: must run on 'dev' (current: ${JSON.stringify(branch)}). ` +
-            'The archive commit lands on the current branch while the push targets dev — running elsewhere diverges them.'
+            `Post-release lifecycle refused: must run on 'dev' (current: ${JSON.stringify(branch)}). ` +
+            'The release is cut from dev, and uploading any other state would publish what was not released.'
         );
     }
 }
 
 /**
- * Asserts the working tree holds nothing beyond what the release itself produced: clean, or
- * exactly the staged/unstaged deletion of this version's flat staging release note.
+ * Asserts the working tree is clean — the release leaves nothing behind in the Engine checkout.
  * @param {Object} config
  * @param {Function} config.getPorcelainStatus Returns `git status --porcelain` output (test seam).
- * @param {String} config.version The validated release version.
  * @returns {void}
- * @throws {Error} Naming every inadmissible path, so the operator cleans deliberately.
+ * @throws {Error} Naming every dirty path, so the operator cleans deliberately.
  */
-export function assertAdmissibleStartingState({getPorcelainStatus, version}) {
-    const
-        notePath   = `resources/content/release-notes/v${version}.md`,
-        // Porcelain XY codes for the note's deletion: unstaged (` D`) as `publish.mjs` leaves it,
-        // or staged (`D `) when an operator staged it manually. Nothing else is admissible.
-        admissible = new Set([` D ${notePath}`, `D  ${notePath}`]),
-        status     = getPorcelainStatus();
+export function assertAdmissibleStartingState({getPorcelainStatus}) {
+    const status = getPorcelainStatus();
 
     // A failed probe is NOT a clean tree. The status runner returns null on failure; normalizing
     // that to '' would pass a gate whose one job is establishing working-tree truth — the exact
     // fail-open this preflight exists to prevent, one layer up.
     if (typeof status !== 'string') {
         throw new Error(
-            'Post-release sync refused: could not establish working-tree truth (`git status --porcelain` failed). ' +
-            'A gate that cannot observe the tree must not admit the broad archive stage.'
+            'Post-release lifecycle refused: could not establish working-tree truth (`git status --porcelain` failed). ' +
+            'A gate that cannot observe the tree must not admit the upload.'
         );
     }
 
-    const inadmissible = status.split('\n').filter(line => line.trim() && !admissible.has(line));
+    const dirty = status.split('\n').filter(line => line.trim());
 
-    if (inadmissible.length > 0) {
+    if (dirty.length > 0) {
         throw new Error(
-            'Post-release sync refused: the working tree holds changes the release did not produce, and the ' +
-            `broad archive stage would capture them:\n${inadmissible.join('\n')}\n` +
-            `Admissible starting state: clean, or only the deletion of ${notePath}. Commit, stash, or clean first.`
+            'Post-release lifecycle refused: the working tree holds changes the release did not produce:\n' +
+            `${dirty.join('\n')}\nAdmissible starting state: clean. Commit, stash, or clean first.`
         );
     }
 }
