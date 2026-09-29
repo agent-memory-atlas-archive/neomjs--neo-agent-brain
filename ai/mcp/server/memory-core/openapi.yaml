@@ -2117,7 +2117,8 @@ paths:
         and agent-memory identity. Singular -1 and a null list mean unknown; [] means observed no assignees.
         Attribution comes only from answered nodes after RLS and budget selection. It is historical attribution,
         not current work or a change actor. It carries no property bags. `state` codes each issue's, PR's and
-        discussion's stored state into `states`, or -1. Geometry columns carry the Brain's own
+        discussion's state as the last ingestion stored it into `states`, or -1; the store keeps no capture time,
+        so its freshness is unknown. Geometry columns carry the Brain's own
         meaning: `gravityWell` (1 marks a strategic anchor), `strategicWeight` and `lastActivityAt` (epoch ms), read
         from the field `activitySources` names for the node's kind. A null `lastActivityAt` means the kind has no
         source when `activitySources` omits it, and otherwise that the node lacks a readable field. `counts.unlinked`
@@ -2211,7 +2212,7 @@ paths:
                           minimum: -1
                       state:
                         type: array
-                        description: Index into `states` for an ISSUE, PULL_REQUEST or DISCUSSION, or -1.
+                        description: Index into `states` for an ISSUE, PULL_REQUEST or DISCUSSION, or -1. The state as the last ingestion stored it, with no capture time, so its freshness is unknown; a consumer acting on it re-reads the item's provider for currency.
                         items:
                           type: integer
                           minimum: -1

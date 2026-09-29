@@ -116,7 +116,8 @@ function trimToBytes(scene, maxBytes) {
  * assignee list stays unknown; [] stays known empty. Older readers can omit all actor columns.
  *
  * With the answer's `state` column, an issue, PR or discussion carries its stored `state` (`OPEN`,
- * `MERGED`, … as the Brain stores it), or null; an answer without the column projects no `state`.
+ * `MERGED`, … as the last ingestion stored it, freshness unknown), or null; an answer without the column
+ * projects no `state`.
  *
  * A scene carries `activitySources` only when the answer has the geometry columns. Its nodes then hold
  * `gravityWell: true` on a strategic anchor and `strategicWeight` where the Brain has one. `lastActivityAt`

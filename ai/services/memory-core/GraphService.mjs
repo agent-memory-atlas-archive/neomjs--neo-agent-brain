@@ -1375,7 +1375,9 @@ class GraphService extends Base {
      *
      * The `state` column codes each issue's, PR's and discussion's stored `state` into the `states`
      * dictionary, so a reader can tell merged or closed work from open work; -1 is a work item with no
-     * stored state, or any other kind.
+     * stored state, or any other kind. It is the state as the last ingestion stored it, and the store keeps no
+     * capture time for it, so its freshness is unknown: a consumer that acts on it re-reads the item's provider
+     * for currency.
      *
      * Geometry columns carry the Brain's own meaning, never the property bag: `gravityWell` (1 for a REM
      * strategic anchor, else 0), `strategicWeight` (a number or null) and `lastActivityAt` (epoch ms or null),
