@@ -89,7 +89,7 @@ test.describe('postReleasePreflight (#17239)', () => {
         })
     });
 
-    test.describe('assertOnDevBranch — the commit lands on the current branch, the push targets dev', () => {
+    test.describe('assertOnDevBranch — the upload reads the state the release was cut from', () => {
         test('passes on dev', () => {
             expect(() => assertOnDevBranch({getCurrentBranch: () => 'dev'})).not.toThrow();
         });
@@ -103,56 +103,35 @@ test.describe('postReleasePreflight (#17239)', () => {
         });
     });
 
-    test.describe('assertAdmissibleStartingState — only the release\'s own staging-note deletion may precede the broad stage', () => {
-        const version = '13.2.0';
-
+    test.describe('assertAdmissibleStartingState — the release leaves the tree clean, and only a clean tree passes', () => {
         test('a clean tree passes', () => {
-            expect(() => assertAdmissibleStartingState({getPorcelainStatus: () => '', version})).not.toThrow();
+            expect(() => assertAdmissibleStartingState({getPorcelainStatus: () => ''})).not.toThrow();
         });
 
         test('a FAILED status probe is refused — unobservable is not clean', () => {
-            // The status runner returns null on failure. The first version of this gate normalized
-            // that to '' and its spec blessed the fail-open; round 2 caught it. Unobservable tree
-            // state must refuse the broad stage, not admit it.
+            // The status runner returns null on failure. Normalizing that to '' would bless a
+            // fail-open: unobservable tree state must refuse the upload, not admit it.
             for (const probe of [null, undefined]) {
-                expect(() => assertAdmissibleStartingState({getPorcelainStatus: () => probe, version}),
+                expect(() => assertAdmissibleStartingState({getPorcelainStatus: () => probe}),
                     `probe ${String(probe)} must be refused`)
                     .toThrow(/could not establish working-tree truth/);
             }
         });
 
-        test('the staging note deletion passes in both porcelain forms (unstaged and staged)', () => {
-            expect(() => assertAdmissibleStartingState({
-                getPorcelainStatus: () => ` D resources/content/release-notes/v${version}.md`, version
-            })).not.toThrow();
-            expect(() => assertAdmissibleStartingState({
-                getPorcelainStatus: () => `D  resources/content/release-notes/v${version}.md`, version
-            })).not.toThrow();
+        test('a release-note deletion is refused by name — publish.mjs keeps the note', () => {
+            for (const line of [' D .github/RELEASE_NOTES/v13.2.0.md', ' D resources/content/release-notes/v13.2.0.md']) {
+                expect(() => assertAdmissibleStartingState({getPorcelainStatus: () => line}), line)
+                    .toThrow(/v13\.2\.0\.md/);
+            }
         });
 
-        test('a note deletion for a DIFFERENT version is refused — the admissible set is version-bound', () => {
-            expect(() => assertAdmissibleStartingState({
-                getPorcelainStatus: () => ' D resources/content/release-notes/v13.1.0.md', version
-            })).toThrow(/refused/);
-        });
-
-        test('unrelated dirt is refused BY NAME, so the operator cleans deliberately', () => {
-            expect(() => assertAdmissibleStartingState({
-                getPorcelainStatus: () => ' M src/Neo.mjs', version
-            })).toThrow(/src\/Neo\.mjs/);
-        });
-
-        test('mixed admissible + inadmissible refuses, naming only the inadmissible paths', () => {
+        test('every dirty path is named, so the operator cleans deliberately', () => {
             const run = () => assertAdmissibleStartingState({
-                getPorcelainStatus: () => [
-                    ` D resources/content/release-notes/v${version}.md`,
-                    '?? scratch.mjs'
-                ].join('\n'),
-                version
+                getPorcelainStatus: () => [' M src/Neo.mjs', '?? scratch.mjs'].join('\n')
             });
 
+            expect(run).toThrow(/src\/Neo\.mjs/);
             expect(run).toThrow(/scratch\.mjs/);
-            expect(run).not.toThrow(/release-notes\/v13\.2\.0\.md[\s\S]*release-notes\/v13\.2\.0\.md/);
         });
     });
 });
