@@ -80,6 +80,27 @@ test.describe('Neo.ai.services.fleet.wireFleetActivityReadSource', () => {
         expect(typeof captured.readPrLaneSnapshot).toBe('function');
     });
 
+    test('the A2A slot pages the mailbox: the offset reaches listMessages, and the first page asks without one', async () => {
+        const asks   = [];
+        const source = wireFleetActivityReadSource({
+            listMessages: async args => {
+                asks.push(args);
+                return {messages: [], offset: args.offset ?? 0, totalCount: 120, truncated: true}
+            },
+            readPrLane  : async () => ({capability: {source: FLEET_COCKPIT_SOURCES.activity, state: 'wired'}, counts: [], events: []}),
+            bridge      : stubBridge()
+        });
+
+        await source.readActivitySnapshot({limit: 50});
+        const history = await source.readActivitySnapshot({limit: 50, offset: 50, slots: ['a2a']});
+
+        // both bindings (in-process MailboxService, the plane client's list_messages) take these args as they are
+        expect(asks.map(args => args.offset)).toEqual([undefined, 50]);
+        // a later page still knows the population, so its total stays; its last-24h count cannot be complete
+        expect(history.counts.filter(row => row.scope === 'total').map(row => row.value)).toEqual([120]);
+        expect(history.counts.some(row => row.scope === 'last24h')).toBe(false)
+    });
+
     test('a CONFIGURED-but-unreadable pullsDir degrades the PR/lane slot — degraded capability + source-degraded event', async () => {
         // Absent-vs-unreadable: a configured pulls directory that cannot be collected must reach
         // makeReadPrLaneSnapshot's catch → the builder's `error` path (degraded), NOT masquerade as a

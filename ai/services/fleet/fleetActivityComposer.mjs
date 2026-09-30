@@ -83,6 +83,37 @@ function normalizeBound(requested, fallback) {
 }
 
 /**
+ * @summary Resolves the page offset. Like `limit` it arrives over the wire, so anything but a
+ * positive integer reads the first page rather than reaching the mailbox.
+ *
+ * Only the A2A lane pages: the PR/lane adapter slices by `limit` alone and answers its newest rows
+ * at any offset, so a history read names `slots: ['a2a']` as well.
+ * @param {*} requested The caller's `offset`.
+ * @returns {Number}
+ * @private
+ */
+function normalizeOffset(requested) {
+    return Number.isInteger(requested) && requested > 0 ? requested : 0
+}
+
+/**
+ * @summary Resolves the slots a read asks. A caller that wants one lane names it, as a history read
+ * of the mailbox does, and the composite capability then speaks for the slots asked. A selection with
+ * no known slot asks every slot, as a live read does.
+ * @param {*} requested The caller's `slots`: names from {@link FLEET_ACTIVITY_SLOTS}.
+ * @param {Object[]} slots Every `{read, slot}` this source composes.
+ * @returns {Object[]}
+ * @private
+ */
+function selectSlots(requested, slots) {
+    const
+        names  = new Set(Array.isArray(requested) ? requested : []),
+        chosen = slots.filter(({slot}) => names.has(slot));
+
+    return chosen.length ? chosen : slots
+}
+
+/**
  * @summary Caps operator-facing text at `max`, marking the elision.
  *
  * @param {String} raw
@@ -331,10 +362,13 @@ export function createFleetActivityReadSource({readA2ASnapshot, readPrLaneSnapsh
             const
                 capturedAt = new Date().toISOString(),
                 bound      = normalizeBound(params.limit, limit),
-                // Every slot is asked even when one is expected to fail: a contributor that cannot
+                offset     = normalizeOffset(params.offset),
+                // Every asked slot is read even when one is expected to fail: a contributor that cannot
                 // read must return its OWN degraded capability, and short-circuiting would replace
-                // that adapter's stated reason with the composer's guess about it.
-                contributions = await Promise.all(slots.map(({read, slot}) => readSlot(read, slot, {...params, limit: bound}, capturedAt)));
+                // that adapter's stated reason with the composer's guess about it. A caller's
+                // `slots` is a question about lanes, not a skip of a failing one.
+                contributions = await Promise.all(selectSlots(params.slots, slots).map(({read, slot}) =>
+                    readSlot(read, slot, {...params, limit: bound, offset}, capturedAt)));
 
             return {
                 capability: composeCapability(contributions.map(contribution => contribution.capability), capturedAt),
