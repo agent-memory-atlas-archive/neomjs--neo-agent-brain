@@ -205,13 +205,16 @@ services:
     # interval after a check completes and reports `unhealthy` after `retries` consecutive
     # failures, so a dead service is reported within 4 × (30 s + 15 s) = 180 s when every check
     # runs to its timeout (12 × (10 s + 10 s) = 240 s before) and 4 × 30 s = 120 s when checks
-    # fail at once (unchanged). The timeout covers a probe whose interpreter start is inflated by
-    # CPU contention, which is what its startup timing separates from a stalled service. Cadence
-    # is the whole saving here: kb-server's `healthcheck` takes no `freshObservability` option
-    # and ignores the one the probe sends. (The rationale sits above the key on purpose: the
-    # bridge spec's cross-artifact arm reads `timeout` within 400 characters of the probe's path.)
+    # fail at once (unchanged). The probe's own budget, `--timeout-ms 14000`, sits a second inside
+    # that timeout: a slow tool call gets 14 s, and the probe still reports its timing split before
+    # Docker ends the check. Without the flag it stops at its 8 s default and the 15 s never
+    # applies. The budget covers a probe whose interpreter start is inflated by CPU contention,
+    # which is what its startup timing separates from a stalled service. Cadence is the whole
+    # saving here: kb-server's `healthcheck` takes no `freshObservability` option and ignores the
+    # one the probe sends. (The rationale sits above the key on purpose: the bridge spec's
+    # cross-artifact arm reads `timeout` within 400 characters of the probe's path.)
     healthcheck:
-      test        : ["CMD", "node", "./ai/scripts/diagnostics/mcpHealthcheck.mjs", "--url", "http://127.0.0.1:3000", "--client-name", "neo-kb-container-healthcheck"]
+      test        : ["CMD", "node", "./ai/scripts/diagnostics/mcpHealthcheck.mjs", "--url", "http://127.0.0.1:3000", "--client-name", "neo-kb-container-healthcheck", "--timeout-ms", "14000"]
       interval    : 30s
       timeout     : 15s
       retries     : 4
@@ -385,7 +388,7 @@ services:
     # while the service booted. Here the probe's `freshObservability: false` also lets
     # HealthService answer from its cached healthy payload; the tool's own state reads still run.
     healthcheck:
-      test        : ["CMD", "node", "./ai/scripts/diagnostics/mcpHealthcheck.mjs", "--url", "http://127.0.0.1:3001", "--client-name", "neo-mc-container-healthcheck", "--expected-status", "healthy,degraded"]
+      test        : ["CMD", "node", "./ai/scripts/diagnostics/mcpHealthcheck.mjs", "--url", "http://127.0.0.1:3001", "--client-name", "neo-mc-container-healthcheck", "--expected-status", "healthy,degraded", "--timeout-ms", "14000"]
       interval    : 30s
       timeout     : 15s
       retries     : 4

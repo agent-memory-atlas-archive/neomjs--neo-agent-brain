@@ -344,7 +344,9 @@ test.describe('ai/scripts/diagnostics/mcpHealthcheck (#11725)', () => {
             '--url',
             'http://127.0.0.1:3000',
             '--client-name',
-            'neo-kb-container-healthcheck'
+            'neo-kb-container-healthcheck',
+            '--timeout-ms',
+            '14000'
         ]);
 
         // MC alone opts into treating `degraded` as alive: its non-WAL dependencies are best-effort
@@ -360,7 +362,9 @@ test.describe('ai/scripts/diagnostics/mcpHealthcheck (#11725)', () => {
             '--client-name',
             'neo-mc-container-healthcheck',
             '--expected-status',
-            'healthy,degraded'
+            'healthy,degraded',
+            '--timeout-ms',
+            '14000'
         ]);
 
         // The gate itself is deliberately UNCHANGED. `service_healthy` still guards startup; what
@@ -611,7 +615,7 @@ test.describe('served-plane verification — a healthy status is not an identity
  * relaxation: `unhealthy` stays the failing verdict.
  */
 test.describe('mcpHealthcheck — a liveness expectation is a SET', () => {
-    let parseExpectedStatuses, runHealthcheck;
+    let parseArgs, parseExpectedStatuses, runHealthcheck;
 
     const readProductionCompose = () => yaml.load(fs.readFileSync(
         new URL('../../../../../../deploy/cloud/docker-compose.yml', import.meta.url),
@@ -637,6 +641,7 @@ test.describe('mcpHealthcheck — a liveness expectation is a SET', () => {
     test.beforeAll(async () => {
         const mod = await import('../../../../../../ai/scripts/diagnostics/mcpHealthcheck.mjs');
 
+        parseArgs             = mod.parseArgs;
         parseExpectedStatuses = mod.parseExpectedStatuses;
         runHealthcheck        = mod.runHealthcheck;
     });
@@ -703,9 +708,9 @@ test.describe('mcpHealthcheck — a liveness expectation is a SET', () => {
      * value this assertion reads.
      *
      * @param {String} file
-     * @returns {Object} `{service: joinedCommand}` for services that define `healthcheck.test`.
+     * @returns {Object} `{service: healthcheck}` for services that define `healthcheck.test`.
      */
-    function healthcheckCommands(file) {
+    function healthchecks(file) {
         const source = fs
             .readFileSync(new URL(`../../../../../../deploy/cloud/${file}`, import.meta.url), 'utf8')
             .replace(/(:[ \t]*)![a-z]+\b/g, '$1');
@@ -715,8 +720,33 @@ test.describe('mcpHealthcheck — a liveness expectation is a SET', () => {
         return Object.fromEntries(
             Object.entries(doc.services || {})
                 .filter(([, service]) => Array.isArray(service?.healthcheck?.test))
-                .map(([name, service]) => [name, service.healthcheck.test.join(' ')])
+                .map(([name, service]) => [name, service.healthcheck])
         );
+    }
+
+    /**
+     * @param {String} file
+     * @returns {Object} `{service: joinedCommand}` for services that define `healthcheck.test`.
+     */
+    function healthcheckCommands(file) {
+        return Object.fromEntries(Object.entries(healthchecks(file)).map(([name, {test}]) => [name, test.join(' ')]));
+    }
+
+    /**
+     * Every MCP probe the compose files declare, with the timeout that ends its check: an override that restates
+     * the command keeps the base file's timeout unless it declares its own.
+     * @returns {Object[]} `{command, probe, timeoutMs}` each
+     */
+    function probeBlocks() {
+        const base = healthchecks('docker-compose.yml');
+
+        return composeFiles.flatMap(file => Object.entries(healthchecks(file))
+            .filter(([, {test}]) => test.includes('./ai/scripts/diagnostics/mcpHealthcheck.mjs'))
+            .map(([name, {test, timeout}]) => ({
+                command  : test.slice(test.indexOf('./ai/scripts/diagnostics/mcpHealthcheck.mjs') + 1),
+                probe    : `${file} ${name}`,
+                timeoutMs: Number.parseFloat(timeout ?? base[name].timeout) * 1000
+            })));
     }
 
     test('EVERY compose file that owns an mc-server healthcheck command carries the liveness set', () => {
@@ -728,6 +758,45 @@ test.describe('mcpHealthcheck — a liveness expectation is a SET', () => {
 
         for (const file of owning) {
             expect(healthcheckCommands(file)['mc-server'], file).toContain('--expected-status healthy,degraded');
+        }
+    });
+
+    test('EVERY compose probe command gives itself a budget one second inside the timeout that ends its check (#579)', () => {
+        const probes = probeBlocks();
+
+        expect(probes.map(({probe}) => probe), 'kb-server and mc-server in each file').toEqual(composeFiles.flatMap(file => [`${file} kb-server`, `${file} mc-server`]));
+
+        for (const {command, probe, timeoutMs} of probes) {
+            const budget = command.includes('--timeout-ms') ? Number(command[command.indexOf('--timeout-ms') + 1]) : null;
+
+            expect(budget, `${probe}: the probe reports its timing split before Docker ends the check`).toBe(timeoutMs - 1000)
+        }
+    });
+
+    test('EVERY compose probe command arms its connect and tool-call deadlines at the budget it declares, not the default (#579)', async () => {
+        const
+            armed    = [],
+            timer    = globalThis.setTimeout,
+            receipts = [];
+
+        // records every deadline the probe arms, and still arms it
+        globalThis.setTimeout = (fn, ms, ...rest) => {armed.push(ms); return timer(fn, ms, ...rest)};
+
+        try {
+            for (const {command, probe, timeoutMs} of probeBlocks()) {
+                armed.length = 0;
+                // the served-plane expectations reject this fake's answer; both deadlines are armed before that
+                await runHealthcheck({...parseArgs(command, {}), ClientClass: clientReturning('healthy'), TransportClass: FakeTransport}).catch(() => {});
+                receipts.push({armed: [...armed], probe, timeoutMs})
+            }
+        } finally {
+            globalThis.setTimeout = timer
+        }
+
+        expect(receipts).toHaveLength(composeFiles.length * 2);
+
+        for (const {armed, probe, timeoutMs} of receipts) {
+            expect(armed, `${probe}: connect, then the tool call, each one second inside Docker's timeout`).toEqual([timeoutMs - 1000, timeoutMs - 1000])
         }
     });
 
