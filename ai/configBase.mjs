@@ -526,12 +526,12 @@ class ConfigBase extends ConfigProvider {
                      */
                     openCode: leaf('opencode', 'NEO_FLEET_OPENCODE_BIN', 'string'),
                     /**
-                     * The codex harness binary. The default is the ChatGPT-app-bundled CLI — an
-                     * alpha channel that self-updates with its app; production fleets pin this
+                     * The codex harness binary. The default is the ChatGPT app's packaged CLI
+                     * entrypoint, which updates with its app; production fleets pin this
                      * leaf, and the lifecycle status's `binaryVersion` surfaces what actually ran.
                      * @type {string}
                      */
-                    codex: leaf('/Applications/ChatGPT.app/Contents/Resources/codex', 'NEO_FLEET_CODEX_BIN', 'string'),
+                    codex: leaf('/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex', 'NEO_FLEET_CODEX_BIN', 'string'),
                     /**
                      * The Codex Desktop packaged MAIN binary — directly spawnable and supervised.
                      * Its private app-profile/project/updater capabilities are probed from the

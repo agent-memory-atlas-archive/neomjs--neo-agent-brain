@@ -1273,8 +1273,7 @@ class FleetLifecycleService extends Base {
      * (`NEO_FLEET_CODEX_BIN` / `NEO_FLEET_CODEX_DESKTOP_BIN` / `NEO_FLEET_CLAUDE_CODE_BIN` /
      * `NEO_FLEET_CLAUDE_DESKTOP_BIN` / `NEO_FLEET_ANTIGRAVITY_BIN` /
      * `NEO_FLEET_KIMI_CODE_BIN` / `NEO_FLEET_OPENCODE_BIN`). The codex leaf default is the
-     * ChatGPT-app-bundled CLI — an
-     * alpha channel that self-updates with its app, so production fleets pin the leaf;
+     * ChatGPT-app-bundled CLI, which updates with its app, so production fleets pin the leaf;
      * `status().binaryVersion` surfaces what actually ran. The app-bundle families default to
      * their macOS bundle MAIN binaries (directly spawnable — never an `open -n` launcher). An
      * untemplated family resolves `null` — {@link resolveLaunch} fails loud rather than guessing.

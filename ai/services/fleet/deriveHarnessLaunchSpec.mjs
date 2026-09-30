@@ -146,8 +146,8 @@ export function getHarnessAuthMode(harnessType) {
  *   fresh home reports no-auth while the default `~/.codex` stays untouched, so per-agent homes
  *   never share auth or session state. Liveness empirically proven: `app-server` on a held-open
  *   piped stdin stays resident and stops cleanly on SIGTERM. Two caveats: an app-bundled codex
- *   binary (e.g. the ChatGPT.app `Resources/codex`) is an ALPHA channel that self-updates with its
- *   app — pin the AiConfig `fleet.harnessBinaries.codex` leaf and read the lifecycle status's
+ *   binary (e.g. the ChatGPT.app `Resources/codex-cli/bin/codex`) updates with its app —
+ *   pin the AiConfig `fleet.harnessBinaries.codex` leaf and read the lifecycle status's
  *   `binaryVersion` surface; and per-home `codex login` is the operator-owned auth step (a
  *   freshly-derived home starts unauthenticated by design — the lifecycle status's `authRequired`
  *   surfaces it).
