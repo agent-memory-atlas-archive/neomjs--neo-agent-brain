@@ -540,7 +540,8 @@ class FleetControlBridge extends Base {
      * source-not-wired snapshot (degraded capability + empty events), never fabricated activity —
      * mirroring {@link #getBootIdentity}'s advisory-empty degrade, so the cockpit renders a
      * "feed not wired" state rather than a silent freeze or invented traffic.
-     * @param {Object} [params] Optional bounds forwarded to the source (`{limit, since, until}`).
+     * @param {Object} [params] Optional bounds forwarded to the source: `limit`, the A2A lane's page
+     *     `offset`, and `slots`, the lanes to read (a history page asks `['a2a']`).
      * @returns {Promise<Object>|Object} `{capability, events}` — the bounded cockpit activity snapshot.
      */
     fleetActivity(params) {

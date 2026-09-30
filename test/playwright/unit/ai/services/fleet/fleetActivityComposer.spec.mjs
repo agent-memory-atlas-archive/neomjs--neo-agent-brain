@@ -190,6 +190,58 @@ test.describe('fleetActivityComposer — composing two truths means composing tw
         expect(events).toHaveLength(3)
     });
 
+    test('a page offset reaches the readers normalized: anything but a positive integer reads the first page', async () => {
+        const seen   = [];
+        const reader = async params => {
+            seen.push(params.offset);
+            return {capability: {source: 'fleet:a2a', state: 'wired', confidence: 'observed'}, events: []}
+        };
+
+        const source = createFleetActivityReadSource({readA2ASnapshot: reader, readPrLaneSnapshot: wired()});
+
+        for (const offset of [50, -5, 2.5, '50', null, undefined]) {
+            await source.readActivitySnapshot({offset})
+        }
+
+        // the offset arrives over the wire like the limit, so a malformed one never reaches the mailbox
+        expect(seen).toEqual([50, 0, 0, 0, 0, 0])
+    });
+
+    test('`slots` asks only the named lanes, and the capability speaks for those alone', async () => {
+        const asked  = [];
+        const reader = (id, state) => async () => {
+            asked.push(id);
+            return {
+                capability: {source: id, state, confidence: state === 'wired' ? 'observed' : 'none', reason: state === 'wired' ? null : 'down'},
+                events    : [{occurredAt: '2026-07-16T12:00:00.000Z', eventId: `${id}-a`}]
+            }
+        };
+
+        const source  = createFleetActivityReadSource({readA2ASnapshot: reader('a2a', 'wired'), readPrLaneSnapshot: reader('pr', 'degraded')}),
+              history = await source.readActivitySnapshot({offset: 50, slots: ['a2a']});
+
+        // a mailbox page never asks the PR/lane reader, so neither its rows nor its blindness reach it
+        expect(asked).toEqual(['a2a']);
+        expect(history.capability.state).toBe('wired');
+        expect(history.events.map(event => event.eventId)).toEqual(['a2a-a'])
+    });
+
+    test('a selection naming no known lane reads every lane, as a live read does', async () => {
+        const asked  = [];
+        const reader = id => async () => {
+            asked.push(id);
+            return {capability: {source: id, state: 'wired', confidence: 'observed'}, events: []}
+        };
+
+        const source = createFleetActivityReadSource({readA2ASnapshot: reader('a2a'), readPrLaneSnapshot: reader('pr')});
+
+        for (const slots of [undefined, [], ['nope'], 'a2a']) {
+            asked.length = 0;
+            await source.readActivitySnapshot({slots});
+            expect(asked, JSON.stringify(slots)).toEqual(['a2a', 'pr'])
+        }
+    });
+
     test('a SYNCHRONOUS throw is contained — Promise.resolve(read()) never sees it', async () => {
         // @neo-gpt-emmy's RA-2. `Promise.resolve(read(params))` evaluates the call BEFORE the wrapper
         // exists, so a sync throw escapes the .catch and takes the whole snapshot down. An async stub

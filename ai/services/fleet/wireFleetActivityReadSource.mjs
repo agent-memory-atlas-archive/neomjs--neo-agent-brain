@@ -34,13 +34,18 @@ import {CORPUS_PROJECTION_ORIGIN}      from '../graph/corpusProjectionContract.m
 /**
  * @summary The A2A slot reader — one bounded snapshot over the injected mailbox read path. The caller
  * owns the `listMessages` binding, so a broken/absent mailbox surfaces as this slot's own degraded
- * capability rather than a composer guess about it.
+ * capability rather than a composer guess about it. The composer's page offset becomes the mailbox
+ * query's `offset`; the first page asks without one, as it always has.
  * @param {Function} listMessages MailboxService-compatible `listMessages(args)`.
  * @returns {Function} `params => Promise<{capability, events}>`
  * @private
  */
 function makeReadA2ASnapshot(listMessages) {
-    return params => readFleetA2AActivitySnapshot({listMessages, limit: params.limit})
+    return params => readFleetA2AActivitySnapshot({
+        listArgs: params.offset > 0 ? {offset: params.offset} : {},
+        listMessages,
+        limit   : params.limit
+    })
 }
 
 /**
