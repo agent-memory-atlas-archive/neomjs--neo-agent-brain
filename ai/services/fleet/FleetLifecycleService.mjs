@@ -12,10 +12,8 @@ import {deriveHarnessLaunchSpec}                                    from './deri
 import FleetRegistryService                                         from './FleetRegistryService.mjs';
 import {cleanupCodexDesktopCrashpad, probeCodexDesktopCapabilities} from './manageCodexDesktopRuntime.mjs';
 
-// The forced-projection env var is a CROSS-PROCESS CONTRACT: the FM sets it on the spawned child env,
-// and the Neural Link server's `resolveToolProjectionMode` reads this exact name as the fallback to
-// `--tool-projection-mode`. Intentionally NOT a configurable field — an override would set a var the
-// NL server never reads, silently dropping the forced read-only projection (fail-OPEN).
+// Reserve the Neural Link policy slot against credential collisions and launch-metadata overrides.
+// Fleet does not impose a projection; explicitly restricted NL servers own their own ceiling.
 const TOOL_PROJECTION_MODE_ENV_VAR = 'NEO_NL_TOOL_PROJECTION_MODE';
 
 const DEFAULT_MAIN_CHECKOUT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -192,17 +190,11 @@ const HARNESS_AUTH_MARKERS = {
  * own var (`bridgeTokenEnvVar`) — minted per spawn, never co-mingled with either provider
  * credential.
  *
- * **Harness-auth provisioning at spawn:** every FM-spawned agent is an *embedded* agent, so `start`
- * provisions its harness-auth surfaces into the child env: (1) a freshly-minted Bridge token for the
- * agent↔Neural-Link-Bridge handshake, (2) the forced read-only Neural Link tool-projection
- * (`toolProjectionMode`, default `harness-embedded`) under the FIXED `NEO_NL_TOOL_PROJECTION_MODE` var
- * (a cross-process contract, intentionally NOT configurable — an override would set a var the NL server
- * never reads → fail-OPEN) — the NL server reads it as a fallback to its `--tool-projection-mode` flag,
- * and (3) the definition's canonical GitHub login under the FIXED `NEO_AGENT_IDENTITY` var (the same
- * cross-process-contract rationale — the MCP identity resolution chain reads that exact name), so a
- * custom Fleet instance id cannot become an alternate provider identity. Fail-closed: an FM-spawned
- * agent never receives the full developer tool surface, and `launch.env` can never pre-load a reserved
- * slot.
+ * **Harness-auth provisioning at spawn:** `start` injects a freshly-minted Bridge token and the
+ * definition's canonical GitHub login under `NEO_AGENT_IDENTITY`. A custom Fleet instance id cannot
+ * become an alternate provider identity. Managed harnesses retain the ordinary Neural Link developer
+ * surface; being launched by Fleet does not classify an agent as a restricted in-app assistant.
+ * Explicit NL server projections remain server-owned, and `launch.env` cannot pre-load reserved slots.
  *
  * **Supervision idiom** mirrors `ai/daemons/orchestrator/services/ProcessSupervisorService` (the
  * injectable `spawnFn` test seam, env-merge, graceful `SIGTERM`→`SIGKILL` stop, and draining the
@@ -211,9 +203,8 @@ const HARNESS_AUTH_MARKERS = {
  * fit for a dynamic registry-keyed fleet. Extracting a shared primitive would touch critical
  * orchestrator infra and is intentionally deferred.
  *
- * Scope: process supervision + harness-auth provisioning (Bridge token + forced NL projection, above).
- * Spawn-time *identity-env* + wake-subscription provisioning remains deferred — gated on cross-harness
- * session-id canonicalization, in a separate provisioning leaf.
+ * Scope: process supervision and harness-auth provisioning. Wake routing has its own provisioning
+ * contract.
  */
 class FleetLifecycleService extends Base {
     static config = {
@@ -246,13 +237,6 @@ class FleetLifecycleService extends Base {
      * @member {String} bridgeTokenEnvVar='NEO_FLEET_BRIDGE_TOKEN'
      */
     bridgeTokenEnvVar = 'NEO_FLEET_BRIDGE_TOKEN'
-
-    /**
-     * The forced NL tool-projection mode injected into every FM-spawned (embedded) agent — the
-     * fail-closed security ceiling. FM-spawned ⇒ embedded ⇒ forced, by construction.
-     * @member {String} toolProjectionMode='harness-embedded'
-     */
-    toolProjectionMode = 'harness-embedded'
 
     /**
      * The absolute root the isolated harness config/state homes (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`)
@@ -406,7 +390,7 @@ class FleetLifecycleService extends Base {
         // The PAT + Bridge-token keys are configurable, so a misconfiguration that collides two (e.g.
         // bridgeTokenEnvVar === credentialEnvVar) would write one credential then overwrite it with the
         // other — collapsing the distinct-credential-class boundary (the Bridge token lands in the PAT
-        // slot), or stomping the forced-projection / agent-identity vars. Reject BEFORE injecting any
+        // slot), or occupying the NL-policy / agent-identity vars. Reject BEFORE injecting any
         // secret; never spawn under a broken env contract.
         const envKeys = [
             this.credentialEnvVar,
@@ -416,7 +400,7 @@ class FleetLifecycleService extends Base {
             AGENT_IDENTITY_ENV_VAR
         ];
         if (envKeys.some(key => !key) || new Set(envKeys).size !== envKeys.length) {
-            throw new Error(`FleetLifecycleService.start: env-key contract violated — credentialEnvVar, the fixed remote-MCP credential slot, bridgeTokenEnvVar, the forced-projection var, and the agent-identity var must be non-empty and pairwise distinct (got ${JSON.stringify(envKeys)}).`);
+            throw new Error(`FleetLifecycleService.start: env-key contract violated — credentialEnvVar, the fixed remote-MCP credential slot, bridgeTokenEnvVar, the NL-policy var, and the agent-identity var must be non-empty and pairwise distinct (got ${JSON.stringify(envKeys)}).`);
         }
 
         // The launch env may not name a reserved slot: allowing it would either let registry-authored
@@ -512,13 +496,6 @@ class FleetLifecycleService extends Base {
         // tracked process record never carries it (mirrors the PAT secret posture); the Bridge
         // handshake verifies it and fails closed on absence/mismatch.
         env[this.bridgeTokenEnvVar] = this.getRegistry().mintBridgeToken(id).token;
-
-        // Forced Neural Link tool-projection: an FM-spawned agent is embedded by definition, so its
-        // NL server is pinned to the read-only projection (server-bound, fail-closed) — set by
-        // construction for every spawn, never the full developer surface. The NL server reads this
-        // FIXED env var (a cross-process contract, not configurable) as a fallback to its
-        // --tool-projection-mode flag.
-        env[TOOL_PROJECTION_MODE_ENV_VAR] = this.toolProjectionMode;
 
         // Agent identity: every FM-spawned harness carries the definition's canonical GitHub login
         // under the FIXED NEO_AGENT_IDENTITY var (a cross-process contract — the MCP identity

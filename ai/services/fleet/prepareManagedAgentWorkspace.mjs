@@ -837,8 +837,6 @@ function renderClaudeJsonContent({agent, plan, remoteMcpCapability, interpolateE
                 env[name] = `\${${name}}`;
             } else if (name === 'NEO_AGENT_IDENTITY') {
                 env[name] = agent.id;
-            } else if (name === 'NEO_NL_TOOL_PROJECTION_MODE') {
-                env[name] = 'harness-embedded';
             } else {
                 throw unsupported(`Claude Desktop has no secret-free representation for runtime env '${name}'`);
             }
@@ -944,13 +942,13 @@ async function prepareOpenCodeArtifacts({targetRepoRoot, instanceHome, agentosRu
     // provisioned seat is an earlier GENERATION, not a hand edit, and only the generation marker can
     // tell those apart. Its own convergence owns the file, and the rule is scoped to it alone.
     const
-        plantFile = files.find(file => file.path === options.wakePlantPath),
-        rest      = files.filter(file => file.path !== options.wakePlantPath),
-        legacyRest= legacyFiles.filter(file => file.path !== options.wakePlantPath);
+        plantFile  = files.find(file => file.path === options.wakePlantPath),
+        rest       = files.filter(file => file.path !== options.wakePlantPath),
+        legacyRest = legacyFiles.filter(file => file.path !== options.wakePlantPath);
 
     return [
         ...await convergeSeatConfigFiles({
-            files: rest, legacyFiles: legacyRest, repoPath: targetRepoRoot, instanceHome, fileSystem,
+            files   : rest, legacyFiles: legacyRest, repoPath: targetRepoRoot, instanceHome, fileSystem,
             policies: [
                 {
                     match          : /opencode\.jsonc$/,
@@ -1007,7 +1005,7 @@ async function convergeWakeEnvelopePlant({plantFile, instanceHome, fileSystem}) 
             'A plant carrying a generation marker that matches its own body is an earlier Fleet generation and is replaced; ' +
             'one without is a person\'s, and reconciling it is theirs to do.',
             {
-                code   : 'FLEET_WORKSPACE_DIVERGENT',
+                code    : 'FLEET_WORKSPACE_DIVERGENT',
                 artifact: {
                     path     : plant.path,
                     status   : WORKSPACE_ARTIFACT_STATES.DIVERGENT,
@@ -1023,8 +1021,8 @@ async function convergeWakeEnvelopePlant({plantFile, instanceHome, fileSystem}) 
     await publishTextAtomically({filePath: plant.path, content: plant.content, fileSystem});
 
     return [{
-        path    : plant.path,
-        status  : existing === null ? WORKSPACE_ARTIFACT_STATES.CREATED : WORKSPACE_ARTIFACT_STATES.UPDATED,
+        path     : plant.path,
+        status   : existing === null ? WORKSPACE_ARTIFACT_STATES.CREATED : WORKSPACE_ARTIFACT_STATES.UPDATED,
         ownedKeys: label
     }];
 }
