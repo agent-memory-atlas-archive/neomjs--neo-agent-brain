@@ -5,7 +5,7 @@ import os                      from 'node:os';
 import path                    from 'node:path';
 import {parsePlaywrightReport} from '../../../ai/services/ingestion/CiFailureIngestor.mjs';
 import {
-    diffFailures, formatFailureLog, readReport, summarizeReport
+    cutShort, diffFailures, formatFailureLog, readReport, summarizeReport
 } from '../compareUnitFailures.mjs';
 
 const ROOT = '/work/repo';
@@ -14,7 +14,7 @@ const ROOT = '/work/repo';
 function report(rows, {errors = [], rootDir = `${ROOT}/test/playwright/unit`} = {}) {
     const files = new Map();
 
-    for (const {file = 'ai/a.spec.mjs', describe = [], title, project = 'unit-brain', status, line = 10, column = 5, message = 'Error: boom'} of rows) {
+    for (const {file = 'ai/a.spec.mjs', describe = [], title, project = 'unit-brain', status, line = 10, column = 5, message = 'Error: boom', unrun = false} of rows) {
         let suite = files.get(file) ?? {title: file, file, specs: [], suites: []};
 
         files.set(file, suite);
@@ -28,8 +28,8 @@ function report(rows, {errors = [], rootDir = `${ROOT}/test/playwright/unit`} = 
 
         suite.specs.push({title, file, line, column, tests: [{
             projectName: project,
-            status,
-            results    : {
+            status     : unrun ? 'skipped' : status,
+            results    : unrun ? [] : {
                 flaky     : [{status: 'failed', error: {message}}, {status: 'passed'}],
                 unexpected: [{status: 'failed', error: {message}}]
             }[status] ?? [{status: 'passed'}]
@@ -100,6 +100,16 @@ test.describe('compareUnitFailures', () => {
         expect(() => readReport('head', path.join(os.tmpdir(), 'compare-unit-failures-absent.json'))).toThrow(/^the head report cannot be read \(ENOENT\)/)
     });
 
+    test('a head run cut short refuses: a test the base ran and the head never reached vouches for nothing', () => {
+        const summary = rows => summarizeReport(report(rows), 'side', ROOT);
+
+        expect(cutShort(summary([pass('ran'), pass('late', {unrun: true})]), summary([pass('ran'), pass('late')])))
+            .toEqual(['unit-brain › ai/a.spec.mjs › late']);
+        // a teardown both runs time out before is not held against the head
+        expect(cutShort(summary([pass('ran'), pass('teardown', {unrun: true})]), summary([pass('ran'), pass('teardown', {unrun: true})])))
+            .toEqual([])
+    });
+
     test('the introduced failures print in the grammar the defect ledger reads', () => {
         const {failures} = summarizeReport(report([
             fail('first', {describe: ['Suite'], line: 12, column: 5, message: '\x1b[2mError: expect(received).toBe(expected)\x1b[22m\n\nExpected: 1'}),
@@ -146,7 +156,11 @@ test.describe('compareUnitFailures', () => {
 
             const oneSided = run('--head', base);
             expect(oneSided.status).toBe(1);
-            expect(oneSided.stderr).toContain('both --head and --base are required')
+            expect(oneSided.stderr).toContain('both --head and --base are required');
+
+            const short = run('--head', write('short.json', [fail('kept'), pass('late', {unrun: true})]), '--base', write('whole.json', [fail('kept'), pass('late')]));
+            expect(short.status).toBe(1);
+            expect(short.stderr).toContain('the head run never reached 1 test(s) the base ran')
         } finally {
             fs.rmSync(dir, {force: true, recursive: true})
         }

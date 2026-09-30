@@ -49,30 +49,34 @@ export function readReport(side, filePath) {
  *
  * A test fails when its final status is `unexpected` or `flaky`: the unit config sets
  * `failOnFlakyTests` in CI, so a pass that needed a retry disqualifies the run there, and it does
- * here. Printed paths are relative to `repoRoot`, the form the reporter prints and the ledger
- * fingerprints.
+ * here. A test with no result never ran: the run ended before reaching it. Printed paths are
+ * relative to `repoRoot`, the form the reporter prints and the ledger fingerprints.
  *
  * @param {Object} report   A Playwright JSON report
  * @param {String} side     `head` or `base`, named in a refusal
  * @param {String} repoRoot The checkout printed paths are relative to
- * @returns {{failures: Map<String, Object>, counts: Object}} Failures keyed by test identity
+ * @returns {{failures: Map<String, Object>, counts: Object, unrun: Set<String>}} Failures keyed by
+ *          test identity, and the identities of the tests that never ran
  * @throws {Error} When the report ran no test
  */
 export function summarizeReport(report, side, repoRoot = process.cwd()) {
     const counts   = {expected: 0, unexpected: 0, flaky: 0, skipped: 0},
           failures = new Map(),
+          unrun    = new Set(),
           rootDir  = report?.config?.rootDir ?? repoRoot;
 
     function visit(suite, titles) {
         for (const spec of suite.specs ?? []) {
             for (const test of spec.tests ?? []) {
+                const titlePath = [...titles, spec.title],
+                      project   = test.projectName ?? '',
+                      key       = `${project} › ${spec.file} › ${titlePath.join(' › ')}`;
+
                 counts[test.status] = (counts[test.status] ?? 0) + 1;
+                test.results?.length || unrun.add(key);
 
                 if (test.status === 'unexpected' || test.status === 'flaky') {
-                    const titlePath = [...titles, spec.title],
-                          project   = test.projectName ?? '';
-
-                    failures.set(`${project} › ${spec.file} › ${titlePath.join(' › ')}`, {
+                    failures.set(key, {
                         project,
                         file   : path.relative(repoRoot, path.resolve(rootDir, spec.file)),
                         line   : spec.line,
@@ -100,7 +104,18 @@ export function summarizeReport(report, side, repoRoot = process.cwd()) {
         throw new Error(`the ${side} report ran no test`)
     }
 
-    return {failures, counts}
+    return {failures, counts, unrun}
+}
+
+/**
+ * @summary The tests the head never ran although the base did: a head run cut short can vouch for
+ * none of them, so any such test refuses the comparison.
+ * @param {Object} head {@link summarizeReport} of the head
+ * @param {Object} base {@link summarizeReport} of the base
+ * @returns {String[]} Sorted test identities
+ */
+export function cutShort(head, base) {
+    return [...head.unrun].filter(key => !base.unrun.has(key)).sort()
 }
 
 /**
@@ -182,7 +197,7 @@ export function formatSummary({head, base, diff}) {
  * appends the summary to `GITHUB_STEP_SUMMARY` when the runner provides one.
  * @param {String[]} argv
  * @param {Object}   env
- * @returns {Number} 1 on an introduced failure or an unreadable side, else 0
+ * @returns {Number} 1 on an introduced failure, an unreadable side or a head run cut short, else 0
  */
 export function main(argv = process.argv.slice(2), env = process.env) {
     try {
@@ -192,7 +207,13 @@ export function main(argv = process.argv.slice(2), env = process.env) {
 
         const head    = summarizeReport(readReport('head', values.head), 'head'),
               base    = summarizeReport(readReport('base', values.base), 'base'),
-              diff    = diffFailures(head.failures, base.failures),
+              missing = cutShort(head, base);
+
+        if (missing.length) {
+            throw new Error(`the head run never reached ${missing.length} test(s) the base ran, so it vouches for none of them: ${missing.slice(0, 5).join('; ')}`)
+        }
+
+        const diff    = diffFailures(head.failures, base.failures),
               summary = formatSummary({head, base, diff});
 
         env.GITHUB_STEP_SUMMARY && fs.appendFileSync(env.GITHUB_STEP_SUMMARY, `${summary}\n`);
