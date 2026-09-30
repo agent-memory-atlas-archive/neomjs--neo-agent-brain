@@ -400,12 +400,13 @@ test.describe('ai/scripts/resumeHarness', () => {
         expect(scriptContent).toContain('keystroke "${freshSessionShortcut}" using command down');
     });
 
-    test('Q1b boot-grounding prompt: payload refers to AGENTS_STARTUP.md and sandman_handoff.md (#10611 PR-B AC2)', async () => {
+    test('Q1b boot-grounding prompt: payload starts from the context-recovery skill and the Sandman handoff, and names no retired file', async () => {
         // The wake payload is a boot-grounding prompt instructing the fresh
-        // agent to read AGENTS_STARTUP.md + sandman_handoff.md, NOT a "Resuming sunsetted session"
+        // agent to use the context-recovery skill + the Sandman handoff, NOT a "Resuming sunsetted session"
         // prose payload. Static-read the prompt builder to verify the shape.
         const scriptContent = fs.readFileSync(scriptPath, 'utf-8');
-        expect(scriptContent).toContain('@AGENTS_STARTUP.md');
+        expect(scriptContent).toContain('please use the context-recovery skill');
+        expect(scriptContent).not.toContain('AGENTS_STARTUP');
         expect(scriptContent).toContain('explicit non-empty prompt/thought/response fields');
         expect(scriptContent).toContain('Boot heartbeat for ${identity}');
         expect(scriptContent).not.toContain('call add_memory once as a boot heartbeat, then proceed normally');
@@ -523,7 +524,7 @@ test.describe('ai/scripts/resumeHarness', () => {
             const args = JSON.parse(fs.readFileSync(outPath, 'utf-8'));
             expect(args[0]).toBe('chat');
             expect(args[1]).toBe('-n');
-            expect(args[2]).toContain('@AGENTS_STARTUP.md');
+            expect(args[2]).toContain('context-recovery skill');
             expect(args[2]).toContain('testReason');
         } finally {
             if (fs.existsSync(mockPath)) fs.unlinkSync(mockPath);
@@ -644,7 +645,7 @@ test.describe('ai/scripts/resumeHarness', () => {
             expect(args[0]).toBe('debug');
             expect(args[1]).toBe('app-server');
             expect(args[2]).toBe('send-message-v2');
-            expect(args[3]).toContain('@AGENTS_STARTUP.md');
+            expect(args[3]).toContain('context-recovery skill');
             expect(args[3]).toContain('testReason');
         } finally {
             if (fs.existsSync(mockPath)) fs.unlinkSync(mockPath);
@@ -679,7 +680,7 @@ test.describe('ai/scripts/resumeHarness', () => {
             expect(fs.existsSync(outPath)).toBe(true);
             const args = JSON.parse(fs.readFileSync(outPath, 'utf-8'));
             expect(args.slice(0, 3)).toEqual(['debug', 'app-server', 'send-message-v2']);
-            expect(args[3]).toContain('@AGENTS_STARTUP.md');
+            expect(args[3]).toContain('context-recovery skill');
             expect(args[3]).toContain('testReason');
         } finally {
             if (fs.existsSync(mockPath)) fs.unlinkSync(mockPath);

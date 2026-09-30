@@ -19,16 +19,16 @@ import {
 
 /**
  * @summary Coverage for `ai/scripts/lint/lint-agents.mjs` — the `<a id>` / `<a name>` HTML
- * anchor-tag lint guard inverted under #11584 per Discussion #11577 graduation.
+ * anchor-tag lint guard.
  *
- * Test axes mirror #11584 AC3:
+ * Test axes:
  *
- * - Lint flags new `<a id>` / `<a name>` insertions in Map substrate (AGENTS.md / AGENTS_STARTUP.md / ANTIGRAVITY_RULES.md)
+ * - Lint flags new `<a id>` / `<a name>` insertions in Map substrate (AGENTS.md / ANTIGRAVITY_RULES.md)
  * - Lint flags new insertions in skill substrate (.agents/skills/**\/*.md)
  * - Lint flags new insertions in Agent OS substrate (learn/agentos/**\/*.md)
  * - Lint preserves positional `§\d+` and semantic `§<kebab>` refs (operator-corrected substrate permits both)
  * - Lint allows explicitly exempt lines (historical / archaeology / errata / rendered-consumer)
- * - Lint error text points authors to Discussion #11577 graduation
+ * - Lint error text points authors to where the rule was decided
  *
  * Plus pure-function coverage for the exported helpers so reviewer-side V-B-A can be cheap
  * (no `git diff` shell-out required for happy-path verification).
@@ -82,7 +82,6 @@ test.describe('ai/scripts/lint-agents (#11584 — <a id> anchor-tag block per Di
 
     test('isInScope: accepts top-level Map substrate', () => {
         expect(isInScope('AGENTS.md')).toBe(true);
-        expect(isInScope('AGENTS_STARTUP.md')).toBe(true);
         expect(isInScope('.agents/ANTIGRAVITY_RULES.md')).toBe(true);
     });
 
@@ -105,11 +104,10 @@ test.describe('ai/scripts/lint-agents (#11584 — <a id> anchor-tag block per Di
         expect(isInScope('README.md')).toBe(false);
     });
 
-    test('TOP_LEVEL_MAP_FILES export contains the 3 capped Map files', () => {
+    test('TOP_LEVEL_MAP_FILES export contains the 2 capped Map files', () => {
         expect(TOP_LEVEL_MAP_FILES.has('AGENTS.md')).toBe(true);
-        expect(TOP_LEVEL_MAP_FILES.has('AGENTS_STARTUP.md')).toBe(true);
         expect(TOP_LEVEL_MAP_FILES.has('.agents/ANTIGRAVITY_RULES.md')).toBe(true);
-        expect(TOP_LEVEL_MAP_FILES.size).toBe(3);
+        expect(TOP_LEVEL_MAP_FILES.size).toBe(2);
     });
 
     test('SKILL_PREFIX + AGENTOS_PREFIX exports are the canonical roots', () => {
