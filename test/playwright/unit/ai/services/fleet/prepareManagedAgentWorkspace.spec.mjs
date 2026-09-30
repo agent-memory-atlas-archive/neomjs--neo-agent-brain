@@ -1975,3 +1975,83 @@ test.describe('prepareManagedAgentWorkspace', () => {
         await expect(fs.stat(instanceRoot)).rejects.toMatchObject({code: 'ENOENT'})
     });
 });
+
+test.describe('prepareManagedAgentWorkspace: the seat\'s instructions in its harness home', () => {
+    const
+        GATE     = /No AiConfig work without reading ADR-0019/,
+        RECEIPT  = '.neo-fleet-seat-instructions.json',
+        onRepo   = (agent, repoSlug) => ({...agent, metadata: {repo: {repoSlug}}}),
+        sha256   = content => crypto.createHash('sha256').update(content, 'utf8').digest('hex'),
+        withLog  = opts => {const lines = []; return {opts: {...opts, log: line => lines.push(line)}, lines}};
+
+    test('a Claude seat on the Brain gets the composition as <home>/CLAUDE.md with a receipt, and re-entry is MATCH', async () => {
+        const
+            agent    = onRepo(makeAgent('claude-code'), 'neomjs/neo-agent-brain'),
+            first    = await prepareManagedAgentWorkspace(options(agent)),
+            filePath = path.join(first.instanceHome, 'CLAUDE.md');
+
+        expect(first.artifacts.at(-1)).toEqual({path: filePath, status: WORKSPACE_ARTIFACT_STATES.CREATED, ownedKeys: 'seat instructions'});
+        expect(await read(filePath)).toMatch(GATE);
+        expect(JSON.parse(await read(path.join(first.instanceHome, RECEIPT))))
+            .toEqual({version: 1, artifact: 'CLAUDE.md', sha256: sha256(await read(filePath))});
+
+        const second = await prepareManagedAgentWorkspace(options(agent));
+
+        expect(second.artifacts.at(-1).status).toBe(WORKSPACE_ARTIFACT_STATES.MATCH)
+    });
+
+    test('a new Skills release replaces a file Fleet wrote; a person\'s edit refuses the start, naming the path', async () => {
+        const
+            agent       = onRepo(makeAgent('claude-code'), 'neomjs/neo-agent-brain'),
+            first       = await prepareManagedAgentWorkspace(options(agent)),
+            filePath    = path.join(first.instanceHome, 'CLAUDE.md'),
+            older       = '# An older generation Fleet wrote\n';
+
+        // the file and its receipt agree on other bytes: Fleet's own earlier write
+        await fs.writeFile(filePath, older);
+        await fs.writeFile(path.join(first.instanceHome, RECEIPT), JSON.stringify({version: 1, artifact: 'CLAUDE.md', sha256: sha256(older)}));
+
+        const updated = await prepareManagedAgentWorkspace(options(agent));
+
+        expect(updated.artifacts.at(-1).status).toBe(WORKSPACE_ARTIFACT_STATES.UPDATED);
+        expect(await read(filePath)).toMatch(GATE);
+
+        await fs.appendFile(filePath, '\nA rule of my own.\n');
+
+        await expect(prepareManagedAgentWorkspace(options(agent))).rejects.toMatchObject({
+            code    : 'FLEET_WORKSPACE_DIVERGENT',
+            artifact: {path: filePath}
+        })
+    });
+
+    test('a checkout carrying .claude/CLAUDE.md supplies a Claude seat\'s instructions: no home file, no artifact, a log line', async () => {
+        const {opts, lines} = withLog(options(onRepo(makeAgent('claude-code'), 'neomjs/neo')));
+
+        await fs.mkdir(path.join(opts.targetRepoRoot, '.claude'), {recursive: true});
+        await fs.writeFile(path.join(opts.targetRepoRoot, '.claude', 'CLAUDE.md'), '# The repository\'s own\n');
+
+        const result = await prepareManagedAgentWorkspace(opts);
+
+        expect(result.artifacts.map(artifact => artifact.ownedKeys)).not.toContain('seat instructions');
+        await expect(fs.stat(path.join(result.instanceHome, 'CLAUDE.md'))).rejects.toMatchObject({code: 'ENOENT'});
+        expect(lines).toContainEqual(expect.stringMatching(/^seat instructions repository-supplied:/))
+    });
+
+    test('Codex Desktop gets AGENTS.md inside its nested Codex home', async () => {
+        const result = await prepareManagedAgentWorkspace(options(onRepo(makeAgent('codex-desktop'), 'neomjs/neo-agent-institution')));
+
+        expect(result.artifacts.at(-1)).toMatchObject({
+            path  : path.join(result.instanceHome, 'codex-home', 'AGENTS.md'),
+            status: WORKSPACE_ARTIFACT_STATES.CREATED
+        })
+    });
+
+    test('a seat on a repository the Skills source does not declare starts without the file, and the log says why', async () => {
+        const {opts, lines} = withLog(options(onRepo(makeAgent('codex'), 'acme/app')));
+        const result        = await prepareManagedAgentWorkspace(opts);
+
+        expect(result.artifacts.map(artifact => artifact.ownedKeys)).not.toContain('seat instructions');
+        await expect(fs.stat(path.join(result.instanceHome, 'AGENTS.md'))).rejects.toMatchObject({code: 'ENOENT'});
+        expect(lines).toContainEqual(expect.stringMatching(/^seat instructions not-applicable:/))
+    })
+});
