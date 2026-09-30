@@ -109,7 +109,7 @@
         "neo.mjs": "https://github.com/neomjs/neo/archive/7f16355a9bf6bc7cdf7cbf94873b649711298f28.tar.gz",
         "playwright": "1.63.0",
         "semver": "^7.8.5",
-        "ws": "^8.21.0",
+        "ws": "^8.22.0",
         "yaml": "2.9.1",
         "zod": "^4.6.5"
     },
@@ -117,7 +117,7 @@
         "@playwright/test": "^1.63.0",
         "autoprefixer": "^10.6.1",
         "catharsis": "0.11.0",
-        "chalk": "^6.0.0",
+        "chalk": "^6.0.1",
         "postcss": "^8.5.28",
         "sass": "^1.105.0"
     },
