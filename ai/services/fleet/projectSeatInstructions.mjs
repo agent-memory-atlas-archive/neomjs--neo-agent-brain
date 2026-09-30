@@ -26,10 +26,15 @@ export const HOME_INSTRUCTION_FILES = Object.freeze({
 });
 
 /**
- * Claude loads a project's instructions from either path, beside the user-scope file and under no shared cap,
- * so a home copy next to one of them would load the same rules twice.
+ * The checkout files each harness loads as project instructions. A checkout carrying one already supplies the
+ * seat's rules, and a home copy beside it loads them twice: Claude reads user and project files under no shared
+ * cap, and Codex reads its home file whole, outside the byte budget its project files share.
  */
-const CLAUDE_PROJECT_FILES = Object.freeze(['CLAUDE.md', path.join('.claude', 'CLAUDE.md')]);
+const REPOSITORY_INSTRUCTION_FILES = Object.freeze({
+    'claude-code'  : Object.freeze(['CLAUDE.md', path.join('.claude', 'CLAUDE.md')]),
+    'codex'        : Object.freeze(['AGENTS.override.md', 'AGENTS.md']),
+    'codex-desktop': Object.freeze(['AGENTS.override.md', 'AGENTS.md'])
+});
 
 /**
  * The organization whose repositories the Skills source declares: the one that publishes it. Derived from the
@@ -63,11 +68,9 @@ export async function projectSeatInstructions({harnessType, homeRoot, repoSlug, 
         return {state: NOT_APPLICABLE, reason: `the Skills source declares no repository '${repoSlug}'`}
     }
 
-    if (harnessType === 'claude-code') {
-        for (const file of CLAUDE_PROJECT_FILES) {
-            if (await exists(path.join(targetRepoRoot, file), fileSystem)) {
-                return {state: REPOSITORY_SUPPLIED, reason: `the checkout carries ${file}`}
-            }
+    for (const file of REPOSITORY_INSTRUCTION_FILES[harnessType]) {
+        if (await exists(path.join(targetRepoRoot, file), fileSystem)) {
+            return {state: REPOSITORY_SUPPLIED, reason: `the checkout carries ${file}`}
         }
     }
 

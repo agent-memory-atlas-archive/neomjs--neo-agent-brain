@@ -57,12 +57,24 @@ test.describe('projectSeatInstructions (a seat\'s maintainer instructions in its
         }
     });
 
-    test('a checkout carrying CLAUDE.md or .claude/CLAUDE.md supplies a Claude seat\'s instructions; a Codex seat still gets its file', async () => {
-        for (const file of ['CLAUDE.md', path.join('.claude', 'CLAUDE.md')]) {
-            const fileSystem = fakeFileSystem([path.join(REPO, file)]);
+    test('a checkout supplies a seat\'s instructions only through the files that seat\'s harness reads', async () => {
+        const
+            supplies = {
+                'claude-code'  : ['CLAUDE.md', path.join('.claude', 'CLAUDE.md')],
+                'codex'        : ['AGENTS.override.md', 'AGENTS.md'],
+                'codex-desktop': ['AGENTS.override.md', 'AGENTS.md']
+            },
+            files = ['CLAUDE.md', path.join('.claude', 'CLAUDE.md'), 'AGENTS.override.md', 'AGENTS.md'];
 
-            expect(await project({fileSystem, repoSlug: 'neomjs/neo'})).toMatchObject({state: REPOSITORY_SUPPLIED});
-            expect(await project({fileSystem, repoSlug: 'neomjs/neo', harnessType: 'codex'})).toMatchObject({state: PROJECTED})
+        for (const [harnessType, own] of Object.entries(supplies)) {
+            for (const file of files) {
+                const
+                    fileSystem = fakeFileSystem([path.join(REPO, file)]),
+                    expected   = own.includes(file) ? REPOSITORY_SUPPLIED : PROJECTED;
+
+                expect(await project({fileSystem, harnessType, repoSlug: 'neomjs/neo'}), `${harnessType} beside ${file}`)
+                    .toMatchObject({state: expected})
+            }
         }
     });
 

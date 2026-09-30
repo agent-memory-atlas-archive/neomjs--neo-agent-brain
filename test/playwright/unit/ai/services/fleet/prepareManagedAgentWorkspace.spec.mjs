@@ -2037,6 +2037,19 @@ test.describe('prepareManagedAgentWorkspace: the seat\'s instructions in its har
         expect(lines).toContainEqual(expect.stringMatching(/^seat instructions repository-supplied:/))
     });
 
+    test('a checkout carrying AGENTS.md supplies a Codex seat\'s instructions: Codex reads its home file whole, beside the project budget', async () => {
+        const {opts, lines} = withLog(options(onRepo(makeAgent('codex'), 'neomjs/neo')));
+
+        await fs.mkdir(opts.targetRepoRoot, {recursive: true});
+        await fs.writeFile(path.join(opts.targetRepoRoot, 'AGENTS.md'), '# The repository\'s own\n');
+
+        const result = await prepareManagedAgentWorkspace(opts);
+
+        expect(result.artifacts.map(artifact => artifact.ownedKeys)).not.toContain('seat instructions');
+        await expect(fs.stat(path.join(result.instanceHome, 'AGENTS.md'))).rejects.toMatchObject({code: 'ENOENT'});
+        expect(lines).toContainEqual(expect.stringMatching(/^seat instructions repository-supplied: the checkout carries AGENTS\.md/))
+    });
+
     test('Codex Desktop gets AGENTS.md inside its nested Codex home', async () => {
         const result = await prepareManagedAgentWorkspace(options(onRepo(makeAgent('codex-desktop'), 'neomjs/neo-agent-institution')));
 
