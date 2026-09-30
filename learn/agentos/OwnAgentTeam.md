@@ -303,17 +303,24 @@ The recipe, in order. A step marked *(Claude)* or *(Codex)* applies to that fami
    *(Codex)* the destination is `memories/` under the seat's `CODEX_HOME` from the table —
    the same `rsync` and `diff -rq`, before the first Start. *(Claude Code CLI)* the config
    root moved with the seat: find the destination as described above before copying.
-4. *(Claude)* Clone the project entry in the branch's config file: `~/.claude.json` for the
-   Desktop family, `<CLAUDE_CONFIG_DIR>/.claude.json` for the CLI family — the old agent's file
-   is wherever *its* config root was. Back the file up first: every running Claude Code
-   instance that shares it rewrites it whole, so re-check the entry after the seat's first
-   session.
+4. *(Claude)* Clone the project entry from the old agent's config file into the seat's. The
+   source is wherever the old agent's config root was (`~/.claude.json` on the default root).
+   The destination is the branch's own file — `~/.claude.json` for the Desktop family, where
+   source and destination are the same file, or `<CLAUDE_CONFIG_DIR>/.claude.json` for the CLI
+   family, which exists once the harness's login has run against the new root, so do that
+   first. The copy backs the destination up, keeps its other fields, and stops on a missing
+   source entry instead of writing `null`. Every running Claude Code instance that shares a
+   file rewrites it whole, so re-check the entry after the seat's first session.
 
    ```bash
-   CJ=~/.claude.json   # Desktop family; CLI family: "$CLAUDE_CONFIG_DIR/.claude.json"
-   cp "$CJ" "$CJ.bak-$(date +%Y%m%d%H%M)"
-   jq --arg old "<old cwd>" --arg new "<new cwd>" '.projects[$new] = .projects[$old]' \
-     "$CJ" > "$TMPDIR/claude.json" && mv "$TMPDIR/claude.json" "$CJ"
+   SRC=~/.claude.json   # the old agent's config file
+   DST=~/.claude.json   # Desktop family (same file); CLI family: "$CLAUDE_CONFIG_DIR/.claude.json"
+   cp "$DST" "$DST.bak-$(date +%Y%m%d%H%M)"
+   jq -e --arg old "<old cwd>" '.projects[$old]' "$SRC" > "$TMPDIR/entry.json" \
+     && jq --arg new "<new cwd>" --slurpfile e "$TMPDIR/entry.json" '.projects[$new] = $e[0]' "$DST" \
+        > "$TMPDIR/claude.json" \
+     && mv "$TMPDIR/claude.json" "$DST" \
+     || echo "stopped: no entry for the old cwd in $SRC"
    ```
 
    *(Codex)* add the trust table for the new clone's path to the seat's `config.toml`.
