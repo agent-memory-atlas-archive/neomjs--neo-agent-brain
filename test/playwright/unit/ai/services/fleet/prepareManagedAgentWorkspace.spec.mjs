@@ -24,18 +24,6 @@ import {isUnmodifiedGeneration, stampWakeEnvelopePlant}      from '../../../../.
 // the new composer calls that existing primitive at the right boundary without invoking its CLI,
 // install, or build path.
 
-const TEMPLATE = `# local project policy
-project_doc_max_bytes = 131072
-
-[mcp_servers."neo-mjs-memory-core"]
-command = "npm"
-args = ["run", "old"]
-enabled = true
-
-[features]
-hooks = true
-`;
-
 const NODE_PATH    = process.execPath;
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../../..');
 
@@ -69,8 +57,6 @@ test.beforeEach(async () => {
     instanceRoot  = path.join(root, 'instances');
     hydrationCalls = [];
 
-    await fs.mkdir(path.join(agentosRuntimeRoot, '.codex'), {recursive: true});
-    await fs.writeFile(path.join(agentosRuntimeRoot, '.codex', 'config.template.toml'), TEMPLATE, 'utf8');
     await fs.mkdir(path.join(agentosRuntimeRoot, 'ai/mcp/client'), {recursive: true});
     await fs.writeFile(
         path.join(agentosRuntimeRoot, 'ai/mcp/client/stdioToStreamableHttp.mjs'),
@@ -680,7 +666,7 @@ test.describe('managed workspace logical plan → host apply boundary', () => {
 });
 
 test.describe('prepareManagedAgentWorkspace', () => {
-    test('Codex: hydrate → project MCP projection + isolated home policy, all CREATED', async () => {
+    test('Codex: template-free runtime → project MCP projection + isolated home policy, all CREATED', async () => {
         const
             opts              = options(makeAgent('codex')),
             result            = await prepareManagedAgentWorkspace(opts),
@@ -753,7 +739,9 @@ test.describe('prepareManagedAgentWorkspace', () => {
         const projectPath = path.join(opts.targetRepoRoot, '.codex', 'config.toml');
         const homePath    = path.join(first.instanceHome, 'config.toml');
 
-        await fs.appendFile(projectPath, '\n[mcp_servers."operator-local"]\ncommand = "custom"\n', 'utf8');
+        const residentProject = 'project_doc_max_bytes = 131072\n' + await read(projectPath) +
+            '\n[mcp_servers."operator-local"]\ncommand = "custom"\n\n[features]\nhooks = true\n';
+        await fs.writeFile(projectPath, residentProject, 'utf8');
         await fs.appendFile(homePath, '\n[operator]\nkeep = true\n', 'utf8');
 
         const second = await prepareManagedAgentWorkspace(opts);
@@ -763,7 +751,7 @@ test.describe('prepareManagedAgentWorkspace', () => {
             WORKSPACE_ARTIFACT_STATES.MATCH,
             WORKSPACE_ARTIFACT_STATES.MATCH
         ]);
-        expect(await read(projectPath)).toContain('[mcp_servers."operator-local"]');
+        expect(await read(projectPath)).toBe(residentProject);
         expect(await read(homePath)).toContain('[operator]');
     });
 
@@ -828,13 +816,14 @@ test.describe('prepareManagedAgentWorkspace', () => {
         expect(await read(homePath)).toBe(downgraded);
     });
 
-    test('Codex Desktop keeps its auth/memory policy inside the nested codex-home', async () => {
+    test('Codex Desktop: template-free runtime keeps auth/memory policy inside the nested codex-home', async () => {
         const
             opts     = options(makeAgent('codex-desktop')),
             result   = await prepareManagedAgentWorkspace(opts),
             authHome = path.join(result.instanceHome, 'codex-home');
 
         expect(await read(path.join(authHome, 'config.toml'))).toContain('features');
+        expect((await read(path.join(opts.targetRepoRoot, '.codex', 'config.toml'))).match(/^\[mcp_servers\./gm)).toHaveLength(5);
         expect((await fs.stat(path.join(authHome, 'memories'))).isDirectory()).toBe(true);
         await expect(fs.stat(path.join(result.instanceHome, 'config.toml'))).rejects.toMatchObject({code: 'ENOENT'});
     });
@@ -1381,7 +1370,7 @@ test.describe('prepareManagedAgentWorkspace', () => {
         const homePath           = path.join(local.instanceHome, 'config.toml');
         const homeBaseline       = await read(homePath);
         const operatorBlock      = '\n# operator bytes begin\n[mcp_servers."operator-local"]\ncommand = "custom --do-not-touch"\n# operator bytes end\n';
-        const operatorArrayBlock = '[[operator."routes]#keep"]] # legal inline-commented array header\nname = "custom --do-not-touch"\n';
+        const operatorArrayBlock = '# operator route policy\n[[operator."routes]#keep"]] # legal inline-commented array header\nname = "custom --do-not-touch"\n';
         const insertionAnchor    = '[mcp_servers."neo-mjs-knowledge-base"]';
 
         await fs.writeFile(

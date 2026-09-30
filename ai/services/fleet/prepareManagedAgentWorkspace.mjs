@@ -700,13 +700,11 @@ async function prepareHarnessArtifacts({
 }
 
 /** @private */
-async function prepareCodexArtifacts({agent, targetRepoRoot, instanceHome, agentosRuntimeRoot, plan, fileSystem}) {
+async function prepareCodexArtifacts({agent, targetRepoRoot, instanceHome, plan, fileSystem}) {
     const
-        templatePath   = path.join(agentosRuntimeRoot, '.codex', 'config.template.toml'),
         projectPath    = path.join(targetRepoRoot, '.codex', 'config.toml'),
-        template       = await fileSystem.readFile(templatePath, 'utf8'),
-        projectContent = renderCodexProjectConfig(template, plan),
-        legacyContent  = renderCodexProjectConfig(template, localizePlan(plan)),
+        projectContent = renderCodexProjectConfig(plan),
+        legacyContent  = renderCodexProjectConfig(localizePlan(plan)),
         homeRoot       = agent.harnessType === 'codex-desktop' ? path.join(instanceHome, 'codex-home') : instanceHome,
         homePath       = path.join(homeRoot, 'config.toml'),
         memoriesPath   = path.join(homeRoot, 'memories'),
@@ -1145,16 +1143,17 @@ function opencodeJsoncOwnedProjection(source) {
     return canonicalize(result);
 }
 
-/** @private */
-function renderCodexProjectConfig(template, plan) {    const
-        base     = stripManagedMcpTables(template).trimEnd(),
-        sections = plan.map(renderCodexMcpTable).join('\n\n'),
-        marker   = /^\[features\]\s*$/m,
-        header   = '# Fleet-managed Neo MCP tables: executable paths come from the installed canonical checkout; cwd/project paths stay bound to this prepared resident checkout; enabled values are the current Brain projection.';
-
-    if (!marker.test(base)) return `${base}\n\n${header}\n${sections}\n`;
-
-    return base.replace(marker, `${header}\n${sections}\n\n[features]`) + '\n';
+/**
+ * @summary Render only Fleet-owned MCP tables from the resolved plan. Project policy belongs to
+ * the resident; convergence preserves existing settings without a runtime-root setup template.
+ * @private
+ */
+function renderCodexProjectConfig(plan) {
+    return [
+        '# Fleet-managed Neo MCP tables: executable paths come from the installed canonical checkout; cwd/project paths stay bound to this prepared resident checkout; enabled values are the current Brain projection.',
+        plan.map(renderCodexMcpTable).join('\n\n'),
+        ''
+    ].join('\n');
 }
 
 /** @private */
@@ -1265,35 +1264,13 @@ function codexMcpServerName(header) {
 }
 
 /** @private */
-function stripManagedMcpTables(source) {
-    const lines    = source.split(/\r?\n/), output = [];
-    let   skipping = false;
-
-    for (const line of lines) {
-        const
-            header = parseTomlTableHeader(line),
-            name   = codexMcpServerName(header);
-
-        if (name) {
-            skipping = name.startsWith(NEO_MCP_NAME_PREFIX);
-            if (!skipping) output.push(line);
-            continue;
-        }
-        if (header) skipping = false;
-        if (!skipping) output.push(line);
-    }
-
-    return output.join('\n').replace(/\n{3,}/g, '\n\n');
-}
-
-/** @private */
 function projectCodexOwnedProjection(source) {
     const lines   = source.split(/\r?\n/), result = {};
     let   current = null, buffer = [];
 
     const flush = () => {
         if (current?.startsWith(NEO_MCP_NAME_PREFIX)) {
-            result[current] = buffer.map(line => line.trimEnd()).join('\n').trim();
+            result[current] = trimTomlTableSuffix(buffer.map(line => line.trimEnd()).join('\n')).trim();
         }
     };
 
@@ -1754,6 +1731,14 @@ function mergeCodexTransport(existing, desired) {
     return output
 }
 
+/**
+ * @summary Exclude resident separator whitespace and comment lines from an owned TOML table.
+ * @private
+ */
+function trimTomlTableSuffix(source) {
+    return source.replace(/(?:\r?\n[ \t]*(?:#[^\r\n]*)?)*[ \t]*$/, '');
+}
+
 /** @private */
 function findTomlMcpTable(source, name) {
     let start = null, boundary = source.length, lineStart = 0;
@@ -1778,14 +1763,9 @@ function findTomlMcpTable(source, name) {
 
     if (start === null) return null;
 
-    // The replacement owns only the table bytes, never the whitespace separator after them.
-    // Keeping that suffix in the resident source is what makes an inserted operator table survive
-    // local → remote → alternate remote → local with byte-exact surrounding layout.
-    let end = boundary;
+    const value = trimTomlTableSuffix(source.slice(start, boundary));
 
-    while (end > start && /\s/.test(source[end - 1])) end--;
-
-    return {start, end, value: source.slice(start, end)}
+    return {start, end: start + value.length, value}
 }
 
 /** @private */
