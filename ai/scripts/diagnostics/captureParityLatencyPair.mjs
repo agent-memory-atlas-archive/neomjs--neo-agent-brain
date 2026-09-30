@@ -194,12 +194,14 @@ function validateCapturePlan(capturePlan) {
     }
 
     for (const key of REMOTE_SERVER_KEYS) {
-        const server = capturePlan.servers[key];
+        const server      = capturePlan.servers[key];
+        const environment = server?.stdio?.environment;
 
         if (!hasExactKeys(server, ['name', 'enabled', 'stdio', 'remote']) ||
             server.name !== `neo-mjs-${key}` ||
             server.enabled !== true ||
-            !hasExactKeys(server.stdio, ['command', 'args', 'envVars']) ||
+            !hasExactKeys(server.stdio, ['command', 'args', 'envVars', ...(environment ? ['environment'] : [])]) ||
+            (environment && (!hasExactKeys(environment, ['ELECTRON_RUN_AS_NODE']) || environment.ELECTRON_RUN_AS_NODE !== '1')) ||
             !path.isAbsolute(server.stdio.command || '') ||
             !Array.isArray(server.stdio.args) ||
             server.stdio.args.length === 0 ||
@@ -963,7 +965,7 @@ export class ParityLatencyCaptureActor {
             if (this.env[name] !== undefined) env[name] = this.env[name]
         }
 
-        Object.assign(env, this.createStdioCaptureEnv());
+        Object.assign(env, this.createStdioCaptureEnv(), descriptor.stdio.environment);
 
         const transport = new this.StdioTransportClass({
             command: descriptor.stdio.command,
@@ -1069,7 +1071,7 @@ export class ParityLatencyCaptureActor {
             if (this.env[name] !== undefined) env[name] = this.env[name]
         }
 
-        Object.assign(env, this.createStdioCaptureEnv(), {
+        Object.assign(env, this.createStdioCaptureEnv(), this.capturePlan.servers['memory-core'].stdio.environment, {
             NEO_PARITY_CAPTURE_EXPECTED_IDENTITY: this.capturePlan.expectedIdentity
         });
 

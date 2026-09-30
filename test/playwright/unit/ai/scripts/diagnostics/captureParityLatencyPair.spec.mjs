@@ -152,6 +152,8 @@ test.describe('capture prerequisites — producer receipt, not caller probes', (
             plan => { plan.servers['memory-core'].remote.url = 'http://127.0.0.1:13130/mcp'; return plan },
             plan => { plan.servers['memory-core'].remote.credentialEnvVar = 'GH_TOKEN'; return plan },
             plan => { plan.servers['memory-core'].stdio.command = 'node'; return plan },
+            plan => { plan.servers['memory-core'].stdio.environment = {GH_TOKEN: 'must-not-be-a-plan-value'}; return plan },
+            plan => { plan.servers['memory-core'].stdio.environment = {ELECTRON_RUN_AS_NODE: '0'}; return plan },
             plan => { plan.sourceRoot = 'relative'; return plan },
             plan => { plan.expectedIdentity = 'neo-gpt'; return plan },
             plan => { plan.servers['memory-core'].extra = true; return plan }
@@ -183,6 +185,27 @@ test.describe('capture prerequisites — producer receipt, not caller probes', (
 });
 
 test.describe('default actor — session, source, and cleanup contracts', () => {
+    test('the stdio transport and seed process receive only the declared Node-mode environment', async () => {
+        const plan = structuredClone(CAPTURE_PLAN);
+        for (const server of Object.values(plan.servers)) server.stdio.environment = {ELECTRON_RUN_AS_NODE: '1'};
+        const seen  = [];
+        const actor = new ParityLatencyCaptureActor({
+            capturePlan        : plan,
+            env                : {GH_TOKEN: 'parent-secret', ELECTRON_RUN_AS_NODE: '0'},
+            ClientClass        : class {},
+            StdioTransportClass: class {constructor(options) {seen.push(options);}}
+        });
+        actor.stdioDataRoot = '/capture/plane';
+        actor.createSession({topology: 'stdio', key: 'memory-core', descriptor: plan.servers['memory-core'], repoPath: plan.repoPath});
+        expect(seen[0].env.ELECTRON_RUN_AS_NODE).toBe('1');
+        expect(seen[0].env.GH_TOKEN).toBeUndefined();
+
+        actor.runExec = async (command, args, label, options) => seen.push(options);
+        await actor.seedStdioIdentity();
+        expect(seen[1].env.ELECTRON_RUN_AS_NODE).toBe('1');
+        expect(seen[1].env.GH_TOKEN).toBeUndefined();
+    });
+
     test('retries listener races but never retries auth, plane, or identity failures', () => {
         expect(isRetryableParityStartupError(Object.assign(new Error('connect'), {
             code: 'ECONNREFUSED'

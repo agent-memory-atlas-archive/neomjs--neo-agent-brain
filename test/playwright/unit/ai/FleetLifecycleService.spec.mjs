@@ -1465,6 +1465,27 @@ test.describe('Neo.ai.services.fleet.FleetLifecycleService — remote MCP capabi
         expect(calls[0].opts.env.CODEX_HOME).toBe('/instances/seat-codex');
         expect(calls[0].opts.env.GH_TOKEN).toBeUndefined();
         expect(calls[0].opts.env.NEO_MCP_REMOTE_TOKEN).toBeUndefined();
+
+        const mcpPlan = tenantMcpPlan(resources, matrix).map(server => ({
+            ...server, environment: {ELECTRON_RUN_AS_NODE: '1'}
+        }));
+        for (const row of rows) {
+            if (row.transport.type === 'stdio') row.transport.env = {ELECTRON_RUN_AS_NODE: '1'};
+        }
+        const inspection = {
+            agent       : {id: 'seat-codex', githubUsername: 'neo-gpt', harnessType: 'codex'},
+            binaryPath  : process.execPath,
+            repoPath    : '/managed/seat-codex/neo',
+            instanceHome: '/instances/seat-codex',
+            mcpMatrix   : matrix,
+            mcpTarget   : {kind: 'tenant', resources},
+            mcpPlan
+        };
+        const receipt = await FleetLifecycleService.inspectPreparedRemoteMcpAdapter(inspection);
+        expect(receipt.capturePlan.servers['memory-core'].stdio.environment).toEqual({ELECTRON_RUN_AS_NODE: '1'});
+
+        delete rows.find(row => row.transport.type === 'stdio').transport.env;
+        await expect(FleetLifecycleService.inspectPreparedRemoteMcpAdapter(inspection)).rejects.toThrow(/stdio execution contract/);
     });
 
     test('the installed Codex projection fails closed on residue, wrong routing, or static auth', async () => {

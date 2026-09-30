@@ -7,6 +7,7 @@ import {isDeepStrictEqual}                         from 'node:util';
 import {hydrateCurrentWorktree}                    from '../../scripts/migrations/bootstrapWorktree.mjs';
 import {MCP_SERVERS, resolveMcpMatrix}             from '../../../src/fleet/contract/mcpServers.mjs';
 import {deriveAgentInstanceHome}                   from './deriveAgentInstanceHome.mjs';
+import {deriveNodeRuntimeEnv}                      from './deriveNodeRuntimeEnv.mjs';
 import {KIMI_SEAT_SERVERS, generateKimiSeatConfig} from './generateKimiSeatConfig.mjs';
 import {
     MANAGED_WORKSPACE_MCP_SERVER_DESCRIPTORS as MCP_SERVER_DESCRIPTORS,
@@ -200,12 +201,16 @@ function validateManagedAgentWorkspacePlan(plan) {
  * @param {ManagedAgentWorkspacePlan} options.logicalPlan
  * @param {String} options.agentosRuntimeRoot
  * @param {String} options.nodePath
+ * @param {Object} options.runtime Host runtime facts.
  * @returns {Object[]}
  * @private
  */
-function bindManagedAgentWorkspacePlan({logicalPlan, agentosRuntimeRoot, nodePath}) {
+function bindManagedAgentWorkspacePlan({logicalPlan, agentosRuntimeRoot, nodePath, runtime}) {
+    const environment = deriveNodeRuntimeEnv(nodePath, runtime);
+
     return logicalPlan.mcpServers.map(server => ({
         ...server,
+        ...(Object.keys(environment).length ? {environment: {...environment}} : {}),
         command   : nodePath,
         sourceRoot: agentosRuntimeRoot,
         args      : [
@@ -239,6 +244,7 @@ function bindManagedAgentWorkspacePlan({logicalPlan, agentosRuntimeRoot, nodePat
  * @param {String} options.instanceRoot Absolute Fleet harness-home root.
  * @param {String} options.agentosRuntimeRoot Installed AgentOS runtime root.
  * @param {String} [options.nodePath] Node executable used for installed MCP entrypoints.
+ * @param {Object} [options.runtime=process] Host runtime facts for child execution mode.
  * @param {Object} [options.remoteMcpCapability] Existing non-secret installed-adapter proof.
  * @param {Function} [options.hydrateWorkspace] Import-safe checkout hydration seam.
  * @param {Function} [options.deriveInstanceHome] Per-agent home derivation seam.
@@ -273,6 +279,7 @@ async function applyManagedAgentWorkspacePlanUnchecked({
     instanceRoot,
     agentosRuntimeRoot,
     nodePath = process.execPath,
+    runtime = process,
     remoteMcpCapability = null,
     hydrateWorkspace = hydrateCurrentWorktree,
     deriveInstanceHome = deriveAgentInstanceHome,
@@ -299,7 +306,8 @@ async function applyManagedAgentWorkspacePlanUnchecked({
         plan                        = bindManagedAgentWorkspacePlan({
             logicalPlan,
             agentosRuntimeRoot: canonicalAgentosRuntimeRoot,
-            nodePath
+            nodePath,
+            runtime
         });
 
     assertAbsolutePath(instanceHome, 'instanceHome');
@@ -350,6 +358,7 @@ async function applyManagedAgentWorkspacePlanUnchecked({
         mcpMatrix         : {...logicalPlan.mcpMatrix},
         mcpPlan           : plan.map(server => ({
             ...server,
+            ...(server.environment ? {environment: {...server.environment}} : {}),
             args              : [...server.args],
             runtimeEnv        : [...server.runtimeEnv],
             requiredRuntimeEnv: [...server.requiredRuntimeEnv],
@@ -394,6 +403,7 @@ async function applyManagedAgentWorkspacePlanUnchecked({
  * @param {Function}[options.hydrateWorkspace]    Import-safe checkout hydration seam.
  * @param {Function}[options.deriveInstanceHome]  Per-agent home derivation seam.
  * @param {Function}[options.resolveMatrix]       Sparse-at-rest MCP resolver seam.
+ * @param {Object}  [options.runtime=process]     Host runtime facts for child execution mode.
  * @param {Object}  [options.fileSystem]          Promise filesystem seam.
  * @param {Function}[options.log]                 Hydration logger.
  * @returns {Promise<{agentosRuntimeRoot: String, targetRepoRoot: String, instanceHome: String, mcpMatrix: Object, mcpPlan: Object[], hydration: Object, artifacts: Object[]}>}
@@ -407,6 +417,7 @@ export async function prepareManagedAgentWorkspace({
     instanceRoot,
     agentosRuntimeRoot,
     nodePath = process.execPath,
+    runtime = process,
     hydrateWorkspace = hydrateCurrentWorktree,
     deriveInstanceHome = deriveAgentInstanceHome,
     resolveMatrix = resolveMcpMatrix,
@@ -443,6 +454,7 @@ export async function prepareManagedAgentWorkspace({
         instanceRoot,
         agentosRuntimeRoot,
         nodePath,
+        runtime,
         remoteMcpCapability,
         hydrateWorkspace,
         deriveInstanceHome,
@@ -702,27 +714,30 @@ async function prepareHarnessArtifacts({
 /** @private */
 async function prepareCodexArtifacts({agent, targetRepoRoot, instanceHome, plan, fileSystem}) {
     const
-        projectPath    = path.join(targetRepoRoot, '.codex', 'config.toml'),
-        projectContent = renderCodexProjectConfig(plan),
-        legacyContent  = renderCodexProjectConfig(localizePlan(plan)),
-        homeRoot       = agent.harnessType === 'codex-desktop' ? path.join(instanceHome, 'codex-home') : instanceHome,
-        homePath       = path.join(homeRoot, 'config.toml'),
-        memoriesPath   = path.join(homeRoot, 'memories'),
-        homeContent    = renderCodexHomeConfig(),
-        remote         = plan.some(server => server.target === 'tenant'),
-        artifacts      = [];
+        projectPath     = path.join(targetRepoRoot, '.codex', 'config.toml'),
+        projectContent  = renderCodexProjectConfig(plan),
+        legacyContent   = renderCodexProjectConfig(localizePlan(plan)),
+        runtimePrevious = previousNodeRuntimePlan(plan),
+        homeRoot        = agent.harnessType === 'codex-desktop' ? path.join(instanceHome, 'codex-home') : instanceHome,
+        homePath        = path.join(homeRoot, 'config.toml'),
+        memoriesPath    = path.join(homeRoot, 'memories'),
+        homeContent     = renderCodexHomeConfig(),
+        remote          = plan.some(server => server.target === 'tenant'),
+        artifacts       = [];
 
     artifacts.push(...await convergeTransportArtifact({
-        filePath       : projectPath,
-        desiredContent : projectContent,
+        filePath                 : projectPath,
+        desiredContent           : projectContent,
         legacyContent,
-        ownedProjection: projectCodexOwnedProjection,
-        mergeTransport : mergeCodexTransport,
-        adapter        : agent.harnessType,
+        runtimeLegacyContent     : runtimePrevious && renderCodexProjectConfig(runtimePrevious),
+        runtimeLegacyStdioContent: runtimePrevious && renderCodexProjectConfig(localizePlan(runtimePrevious)),
+        ownedProjection          : projectCodexOwnedProjection,
+        mergeTransport           : mergeCodexTransport,
+        adapter                  : agent.harnessType,
         instanceHome,
         remote,
-        ownedLabel     : 'mcp_servers.\"neo-mjs-*\"',
-        trustedRoot    : targetRepoRoot,
+        ownedLabel               : 'mcp_servers.\"neo-mjs-*\"',
+        trustedRoot              : targetRepoRoot,
         fileSystem
     }));
     const homeArtifact = await convergeTextArtifact({
@@ -761,7 +776,9 @@ async function prepareClaudeJsonArtifact({
     interpolateEnv
 }) {
     const
-        desiredContent = renderClaudeJsonContent({
+        runtimePrevious = previousNodeRuntimePlan(plan),
+        renderPrevious  = previous => renderClaudeJsonContent({agent, plan: previous, remoteMcpCapability, interpolateEnv}),
+        desiredContent  = renderClaudeJsonContent({
             agent,
             plan,
             remoteMcpCapability,
@@ -780,12 +797,14 @@ async function prepareClaudeJsonArtifact({
         filePath,
         desiredContent,
         legacyContent,
-        ownedProjection: claudeJsonOwnedProjection,
-        mergeTransport : (existing, desired) => mergeJsonTransport(existing, desired, 'mcpServers'),
-        adapter        : agent.harnessType,
-        instanceHome   : trustedRoot,
-        remote         : plan.some(server => server.target === 'tenant'),
-        ownedLabel     : 'mcpServers.neo-mjs-*',
+        runtimeLegacyContent     : runtimePrevious && renderPrevious(runtimePrevious),
+        runtimeLegacyStdioContent: runtimePrevious && renderPrevious(localizePlan(runtimePrevious)),
+        ownedProjection          : claudeJsonOwnedProjection,
+        mergeTransport           : (existing, desired, names) => mergeJsonTransport(existing, desired, 'mcpServers', names),
+        adapter                  : agent.harnessType,
+        instanceHome             : trustedRoot,
+        remote                   : plan.some(server => server.target === 'tenant'),
+        ownedLabel               : 'mcpServers.neo-mjs-*',
         trustedRoot,
         fileSystem
     })
@@ -806,6 +825,7 @@ function renderClaudeJsonContent({agent, plan, remoteMcpCapability, interpolateE
             if (agent.harnessType === 'claude-desktop') {
                 servers[server.name] = {
                     command: remoteMcpCapability.bridge.command,
+                    ...(server.environment ? {env: {...server.environment}} : {}),
                     args   : [
                         remoteMcpCapability.bridge.entrypoint,
                         '--url',
@@ -825,7 +845,7 @@ function renderClaudeJsonContent({agent, plan, remoteMcpCapability, interpolateE
         }
 
         const
-            env      = {},
+            env      = {...server.environment},
             envNames = interpolateEnv
                 ? new Set([...server.requiredRuntimeEnv, ...server.secretEnv])
                 : server.requiredRuntimeEnv;
@@ -865,17 +885,7 @@ async function prepareKimiArtifacts({targetRepoRoot, instanceHome, agentosRuntim
 
     const
         remoteServers = createRemoteServerMap(plan),
-        {files}       = generateKimiSeatConfig({
-            agentosRuntimeRoot,
-            targetRepoRoot,
-            seatEnvFile: path.join(targetRepoRoot, '.env'),
-            kimiHome   : instanceHome,
-            memoryDir  : path.join(instanceHome, 'memory'),
-            nodeBinary : plan[0].command,
-            servers,
-            remoteServers
-        }),
-        {files: legacyFiles} = generateKimiSeatConfig({
+        options       = {
             agentosRuntimeRoot,
             targetRepoRoot,
             seatEnvFile: path.join(targetRepoRoot, '.env'),
@@ -883,9 +893,14 @@ async function prepareKimiArtifacts({targetRepoRoot, instanceHome, agentosRuntim
             memoryDir  : path.join(instanceHome, 'memory'),
             nodeBinary : plan[0].command,
             servers
-        });
+        },
+        environment = plan[0].environment,
+        {files} = generateKimiSeatConfig({...options, environment, remoteServers}),
+        {files: legacyFiles} = generateKimiSeatConfig({...options, environment}),
+        runtimeLegacyFiles = environment && generateKimiSeatConfig({...options, remoteServers}).files,
+        runtimeLegacyStdioFiles = environment && generateKimiSeatConfig(options).files;
 
-    return convergeSeatConfigFiles({files, legacyFiles, repoPath: targetRepoRoot, instanceHome, fileSystem, policies: [
+    return convergeSeatConfigFiles({files, legacyFiles, runtimeLegacyFiles, runtimeLegacyStdioFiles, repoPath: targetRepoRoot, instanceHome, fileSystem, policies: [
         {match: /config\.toml$/,                   ownedProjection: kimiConfigTomlOwnedProjection, ownedLabel: 'default_permission_mode,default_model,[[permission.rules]],[[hooks]]'},
         {
             match          : /\.kimi-code\/mcp\.json$/,
@@ -922,6 +937,7 @@ async function prepareOpenCodeArtifacts({targetRepoRoot, instanceHome, agentosRu
             seatEnvFile : path.join(targetRepoRoot, '.env'),
             memoryDir   : path.join(instanceHome, 'memory'),
             nodeBinary  : plan[0].command,
+            environment : plan[0].environment,
             seatHome    : instanceHome,
             wakeHookPath: path.join(instanceHome, 'write-wake-envelope.mjs'),
             // The seat's OWN OpenCode plugins dir, resolved here rather than inside the boot hook:
@@ -933,7 +949,9 @@ async function prepareOpenCodeArtifacts({targetRepoRoot, instanceHome, agentosRu
             servers
         },
         {files}       = generateOpenCodeSeatConfig({...options, remoteServers}),
-        {files: legacyFiles} = generateOpenCodeSeatConfig(options);
+        {files: legacyFiles} = generateOpenCodeSeatConfig(options),
+        runtimeLegacyFiles = plan[0].environment && generateOpenCodeSeatConfig({...options, environment: {}, remoteServers}).files,
+        runtimeLegacyStdioFiles = plan[0].environment && generateOpenCodeSeatConfig({...options, environment: {}}).files;
 
     // The plant is WITHHELD from the generic text-artifact pass rather than given a policy row, because
     // `convergeTextArtifact` cannot replace and the plant has to be replaceable: the file already on a
@@ -946,7 +964,7 @@ async function prepareOpenCodeArtifacts({targetRepoRoot, instanceHome, agentosRu
 
     return [
         ...await convergeSeatConfigFiles({
-            files   : rest, legacyFiles: legacyRest, repoPath: targetRepoRoot, instanceHome, fileSystem,
+            files   : rest, legacyFiles: legacyRest, runtimeLegacyFiles, runtimeLegacyStdioFiles, repoPath: targetRepoRoot, instanceHome, fileSystem,
             policies: [
                 {
                     match          : /opencode\.jsonc$/,
@@ -1032,7 +1050,7 @@ async function convergeWakeEnvelopePlant({plantFile, instanceHome, fileSystem}) 
  * seat's own authorship is never a divergence), an absent file is created from the template.
  * @private
  */
-async function convergeSeatConfigFiles({files, legacyFiles, repoPath, instanceHome, fileSystem, policies}) {
+async function convergeSeatConfigFiles({files, legacyFiles, runtimeLegacyFiles, runtimeLegacyStdioFiles, repoPath, instanceHome, fileSystem, policies}) {
     const artifacts = [];
 
     for (const file of files) {
@@ -1051,11 +1069,14 @@ async function convergeSeatConfigFiles({files, legacyFiles, repoPath, instanceHo
         if (policy?.transport) {
             artifacts.push(...await convergeTransportArtifact({
                 ...common,
-                legacyContent : legacyFile.content,
-                mergeTransport: (existing, desired) => mergeJsonTransport(
+                legacyContent            : legacyFile.content,
+                runtimeLegacyContent     : runtimeLegacyFiles?.find(entry => entry.path === file.path)?.content,
+                runtimeLegacyStdioContent: runtimeLegacyStdioFiles?.find(entry => entry.path === file.path)?.content,
+                mergeTransport           : (existing, desired, names) => mergeJsonTransport(
                     existing,
                     desired,
-                    policy.transport.containerName
+                    policy.transport.containerName,
+                    names
                 ),
                 adapter: policy.transport.adapter,
                 instanceHome,
@@ -1173,6 +1194,7 @@ function renderCodexMcpTable(server) {
         `[mcp_servers.\"${server.name}\"]`,
         `command = ${JSON.stringify(server.command)}`,
         `args = ${JSON.stringify(server.args)}`,
+        ...(server.environment ? ['env = { ELECTRON_RUN_AS_NODE = "1" }'] : []),
         `env_vars = ${JSON.stringify(server.runtimeEnv)}`,
         'startup_timeout_sec = 30',
         'tool_timeout_sec = 120',
@@ -1461,6 +1483,13 @@ const TRANSPORT_SERVER_NAMES = Object.freeze([
     `${NEO_MCP_NAME_PREFIX}knowledge-base`
 ]);
 
+/** @summary Recognize the former exact invocation without widening any other managed setting. @private */
+function previousNodeRuntimePlan(plan) {
+    return plan.some(server => server.environment)
+        ? plan.map(({environment, ...server}) => server)
+        : null;
+}
+
 /** @private */
 function localizePlan(plan) {
     return plan.map(server => server.target === 'tenant'
@@ -1481,14 +1510,17 @@ function createRemoteServerMap(plan) {
 /**
  * @summary Converge the one transport-bearing artifact with an authenticated transition receipt.
  * Markerless legacy stdio may move once; later changes require the receipt hash to match the
- * current MC/KB projection. All other managed Neo entries must already match, and the merge
- * function replaces only the two transport values.
+ * current MC/KB projection. Other managed entries must match, except the exact prior runtime
+ * projection supplied by the renderer. That one upgrade changes child Node mode without accepting
+ * unrelated edits; resident tables and login state remain outside the owned projection.
  * @private
  */
 async function convergeTransportArtifact({
     filePath,
     desiredContent,
     legacyContent,
+    runtimeLegacyContent,
+    runtimeLegacyStdioContent,
     ownedProjection,
     mergeTransport,
     adapter,
@@ -1501,9 +1533,11 @@ async function convergeTransportArtifact({
     await assertNoSymlinkSegments({rootPath: trustedRoot, targetPath: filePath, fileSystem, label: ownedLabel});
 
     const
-        receiptPath = path.join(instanceHome, '.neo-fleet-mcp-transport.json'),
-        desired     = splitTransportProjection(ownedProjection(desiredContent)),
-        legacy      = splitTransportProjection(ownedProjection(legacyContent));
+        receiptPath          = path.join(instanceHome, '.neo-fleet-mcp-transport.json'),
+        desired              = splitTransportProjection(ownedProjection(desiredContent)),
+        legacy               = splitTransportProjection(ownedProjection(legacyContent)),
+        runtimePrevious      = runtimeLegacyContent && splitTransportProjection(ownedProjection(runtimeLegacyContent)),
+        runtimePreviousStdio = runtimeLegacyStdioContent && splitTransportProjection(ownedProjection(runtimeLegacyStdioContent));
     let existing;
     let artifactStatus = WORKSPACE_ARTIFACT_STATES.MATCH;
 
@@ -1519,29 +1553,39 @@ async function convergeTransportArtifact({
         artifactStatus = WORKSPACE_ARTIFACT_STATES.CREATED
     }
 
-    const actual = splitTransportProjection(ownedProjection(existing));
+    const actual         = splitTransportProjection(ownedProjection(existing));
+    const runtimeUpgrade = JSON.stringify(actual.other) !== JSON.stringify(desired.other)
+        && runtimePrevious && !runtimePrevious.invalid
+        && JSON.stringify(actual.other) === JSON.stringify(runtimePrevious.other);
 
     if (actual.invalid || desired.invalid || legacy.invalid ||
-        JSON.stringify(actual.other) !== JSON.stringify(desired.other)) {
+        (!runtimeUpgrade && JSON.stringify(actual.other) !== JSON.stringify(desired.other))) {
         throw transportDivergence(filePath, ownedLabel, actual.invalid ? 'invalid managed artifact' : 'non-transport managed keys differ')
     }
 
-    if (JSON.stringify(actual.transport) !== JSON.stringify(desired.transport)) {
+    const transportChanged = JSON.stringify(actual.transport) !== JSON.stringify(desired.transport);
+
+    if (transportChanged) {
         const receipt    = await readTransportReceipt({receiptPath, adapter, filePath, fileSystem});
         const authorized = receipt
             ? receipt.projectionSha256 === hashProjection(actual.transport)
-            : JSON.stringify(actual.transport) === JSON.stringify(legacy.transport);
+            : JSON.stringify(actual.transport) === JSON.stringify(legacy.transport)
+                || (runtimePreviousStdio && !runtimePreviousStdio.invalid
+                    && JSON.stringify(actual.transport) === JSON.stringify(runtimePreviousStdio.transport));
 
         if (!authorized) {
             throw transportDivergence(filePath, ownedLabel, 'current MC/KB projection is neither markerless legacy stdio nor receipt-authenticated')
         }
+    }
 
-        const merged     = mergeTransport(existing, desiredContent);
+    if (transportChanged || runtimeUpgrade) {
+        const names      = runtimeUpgrade ? MCP_SERVERS.map(({key}) => `${NEO_MCP_NAME_PREFIX}${key}`) : TRANSPORT_SERVER_NAMES;
+        const merged     = mergeTransport(existing, desiredContent, names);
         const mergedPlan = splitTransportProjection(ownedProjection(merged));
 
         if (mergedPlan.invalid ||
             JSON.stringify(mergedPlan.transport) !== JSON.stringify(desired.transport) ||
-            JSON.stringify(mergedPlan.other) !== JSON.stringify(actual.other)) {
+            JSON.stringify(mergedPlan.other) !== JSON.stringify(desired.other)) {
             throw transportDivergence(filePath, ownedLabel, 'transport-only merge could not preserve the managed artifact contract')
         }
 
@@ -1710,9 +1754,9 @@ async function publishTextAtomically({filePath, content, fileSystem}) {
 }
 
 /** @private */
-function mergeCodexTransport(existing, desired) {
+function mergeCodexTransport(existing, desired, names = TRANSPORT_SERVER_NAMES) {
     let   output       = existing;
-    const replacements = TRANSPORT_SERVER_NAMES.map(name => {
+    const replacements = names.map(name => {
         const
             current = findTomlMcpTable(existing, name),
             target  = findTomlMcpTable(desired, name);
@@ -1769,7 +1813,7 @@ function findTomlMcpTable(source, name) {
 }
 
 /** @private */
-function mergeJsonTransport(existing, desired, containerName) {
+function mergeJsonTransport(existing, desired, containerName, names = TRANSPORT_SERVER_NAMES) {
     const desiredObject = parseJsonLike(desired);
     const desiredBag    = desiredObject?.[containerName];
 
@@ -1790,7 +1834,8 @@ function mergeJsonTransport(existing, desired, containerName) {
         throw transportDivergence(containerName, 'JSON MCP container', 'desired container source is missing')
     }
 
-    const replacements = TRANSPORT_SERVER_NAMES.map(name => {
+    const selectedNames = names === TRANSPORT_SERVER_NAMES ? names : names.filter(name => Object.hasOwn(desiredBag, name));
+    const replacements  = selectedNames.map(name => {
         const
             current = findDirectJsonProperty(existing, {
                 start: containerRange.valueStart,
