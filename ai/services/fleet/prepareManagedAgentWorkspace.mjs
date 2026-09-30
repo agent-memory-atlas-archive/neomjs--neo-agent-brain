@@ -15,6 +15,7 @@ import {
     createManagedAgentWorkspacePlan
 } from './managedAgentWorkspacePlan.mjs';
 import {OPENCODE_SEAT_SERVERS, WAKE_ENVELOPE_PLANT_FILE_NAME, generateOpenCodeSeatConfig, isUnmodifiedGeneration} from './generateOpenCodeSeatConfig.mjs';
+import {SEAT_INSTRUCTION_STATES, projectSeatInstructions}                                                         from './projectSeatInstructions.mjs';
 
 export {createManagedAgentWorkspacePlan} from './managedAgentWorkspacePlan.mjs';
 
@@ -242,6 +243,8 @@ function bindManagedAgentWorkspacePlan({logicalPlan, agentosRuntimeRoot, nodePat
  * @param {ManagedAgentWorkspacePlan} options.plan Closed logical plan; structural clones accepted
  *     after schema and canonical-projection coherence validation.
  * @param {String} options.targetRepoRoot Absolute provisioned target checkout path.
+ * @param {String|null} [options.repoSlug=null] The checkout's repository, `<owner>/<name>`; it names
+ *     the seat's instructions and is a host fact beside `targetRepoRoot`, never part of the logical plan.
  * @param {String} options.instanceRoot Absolute Fleet harness-home root.
  * @param {String} options.agentosRuntimeRoot Installed AgentOS runtime root.
  * @param {String} [options.nodePath] Node executable used for installed MCP entrypoints.
@@ -251,7 +254,8 @@ function bindManagedAgentWorkspacePlan({logicalPlan, agentosRuntimeRoot, nodePat
  * @param {Function} [options.deriveInstanceHome] Per-agent home derivation seam.
  * @param {Object} [options.fileSystem] Promise filesystem seam.
  * @param {Function} [options.log] Hydration logger.
- * @returns {Promise<{agentosRuntimeRoot: String, targetRepoRoot: String, instanceHome: String, mcpMatrix: Object, mcpPlan: Object[], hydration: Object, artifacts: Object[]}>}
+ * @returns {Promise<{agentosRuntimeRoot: String, targetRepoRoot: String, instanceHome: String, mcpMatrix: Object, mcpPlan: Object[], hydration: Object, artifacts: Object[], seatInstructions: Object}>}
+ *     `seatInstructions` is the decision about the seat's instruction file: `{state, reason, ignored?, homeFile?}`.
  * @throws {ManagedWorkspacePreparationError} For invalid plans/bindings, unsafe paths, unsupported
  *     capabilities, divergent content, or effect failures.
  */
@@ -277,6 +281,7 @@ export async function applyManagedAgentWorkspacePlan(options={}) {
 async function applyManagedAgentWorkspacePlanUnchecked({
     plan: inputPlan,
     targetRepoRoot,
+    repoSlug = null,
     instanceRoot,
     agentosRuntimeRoot,
     nodePath = process.execPath,
@@ -352,6 +357,17 @@ async function applyManagedAgentWorkspacePlanUnchecked({
         fileSystem
     });
 
+    const seatInstructions = await convergeSeatInstructions({
+        harnessType   : agent.harnessType,
+        targetRepoRoot: canonicalTargetRepoRoot,
+        instanceHome,
+        repoSlug,
+        fileSystem,
+        log
+    });
+
+    seatInstructions.artifact && artifacts.push(seatInstructions.artifact);
+
     return {
         agentosRuntimeRoot: canonicalAgentosRuntimeRoot,
         targetRepoRoot    : canonicalTargetRepoRoot,
@@ -366,7 +382,8 @@ async function applyManagedAgentWorkspacePlanUnchecked({
             secretEnv         : [...server.secretEnv]
         })),
         hydration,
-        artifacts
+        artifacts,
+        seatInstructions  : seatInstructions.observation
     }
 }
 
@@ -407,7 +424,8 @@ async function applyManagedAgentWorkspacePlanUnchecked({
  * @param {Object}  [options.runtime=process]     Host runtime facts for child execution mode.
  * @param {Object}  [options.fileSystem]          Promise filesystem seam.
  * @param {Function}[options.log]                 Hydration logger.
- * @returns {Promise<{agentosRuntimeRoot: String, targetRepoRoot: String, instanceHome: String, mcpMatrix: Object, mcpPlan: Object[], hydration: Object, artifacts: Object[]}>}
+ * @returns {Promise<{agentosRuntimeRoot: String, targetRepoRoot: String, instanceHome: String, mcpMatrix: Object, mcpPlan: Object[], hydration: Object, artifacts: Object[], seatInstructions: Object}>}
+ *     `seatInstructions` is the decision about the seat's instruction file: `{state, reason, ignored?, homeFile?}`.
  * @throws {ManagedWorkspacePreparationError} for unsupported adapters or divergent owned content.
  * @see createManagedAgentWorkspacePlan
  * @see applyManagedAgentWorkspacePlan
@@ -452,6 +470,7 @@ export async function prepareManagedAgentWorkspace({
     return applyManagedAgentWorkspacePlan({
         plan,
         targetRepoRoot,
+        repoSlug: agent.metadata?.repo?.repoSlug ?? null,
         instanceRoot,
         agentosRuntimeRoot,
         nodePath,
@@ -712,13 +731,118 @@ async function prepareHarnessArtifacts({
     }
 }
 
+/**
+ * @summary The home a harness reads its user-scope files from: Codex Desktop nests its `CODEX_HOME`
+ * inside the instance home, every other harness uses the instance home itself.
+ * @param {String} harnessType
+ * @param {String} instanceHome
+ * @returns {String}
+ * @private
+ */
+function harnessHomeRoot(harnessType, instanceHome) {
+    return harnessType === 'codex-desktop' ? path.join(instanceHome, 'codex-home') : instanceHome
+}
+
+/**
+ * @summary Converges the seat's maintainer instructions in its harness home (`projectSeatInstructions`
+ * decides the file and its text). The file changes with every Skills release, so it is converged against
+ * a receipt of Fleet's last write rather than as create-only content; a person's edit still refuses the
+ * start. When the seat stops taking the file, Fleet retires the copy it wrote, so stale rules never load
+ * beside the checkout's own. The decision travels in the preparation result as `observation`.
+ * @param {Object} options
+ * @returns {Promise<{artifact: Object|null, observation: Object}>}
+ * @private
+ */
+async function convergeSeatInstructions({harnessType, targetRepoRoot, instanceHome, repoSlug, fileSystem, log}) {
+    const
+        ownedLabel  = 'seat instructions',
+        receiptPath = path.join(instanceHome, '.neo-fleet-seat-instructions.json'),
+        projection  = await projectSeatInstructions({
+            harnessType,
+            homeRoot: harnessHomeRoot(harnessType, instanceHome),
+            repoSlug,
+            targetRepoRoot,
+            fileSystem
+        }),
+        observation = {
+            state : projection.state,
+            reason: projection.reason,
+            ...(projection.ignored ? {ignored: projection.ignored} : {})
+        };
+
+    if (projection.state === SEAT_INSTRUCTION_STATES.PROJECTED) {
+        return {
+            artifact: await convergeTextArtifact({
+                filePath       : projection.filePath,
+                desiredContent : projection.content,
+                ownedProjection: wholeFileOwnedProjection,
+                ownedLabel,
+                trustedRoot    : instanceHome,
+                fileSystem,
+                receiptPath
+            }),
+            observation
+        }
+    }
+
+    log(`${ownedLabel} ${projection.state}: ${projection.reason}`);
+
+    if (!projection.filePath) return {artifact: null, observation};
+
+    const retired = await retireSeatInstructions({filePath: projection.filePath, receiptPath, trustedRoot: instanceHome, fileSystem, ownedLabel});
+
+    return {
+        artifact   : retired.artifact,
+        observation: retired.homeFile ? {...observation, homeFile: retired.homeFile} : observation
+    }
+}
+
+/**
+ * @summary Removes the instructions file Fleet wrote into a seat's home once the seat no longer takes it,
+ * with its receipt. Only a file that still hashes to Fleet's last write is Fleet's to remove. A file with no
+ * receipt was never Fleet's and stays, reported in `homeFile`; a file edited after Fleet wrote it refuses
+ * the start, because its rules would load beside the ones the seat now takes.
+ * @param {Object} options
+ * @returns {Promise<{artifact: Object|null, homeFile?: String}>}
+ * @private
+ */
+async function retireSeatInstructions({filePath, receiptPath, trustedRoot, fileSystem, ownedLabel}) {
+    await assertNoSymlinkSegments({rootPath: trustedRoot, targetPath: filePath, fileSystem, label: ownedLabel});
+
+    let existing;
+
+    try {
+        existing = await fileSystem.readFile(filePath, 'utf8')
+    } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+
+        await removeContentReceipt({receiptPath, trustedRoot, fileSystem});
+        return {artifact: null}
+    }
+
+    const recorded = await readContentReceipt({receiptPath, filePath, trustedRoot, fileSystem});
+
+    if (recorded === null) {
+        return {artifact: null, homeFile: `kept: ${filePath} was not written by Fleet`}
+    }
+
+    if (recorded !== hashContent(existing)) {
+        throw divergentArtifact(filePath, ownedLabel, 'edited after Fleet wrote it, and the seat no longer takes it')
+    }
+
+    await fileSystem.unlink(filePath);
+    await removeContentReceipt({receiptPath, trustedRoot, fileSystem});
+
+    return {artifact: {path: filePath, status: WORKSPACE_ARTIFACT_STATES.UPDATED, ownedKeys: `${ownedLabel} retired`}}
+}
+
 /** @private */
 async function prepareCodexArtifacts({agent, targetRepoRoot, instanceHome, plan, fileSystem}) {
     const
         projectPath     = path.join(targetRepoRoot, '.codex', 'config.toml'),
         legacyContent   = renderCodexProjectConfig(localizePlan(plan)),
         runtimePrevious = previousNodeRuntimePlan(plan),
-        homeRoot        = agent.harnessType === 'codex-desktop' ? path.join(instanceHome, 'codex-home') : instanceHome,
+        homeRoot        = harnessHomeRoot(agent.harnessType, instanceHome),
         homePath        = path.join(homeRoot, 'config.toml'),
         memoriesPath    = path.join(homeRoot, 'memories'),
         homeContent     = renderCodexHomeConfig(),
@@ -1792,6 +1916,71 @@ async function removeTransportReceipt({receiptPath, fileSystem, instanceHome}) {
 }
 
 /** @private */
+function hashContent(content) {
+    return crypto.createHash('sha256').update(content, 'utf8').digest('hex')
+}
+
+/**
+ * @summary The sha256 a content receipt records for its file, or `null` when no receipt can vouch for
+ * it: absent, malformed, or naming another file. `null` grants no authority, so the caller fails closed.
+ * @private
+ */
+async function readContentReceipt({receiptPath, filePath, trustedRoot, fileSystem}) {
+    await assertNoSymlinkSegments({rootPath: trustedRoot, targetPath: receiptPath, fileSystem, label: 'content receipt'});
+
+    let receipt;
+
+    try {
+        receipt = JSON.parse(await fileSystem.readFile(receiptPath, 'utf8'))
+    } catch (error) {
+        if (error?.code === 'ENOENT' || error instanceof SyntaxError) return null;
+        throw error
+    }
+
+    return receipt?.version === 1 && receipt.artifact === path.basename(filePath) && /^[a-f0-9]{64}$/.test(receipt.sha256 ?? '')
+        ? receipt.sha256
+        : null
+}
+
+/**
+ * @summary Records the bytes Fleet last wrote to a file, so the next convergence can tell its own
+ * write from a person's edit. Writes only when the record changes.
+ * @private
+ */
+async function writeContentReceipt({receiptPath, filePath, content, trustedRoot, fileSystem}) {
+    await assertNoSymlinkSegments({rootPath: trustedRoot, targetPath: receiptPath, fileSystem, label: 'content receipt'});
+
+    const receipt = JSON.stringify({version: 1, artifact: path.basename(filePath), sha256: hashContent(content)}, null, 2) + '\n';
+
+    let existing = null;
+
+    try {
+        existing = await fileSystem.readFile(receiptPath, 'utf8')
+    } catch (error) {
+        if (error?.code !== 'ENOENT') throw error
+    }
+
+    if (existing !== receipt) {
+        await fileSystem.mkdir(path.dirname(receiptPath), {recursive: true});
+        await publishTextAtomically({filePath: receiptPath, content: receipt, fileSystem})
+    }
+}
+
+/**
+ * @summary Removes a content receipt once its file is gone; an absent receipt is already removed.
+ * @private
+ */
+async function removeContentReceipt({receiptPath, trustedRoot, fileSystem}) {
+    await assertNoSymlinkSegments({rootPath: trustedRoot, targetPath: receiptPath, fileSystem, label: 'content receipt'});
+
+    try {
+        await fileSystem.unlink(receiptPath)
+    } catch (error) {
+        if (error?.code !== 'ENOENT') throw error
+    }
+}
+
+/** @private */
 async function publishTextAtomically({filePath, content, fileSystem}) {
     // Scratch naming and cleanup-on-failure are the primitive's now; the `unlink(tmpPath)` that used
     // to live in the catch referenced a binding this no longer declares.
@@ -2161,9 +2350,17 @@ function transportDivergence(filePath, ownedKeys, reason) {
     )
 }
 
-/** @private */
-async function convergeTextArtifact({filePath, desiredContent, ownedProjection, ownedLabel, trustedRoot, fileSystem}) {
+/**
+ * @summary Converges one Fleet-owned text file: create it when absent, match it when its owned
+ * projection agrees, refuse the start otherwise. With a `receiptPath`, a file that still hashes to
+ * Fleet's last write is Fleet's to replace, so generated content can follow its source; a person's
+ * edit, or a missing or malformed receipt, still refuses.
+ * @private
+ */
+async function convergeTextArtifact({filePath, desiredContent, ownedProjection, ownedLabel, trustedRoot, fileSystem, receiptPath = null}) {
     await assertNoSymlinkSegments({rootPath: trustedRoot, targetPath: filePath, fileSystem, label: ownedLabel});
+
+    const recordWrite = content => receiptPath && writeContentReceipt({receiptPath, filePath, content, trustedRoot, fileSystem});
 
     let existing;
     try {
@@ -2175,6 +2372,7 @@ async function convergeTextArtifact({filePath, desiredContent, ownedProjection, 
         await assertNoSymlinkSegments({rootPath: trustedRoot, targetPath: filePath, fileSystem, label: ownedLabel});
         try {
             await fileSystem.writeFile(filePath, desiredContent, {encoding: 'utf8', flag: 'wx', mode: 0o600});
+            await recordWrite(desiredContent);
             return {path: filePath, status: WORKSPACE_ARTIFACT_STATES.CREATED, ownedKeys: ownedLabel};
         } catch (writeError) {
             if (writeError?.code !== 'EEXIST') throw writeError;
@@ -2187,7 +2385,14 @@ async function convergeTextArtifact({filePath, desiredContent, ownedProjection, 
         desired = ownedProjection(desiredContent);
 
     if (JSON.stringify(actual) === JSON.stringify(desired)) {
+        await recordWrite(desiredContent);
         return {path: filePath, status: WORKSPACE_ARTIFACT_STATES.MATCH, ownedKeys: ownedLabel};
+    }
+
+    if (receiptPath && await readContentReceipt({receiptPath, filePath, trustedRoot, fileSystem}) === hashContent(existing)) {
+        await publishTextAtomically({filePath, content: desiredContent, fileSystem});
+        await recordWrite(desiredContent);
+        return {path: filePath, status: WORKSPACE_ARTIFACT_STATES.UPDATED, ownedKeys: ownedLabel};
     }
 
     const artifact = {

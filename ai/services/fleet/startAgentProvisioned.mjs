@@ -103,7 +103,9 @@ async function spawnPermitted({lifecycleService, registry, agentId, startOptions
  * @param {String}   [options.agentosRuntimeRoot] Installed AgentOS runtime root; defaults to the
  *                                                package root containing this composer.
  * @param {String}   [options.nodePath]         Node executable override for generated MCP definitions.
- * @returns {Promise<Object>} the agent's lifecycle status (see `FleetLifecycleService.status`).
+ * @returns {Promise<Object>} the agent's lifecycle status (see `FleetLifecycleService.status`). A prepared
+ *   seat's status also carries `seatInstructions`, the preparer's decision about its instructions file,
+ *   so whoever starts the seat sees why it got, kept or lost one.
  * @throws {Error} when `lifecycleService` / `agentId` is missing, the agent is unknown or has no GitHub
  *   PAT stored (refused before any checkout), `managedRoot`
  *   is absent for a repo-bearing agent, a repo-bearing raw launch override would bypass curated
@@ -266,7 +268,7 @@ export async function startAgentProvisioned({
         })
     }
 
-    return spawnPermitted({
+    const status = await spawnPermitted({
         lifecycleService,
         registry,
         agentId,
@@ -278,4 +280,6 @@ export async function startAgentProvisioned({
                 : {})
         }
     });
+
+    return prepared.seatInstructions ? {...status, seatInstructions: prepared.seatInstructions} : status
 }
