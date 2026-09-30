@@ -243,10 +243,9 @@ test.describe('fleetActivityComposer — composing two truths means composing tw
     });
 
     test('a SYNCHRONOUS throw is contained — Promise.resolve(read()) never sees it', async () => {
-        // @neo-gpt-emmy's RA-2. `Promise.resolve(read(params))` evaluates the call BEFORE the wrapper
-        // exists, so a sync throw escapes the .catch and takes the whole snapshot down. An async stub
-        // cannot surface it — which is why the original "throwing adapter" test passed over this.
-        // A real adapter validating its arguments throws exactly this way.
+        // `Promise.resolve(read(params))` evaluates the call BEFORE the wrapper exists, so a sync throw
+        // would escape the .catch and take the whole snapshot down. An async stub cannot surface that;
+        // a real adapter validating its arguments throws exactly this way.
         const source = createFleetActivityReadSource({
             readA2ASnapshot   : () => { throw new Error('sync validation failure') },
             readPrLaneSnapshot: wired([{occurredAt: '2026-07-16T12:00:00.000Z', eventId: 'pr-1'}])
