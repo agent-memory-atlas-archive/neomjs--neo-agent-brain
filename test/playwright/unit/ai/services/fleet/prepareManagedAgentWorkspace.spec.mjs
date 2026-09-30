@@ -749,8 +749,18 @@ test.describe('prepareManagedAgentWorkspace', () => {
             'await server.connect(new StdioServerTransport());'
         ].join('\n'));
 
-        const opts   = {...options(makeAgent('codex-desktop')), mcpTarget: tenantTarget()};
-        const result = await prepareManagedAgentWorkspace(opts);
+        const opts       = {...options(makeAgent('codex-desktop')), mcpTarget: tenantTarget()};
+        const result     = await prepareManagedAgentWorkspace(opts);
+        const homePath   = path.join(result.instanceHome, 'codex-home', 'config.toml');
+        const nativeHome = (await read(homePath)).replace(
+            '# Fleet-managed remote MCP project trust begin\n',
+            '# Fleet-managed remote MCP project trust begin\n' +
+            'notify = ["/fixture/native-notify", "turn-ended"]\nmodel = "gpt-6-astra"\n' +
+            'model_reasoning_effort = "ultra"\n\n'
+        );
+        await fs.writeFile(homePath, nativeHome);
+        await prepareManagedAgentWorkspace(opts);
+        expect(await read(homePath)).toBe(nativeHome);
         const listed = spawnSync(process.env.NEO_TEST_CODEX_BIN, ['mcp', 'list', '--json'], {
             cwd     : opts.targetRepoRoot,
             env     : {PATH: process.env.PATH, CODEX_HOME: path.join(result.instanceHome, 'codex-home')},
@@ -1033,6 +1043,74 @@ test.describe('prepareManagedAgentWorkspace', () => {
         expect((await fs.stat(path.join(a.instanceHome, 'memories'))).isDirectory()).toBe(true);
         expect((await fs.stat(path.join(b.instanceHome, 'memories'))).isDirectory()).toBe(true);
     });
+
+    for (const harness of ['codex', 'codex-desktop']) {
+        test(`${harness}: remote trust re-entry preserves native settings inside Fleet comments`, async () => {
+            const opts = options(makeAgent(harness));
+            opts.mcpTarget = tenantTarget();
+
+            const first      = await prepareManagedAgentWorkspace(opts);
+            const home       = harness === 'codex' ? first.instanceHome : path.join(first.instanceHome, 'codex-home');
+            const homePath   = path.join(home, 'config.toml');
+            const authPath   = path.join(home, 'auth.json');
+            const nativeHome = (await read(homePath)).replace(
+                '# Fleet-managed remote MCP project trust begin\n',
+                '# Fleet-managed remote MCP project trust begin\n' +
+                'notify = ["/fixture/native-notify", "turn-ended"]\n' +
+                'model = "resident-model"\nmodel_reasoning_effort = "ultra"\n\n'
+            );
+            const authentication = '{"fixture": "resident login stays untouched"}\n';
+
+            await fs.writeFile(homePath, nativeHome);
+            await fs.writeFile(authPath, authentication);
+            const second = await prepareManagedAgentWorkspace(opts);
+
+            expect(second.artifacts.every(item => item.status === WORKSPACE_ARTIFACT_STATES.MATCH)).toBe(true);
+            expect(await read(homePath)).toBe(nativeHome);
+            expect(await read(authPath)).toBe(authentication);
+
+            const equivalent = nativeHome.replace('trust_level = "trusted"', "trust_level = 'trusted' # native spelling");
+            await fs.writeFile(homePath, equivalent);
+            await prepareManagedAgentWorkspace(opts);
+            expect(await read(homePath)).toBe(equivalent);
+
+            opts.mcpTarget = null;
+            await expect(prepareManagedAgentWorkspace(opts)).rejects.toMatchObject({code: 'FLEET_WORKSPACE_DIVERGENT'});
+            expect(await read(homePath)).toBe(equivalent);
+            expect(await read(authPath)).toBe(authentication);
+        });
+    }
+
+    for (const [name, mutate] of [
+        ['missing target trust', source => source.replace('trust_level = "trusted"', '# removed by resident')],
+        ['wrong target', source => source.replace('[projects.', '[other_projects.')],
+        ['invalid TOML', source => 'resident_secret = "unterminated\n' + source],
+        ['missing end marker', source => source.replace('# Fleet-managed remote MCP project trust end', '')],
+        ['orphan end marker', source => source.replace('# Fleet-managed remote MCP project trust begin', '')],
+        ['duplicate end marker', source => source + '\n# Fleet-managed remote MCP project trust end\n']
+    ]) {
+        test(`remote trust re-entry refuses ${name} without exposing or overwriting content`, async () => {
+            const opts = options(makeAgent('codex-desktop'));
+            opts.mcpTarget = tenantTarget();
+            const first    = await prepareManagedAgentWorkspace(opts);
+            const homePath = path.join(first.instanceHome, 'codex-home', 'config.toml');
+            const invalid  = mutate(await read(homePath));
+            await fs.writeFile(homePath, invalid);
+
+            let error;
+            try {
+                await prepareManagedAgentWorkspace(opts);
+            } catch (caught) {
+                error = caught;
+            }
+            expect(error).toBeInstanceOf(ManagedWorkspacePreparationError);
+            expect(error.code).toBe('FLEET_WORKSPACE_DIVERGENT');
+            expect(error.artifact.ownedKeys).toBe(name === 'invalid TOML' ? 'Codex context policy' : 'projects.<managed-repo>.trust_level');
+            expect(JSON.stringify(error)).not.toContain('resident_secret');
+            expect(error.message).not.toContain('resident_secret');
+            expect(await read(homePath)).toBe(invalid);
+        });
+    }
 
     test('a remote Codex home refuses a managed-project trust downgrade instead of silently ignoring its generated MCP config', async () => {
         const opts = options(makeAgent('codex'));
