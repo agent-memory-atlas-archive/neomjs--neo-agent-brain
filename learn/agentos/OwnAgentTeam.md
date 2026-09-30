@@ -240,7 +240,7 @@ families, four homes (`ai/services/fleet/deriveHarnessLaunchSpec.mjs`):
 | Fleet harness | The seat's home, as Fleet passes it | Where its markdown memory lives | Its window |
 |---|---|---|---|
 | `claude-desktop` | `<seat>/harness/claude-desktop` as `--user-data-dir` (and `CLAUDE_USER_DATA_DIR`) — the app profile only; the Claude Code inside keeps the default config root `~/.claude` | `~/.claude/projects/<project>/memory/` — measured on this setup | the app window; sign in there |
-| `claude-code` | `<seat>/harness/claude-code` as `CLAUDE_CONFIG_DIR` — the whole config root moves with the seat | `<CLAUDE_CONFIG_DIR>/projects/<project>/memory/` — Claude's documented storage rule, not yet witnessed on a Fleet seat | none (a supervised stream); the login is a command against that config root |
+| `claude-code` | `<seat>/harness/claude-code` as `CLAUDE_CONFIG_DIR` — the whole config root moves with the seat, its `.claude.json` included (`<CLAUDE_CONFIG_DIR>/.claude.json`, as Fleet's launch contract documents and an isolated CLI run confirmed) | `<CLAUDE_CONFIG_DIR>/projects/<project>/memory/` — Claude's documented storage rule, not yet witnessed on a Fleet seat | none (a supervised stream); the login is a command against that config root |
 | `codex-desktop` | `<seat>/harness/codex-desktop` — `codex-home/` inside it is `CODEX_HOME`, `electron-profile/` is `--user-data-dir` | `<seat>/harness/codex-desktop/codex-home/memories/` | the app window; sign in there |
 | `codex` | `<seat>/harness/codex` as `CODEX_HOME` | `<CODEX_HOME>/memories/` | none; the login is a command against that home |
 
@@ -251,7 +251,7 @@ config root:
 |---|---|---|
 | Markdown memory (the index and its files) | `~/.claude/projects/<project>/memory/` | Copy |
 | Session transcripts | `~/.claude/projects/<project>/*.jsonl` | Optional — resume history only; the Memory Core is the archive |
-| Project entry (allowed tools, MCP toggles, trust) | `~/.claude.json` → `projects["<cwd>"]` | Copy the entry onto the new cwd |
+| Project entry (allowed tools, MCP toggles, trust) | `~/.claude.json` → `projects["<cwd>"]` on the Desktop family; the CLI family's file is `<CLAUDE_CONFIG_DIR>/.claude.json` | Copy the entry onto the new cwd, in the branch's own file |
 | Permission allowlist | `<checkout>/.claude/settings.local.json` | Copy into the new clone, after Fleet cloned it |
 | App profile (login, sessions, MCP config) | the instance's `--user-data-dir` | No — sign in once; Fleet writes the MCP config |
 
@@ -303,14 +303,17 @@ The recipe, in order. A step marked *(Claude)* or *(Codex)* applies to that fami
    *(Codex)* the destination is `memories/` under the seat's `CODEX_HOME` from the table —
    the same `rsync` and `diff -rq`, before the first Start. *(Claude Code CLI)* the config
    root moved with the seat: find the destination as described above before copying.
-4. *(Claude)* Clone the project entry. Back the file up first: every running Claude Code
-   instance rewrites `~/.claude.json` whole, so re-check the entry after the seat's first
+4. *(Claude)* Clone the project entry in the branch's config file: `~/.claude.json` for the
+   Desktop family, `<CLAUDE_CONFIG_DIR>/.claude.json` for the CLI family — the old agent's file
+   is wherever *its* config root was. Back the file up first: every running Claude Code
+   instance that shares it rewrites it whole, so re-check the entry after the seat's first
    session.
 
    ```bash
-   cp ~/.claude.json ~/.claude.json.bak-$(date +%Y%m%d%H%M)
+   CJ=~/.claude.json   # Desktop family; CLI family: "$CLAUDE_CONFIG_DIR/.claude.json"
+   cp "$CJ" "$CJ.bak-$(date +%Y%m%d%H%M)"
    jq --arg old "<old cwd>" --arg new "<new cwd>" '.projects[$new] = .projects[$old]' \
-     ~/.claude.json > "$TMPDIR/claude.json" && mv "$TMPDIR/claude.json" ~/.claude.json
+     "$CJ" > "$TMPDIR/claude.json" && mv "$TMPDIR/claude.json" "$CJ"
    ```
 
    *(Codex)* add the trust table for the new clone's path to the seat's `config.toml`.
