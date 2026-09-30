@@ -2,6 +2,7 @@ import {execFile, execFileSync, spawn}                              from 'child_
 import fs                                                           from 'fs';
 import path                                                         from 'path';
 import {fileURLToPath}                                              from 'url';
+import {isDeepStrictEqual}                                          from 'node:util';
 import AiConfig                                                     from '../../config.mjs';
 import {generateLocalBearerToken}                                   from '../../mcp/server/shared/helpers/localBearer.mjs';
 import Base                                                         from 'neo.mjs/src/core/Base.mjs';
@@ -9,6 +10,7 @@ import {MCP_SERVERS}                                                from '../../
 import {REMOTE_MCP_CREDENTIAL_ENV_VAR}                              from './mcpServers.mjs';
 import {deriveAgentInstanceHome}                                    from './deriveAgentInstanceHome.mjs';
 import {deriveHarnessLaunchSpec}                                    from './deriveHarnessLaunchSpec.mjs';
+import {deriveNodeRuntimeEnv, NODE_RUNTIME_ENV}                     from './deriveNodeRuntimeEnv.mjs';
 import FleetRegistryService                                         from './FleetRegistryService.mjs';
 import {cleanupCodexDesktopCrashpad, probeCodexDesktopCapabilities} from './manageCodexDesktopRuntime.mjs';
 
@@ -105,7 +107,7 @@ function probeClaudeDesktopMcpBridge({mainCheckout, nodePath}) {
 
     const help = execFileSync(nodePath, [entrypoint, '--help'], {
         encoding: 'utf8',
-        env     : {PATH: process.env.PATH},
+        env     : {PATH: process.env.PATH, ...deriveNodeRuntimeEnv(nodePath)},
         timeout : 3000
     });
 
@@ -1466,7 +1468,8 @@ class FleetLifecycleService extends Base {
                 !Array.isArray(planRow.args) ||
                 !planRow.args.every(value => typeof value === 'string') ||
                 !Array.isArray(planRow.runtimeEnv) ||
-                !planRow.runtimeEnv.every(value => /^[A-Z][A-Z0-9_]*$/.test(value))) {
+                !planRow.runtimeEnv.every(value => /^[A-Z][A-Z0-9_]*$/.test(value)) ||
+                (planRow.environment && !isDeepStrictEqual(planRow.environment, NODE_RUNTIME_ENV))) {
                 throw new Error(`FleetLifecycleService.inspectPreparedRemoteMcpAdapter: prepared plan did not preserve the exact generated descriptor for '${name}'.`)
             }
 
@@ -1489,8 +1492,9 @@ class FleetLifecycleService extends Base {
                 }
             } else if (transport.type !== 'stdio' ||
                 planRow.target !== 'resident' ||
-                planRow.transport !== 'stdio') {
-                throw new Error(`FleetLifecycleService.inspectPreparedRemoteMcpAdapter: installed '${harnessType}' moved local-only '${name}' off stdio.`)
+                planRow.transport !== 'stdio' ||
+                (planRow.environment && !isDeepStrictEqual(transport.env, NODE_RUNTIME_ENV))) {
+                throw new Error(`FleetLifecycleService.inspectPreparedRemoteMcpAdapter: installed '${harnessType}' did not preserve '${name}' local stdio execution contract.`)
             }
         }
 
@@ -1507,7 +1511,8 @@ class FleetLifecycleService extends Base {
                 stdio  : {
                     command: planRow.command,
                     args   : [...planRow.args],
-                    envVars: [...planRow.runtimeEnv]
+                    envVars: [...planRow.runtimeEnv],
+                    ...(planRow.environment ? {environment: {...planRow.environment}} : {})
                 },
                 remote: {
                     url             : transport.url,

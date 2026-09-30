@@ -23,10 +23,12 @@ import net                               from 'node:net';
 import os                                from 'node:os';
 import path                              from 'node:path';
 import {performance}                     from 'node:perf_hooks';
+import {isDeepStrictEqual}               from 'node:util';
 import {Client}                          from '@modelcontextprotocol/sdk/client/index.js';
 import {StdioClientTransport}            from '@modelcontextprotocol/sdk/client/stdio.js';
 import {StreamableHTTPClientTransport}   from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {assertServedPlane, readToolJson} from './mcpHealthcheck.mjs';
+import {NODE_RUNTIME_ENV}                from '../../services/fleet/deriveNodeRuntimeEnv.mjs';
 import {
     MIN_SAMPLES,
     PARITY_BOOT_EVENT,
@@ -194,12 +196,14 @@ function validateCapturePlan(capturePlan) {
     }
 
     for (const key of REMOTE_SERVER_KEYS) {
-        const server = capturePlan.servers[key];
+        const server      = capturePlan.servers[key];
+        const environment = server?.stdio?.environment;
 
         if (!hasExactKeys(server, ['name', 'enabled', 'stdio', 'remote']) ||
             server.name !== `neo-mjs-${key}` ||
             server.enabled !== true ||
-            !hasExactKeys(server.stdio, ['command', 'args', 'envVars']) ||
+            !hasExactKeys(server.stdio, ['command', 'args', 'envVars', ...(environment ? ['environment'] : [])]) ||
+            (environment && !isDeepStrictEqual(environment, NODE_RUNTIME_ENV)) ||
             !path.isAbsolute(server.stdio.command || '') ||
             !Array.isArray(server.stdio.args) ||
             server.stdio.args.length === 0 ||
@@ -963,7 +967,7 @@ export class ParityLatencyCaptureActor {
             if (this.env[name] !== undefined) env[name] = this.env[name]
         }
 
-        Object.assign(env, this.createStdioCaptureEnv());
+        Object.assign(env, this.createStdioCaptureEnv(), descriptor.stdio.environment);
 
         const transport = new this.StdioTransportClass({
             command: descriptor.stdio.command,
@@ -1069,7 +1073,7 @@ export class ParityLatencyCaptureActor {
             if (this.env[name] !== undefined) env[name] = this.env[name]
         }
 
-        Object.assign(env, this.createStdioCaptureEnv(), {
+        Object.assign(env, this.createStdioCaptureEnv(), this.capturePlan.servers['memory-core'].stdio.environment, {
             NEO_PARITY_CAPTURE_EXPECTED_IDENTITY: this.capturePlan.expectedIdentity
         });
 

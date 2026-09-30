@@ -17,7 +17,8 @@ import {
     createManagedAgentWorkspacePlan,
     prepareManagedAgentWorkspace
 } from '../../../../../../ai/services/fleet/prepareManagedAgentWorkspace.mjs';
-import {isUnmodifiedGeneration, stampWakeEnvelopePlant}      from '../../../../../../ai/services/fleet/generateOpenCodeSeatConfig.mjs';
+import {isUnmodifiedGeneration, stampWakeEnvelopePlant} from '../../../../../../ai/services/fleet/generateOpenCodeSeatConfig.mjs';
+import {deriveNodeRuntimeEnv}                           from '../../../../../../ai/services/fleet/deriveNodeRuntimeEnv.mjs';
 
 // Temp-filesystem contract tests: the real artifact writer runs, while checkout hydration is an
 // injected recorder. `hydrateCurrentWorktree` has its own real temp-checkout suite; this spec proves
@@ -666,6 +667,117 @@ test.describe('managed workspace logical plan → host apply boundary', () => {
 });
 
 test.describe('prepareManagedAgentWorkspace', () => {
+    test('Node execution mode belongs only to the selected Electron executable', () => {
+        const runtime = {execPath: '/app/Electron', versions: {electron: '43.5.0'}};
+
+        expect(deriveNodeRuntimeEnv('/app/Electron', runtime)).toEqual({ELECTRON_RUN_AS_NODE: '1'});
+        expect(deriveNodeRuntimeEnv('/usr/local/bin/node', runtime)).toEqual({});
+        expect(deriveNodeRuntimeEnv('/app/Electron', {...runtime, versions: {}})).toEqual({});
+    });
+
+    for (const harnessType of ['codex', 'codex-desktop', 'claude-code', 'claude-desktop', 'kimi-code', 'opencode']) {
+        test(`${harnessType}: upgrade the exact prior MCP runtime without changing login files`, async () => {
+            const opts = {
+                ...options(makeAgent(harnessType)),
+                runtime: {execPath: NODE_PATH, versions: {}}
+            };
+            const first      = await prepareManagedAgentWorkspace(opts);
+            const configPath = {
+                codex           : path.join(opts.targetRepoRoot, '.codex/config.toml'),
+                'codex-desktop' : path.join(opts.targetRepoRoot, '.codex/config.toml'),
+                'claude-code'   : path.join(first.instanceHome, 'mcp-config.json'),
+                'claude-desktop': path.join(first.instanceHome, 'claude_desktop_config.json'),
+                'kimi-code'     : path.join(opts.targetRepoRoot, '.kimi-code/mcp.json'),
+                opencode        : path.join(opts.targetRepoRoot, 'opencode.jsonc')
+            }[harnessType];
+            const before     = await read(configPath);
+            const authPath   = path.join(first.instanceHome, 'auth.json');
+            const parentMode = process.env.ELECTRON_RUN_AS_NODE;
+
+            await fs.writeFile(authPath, 'resident login bytes\n');
+            expect(before).not.toContain('ELECTRON_RUN_AS_NODE');
+            opts.runtime.versions.electron = '43.5.0';
+
+            const upgraded = await prepareManagedAgentWorkspace(opts);
+            expect(await read(configPath)).toContain('ELECTRON_RUN_AS_NODE');
+            expect(upgraded.artifacts.find(item => item.path === configPath).status).toBe(WORKSPACE_ARTIFACT_STATES.UPDATED);
+            expect(await read(authPath)).toBe('resident login bytes\n');
+            expect(process.env.ELECTRON_RUN_AS_NODE).toBe(parentMode);
+            expect((await prepareManagedAgentWorkspace(opts)).artifacts.every(item => item.status === WORKSPACE_ARTIFACT_STATES.MATCH)).toBe(true);
+
+            await fs.writeFile(configPath, before.replaceAll(NODE_PATH, '/edited/node'));
+            await expect(prepareManagedAgentWorkspace(opts)).rejects.toMatchObject({code: 'FLEET_WORKSPACE_DIVERGENT'});
+        });
+    }
+
+    test('Electron MCP upgrade preserves remote endpoints, resident TOML and nested Codex login', async () => {
+        const opts       = {...options(makeAgent('codex-desktop')), mcpTarget: tenantTarget(), runtime: {execPath: NODE_PATH, versions: {}}};
+        const first      = await prepareManagedAgentWorkspace(opts);
+        const configPath = path.join(opts.targetRepoRoot, '.codex/config.toml');
+        const resident   = '\n[resident]\nkeep = "owned by the peer"\n';
+        const authPath   = path.join(first.instanceHome, 'codex-home/auth.json');
+
+        await fs.writeFile(configPath, await read(configPath) + resident);
+        await fs.writeFile(authPath, 'private login fixture\n');
+        opts.runtime.versions.electron = '43.5.0';
+        await prepareManagedAgentWorkspace(opts);
+
+        const result = await read(configPath);
+        expect(result).toContain(resident);
+        expect(result).toContain('https://tenant.example.com/agentos/mc/mcp');
+        expect(result.match(/ELECTRON_RUN_AS_NODE/g)).toHaveLength(3);
+        expect(await read(authPath)).toBe('private login fixture\n');
+
+        opts.mcpTarget = null;
+        await prepareManagedAgentWorkspace(opts);
+        expect((await read(configPath)).match(/ELECTRON_RUN_AS_NODE/g)).toHaveLength(5);
+        opts.mcpTarget = tenantTarget();
+        await prepareManagedAgentWorkspace(opts);
+        expect((await read(configPath)).match(/ELECTRON_RUN_AS_NODE/g)).toHaveLength(3);
+    });
+
+    test('installed Codex parser and Electron execute the generated MCP command', async () => {
+        test.skip(!process.versions.electron || !process.env.NEO_TEST_CODEX_BIN,
+            'Requires the packaged Electron runtime and an installed Codex CLI.');
+
+        const entry = path.join(agentosRuntimeRoot, MCP_ENTRYPOINTS[2]);
+        await fs.writeFile(entry, [
+            `import {McpServer} from ${JSON.stringify(import.meta.resolve('@modelcontextprotocol/sdk/server/mcp.js'))};`,
+            `import {StdioServerTransport} from ${JSON.stringify(import.meta.resolve('@modelcontextprotocol/sdk/server/stdio.js'))};`,
+            'const server = new McpServer({name: "runtime-probe", version: "1.0.0"});',
+            'server.registerTool("runtime_probe", {inputSchema: {}}, async () => ({content: [{type: "text", text: JSON.stringify({electron: process.versions.electron, mode: process.env.ELECTRON_RUN_AS_NODE})}]}));',
+            'await server.connect(new StdioServerTransport());'
+        ].join('\n'));
+
+        const opts   = {...options(makeAgent('codex-desktop')), mcpTarget: tenantTarget()};
+        const result = await prepareManagedAgentWorkspace(opts);
+        const listed = spawnSync(process.env.NEO_TEST_CODEX_BIN, ['mcp', 'list', '--json'], {
+            cwd     : opts.targetRepoRoot,
+            env     : {PATH: process.env.PATH, CODEX_HOME: path.join(result.instanceHome, 'codex-home')},
+            encoding: 'utf8',
+            timeout : 10000
+        });
+        expect(listed.status, listed.stderr).toBe(0);
+        const row = JSON.parse(listed.stdout).find(item => item.name === 'neo-mjs-neural-link');
+        expect(row.transport.env).toEqual({ELECTRON_RUN_AS_NODE: '1'});
+
+        const transport = new StdioClientTransport({
+            command: row.transport.command,
+            args   : row.transport.args,
+            env    : row.transport.env,
+            cwd    : opts.targetRepoRoot,
+            stderr : 'pipe'
+        });
+        const client = new Client({name: 'runtime-proof', version: '1.0.0'});
+        try {
+            await client.connect(transport);
+            const response = await client.callTool({name: 'runtime_probe', arguments: {}});
+            expect(JSON.parse(response.content[0].text)).toEqual({electron: process.versions.electron, mode: '1'});
+        } finally {
+            await client.close();
+        }
+    });
+
     test('Codex: template-free runtime → project MCP projection + isolated home policy, all CREATED', async () => {
         const
             opts              = options(makeAgent('codex')),
