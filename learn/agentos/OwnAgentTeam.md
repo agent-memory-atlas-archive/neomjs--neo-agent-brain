@@ -252,9 +252,17 @@ a space included: `/Users/me/agents/ada/neomjs/neo` becomes
 the rule ever changes, the directory it creates *is* the slug — copy into it before the
 second session.
 
-Codex keys its project trust by path in `~/.codex/config.toml`; re-key it for the new clone.
-Where Codex keeps per-project memory, and whether it is file-based, is the Codex seat's fact
-to state — this section carries it once a Codex maintainer has read it off a live seat.
+Codex keys differently, and the move is simpler for it. Read off a live Codex seat by a Codex
+maintainer (the seat's `CODEX_HOME` is its own instance directory):
+
+| Surface | Where | In the move? |
+|---|---|---|
+| Markdown memory (the index and its files) | `$CODEX_HOME/memories/` — `MEMORY.md`, `memory_summary.md`, `raw_memories.md`, `rollout_summaries/`, with `skills/` and `extensions/` beside them | Copy the directory into the seat's new `CODEX_HOME` |
+| Project trust | `$CODEX_HOME/config.toml`, a table per checkout: `[projects."<absolute checkout path>"]` with `trust_level = "trusted"` | Add a table for the new clone's path; the key is the path itself, no slug conversion |
+| Login, sessions, the rest of the home | `$CODEX_HOME/…` | Not part of this recipe — sign in again; what else Codex persists there is not enumerated here |
+
+Codex memory is per instance, not per project, so a seat that keeps its `CODEX_HOME` keeps its
+memory; only a seat that moves to a Fleet-provisioned home copies `memories/` across.
 
 The recipe, in order:
 
@@ -281,6 +289,8 @@ The recipe, in order:
      ~/.claude.json > "$TMPDIR/claude.json" && mv "$TMPDIR/claude.json" ~/.claude.json
    ```
 
+   For a Codex seat, this step copies `$CODEX_HOME/memories/` into the new harness home and
+   the next one adds the trust table for the new clone; the proof and the order stay the same.
 5. Start the seat in the Fleet Manager and sign in inside its window. Only now copy
    `.claude/settings.local.json` into the new clone: the clone exists after the first Start,
    and nothing may be created under the seat folder before it — `git clone` refuses a
