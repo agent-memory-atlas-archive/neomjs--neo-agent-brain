@@ -778,6 +778,134 @@ test.describe('prepareManagedAgentWorkspace', () => {
         }
     });
 
+    for (const harnessType of ['codex', 'codex-desktop']) {
+        test(`${harnessType}: context defaults come only from the selected repository`, async () => {
+            const opts         = options(makeAgent(harnessType));
+            const templatePath = path.join(opts.targetRepoRoot, '.codex', 'config.template.toml');
+            await fs.mkdir(path.dirname(templatePath), {recursive: true});
+            await fs.writeFile(templatePath, [
+                '"model_context_window" = 1000000',
+                'model_auto_compact_token_limit = 850000',
+                'model = "not-copied"',
+                'model_max_output_tokens = 128000',
+                'approval_policy = "never"',
+                'notes = """',
+                'model_context_window = 42',
+                '"""',
+                '[sandbox_workspace_write]',
+                'network_access = true',
+                '[nested]',
+                'model_context_window = 99'
+            ].join('\n'));
+            await fs.mkdir(path.join(agentosRuntimeRoot, '.codex'), {recursive: true});
+            await fs.writeFile(path.join(agentosRuntimeRoot, '.codex', 'config.template.toml'), 'model_context_window = 7\n');
+
+            const prepared = await prepareManagedAgentWorkspace(opts);
+            const config   = await read(path.join(opts.targetRepoRoot, '.codex', 'config.toml'));
+            expect(config).toContain('model_context_window = 1000000\nmodel_auto_compact_token_limit = 850000\n');
+            expect(config).not.toMatch(/not-copied|model_max_output_tokens|approval_policy|network_access|notes|\[nested\]/);
+            expect(prepared.artifacts[0].status).toBe(WORKSPACE_ARTIFACT_STATES.CREATED);
+        });
+
+        for (const scope of ['project', 'home']) {
+            for (const key of ['model_context_window', 'model_auto_compact_token_limit']) {
+                test(`${harnessType}: one explicit ${scope} ${key} preserves the resident policy`, async () => {
+                    const opts        = options(makeAgent(harnessType));
+                    const prepared    = await prepareManagedAgentWorkspace(opts);
+                    const projectPath = path.join(opts.targetRepoRoot, '.codex', 'config.toml');
+                    const homePath    = path.join(prepared.instanceHome, ...(harnessType === 'codex-desktop' ? ['codex-home'] : []), 'config.toml');
+                    const policyPath  = scope === 'project' ? projectPath : homePath;
+                    await fs.writeFile(policyPath, `"${key}" = 123456\n` + await read(policyPath));
+                    const projectBefore = await read(projectPath);
+                    const homeBefore    = await read(homePath);
+                    await fs.writeFile(path.join(opts.targetRepoRoot, '.codex', 'config.template.toml'),
+                        'model_context_window = 1000000\nmodel_auto_compact_token_limit = 850000\n');
+
+                    const repeated = await prepareManagedAgentWorkspace(opts);
+                    expect(await read(projectPath)).toBe(projectBefore);
+                    expect(await read(homePath)).toBe(homeBefore);
+                    expect(repeated.artifacts.every(artifact => artifact.status === WORKSPACE_ARTIFACT_STATES.MATCH)).toBe(true);
+                });
+            }
+        }
+    }
+
+    test('Codex context seeding upgrades MCP-only output once and preserves resident text and login', async () => {
+        const opts         = options(makeAgent('codex-desktop'));
+        const prepared     = await prepareManagedAgentWorkspace(opts);
+        const projectPath  = path.join(opts.targetRepoRoot, '.codex', 'config.toml');
+        const homePath     = path.join(prepared.instanceHome, 'codex-home', 'config.toml');
+        const authPath     = path.join(prepared.instanceHome, 'codex-home', 'auth.json');
+        const templatePath = path.join(opts.targetRepoRoot, '.codex', 'config.template.toml');
+        const resident     = '# retain this comment\nnotes = """\nmodel_context_window = 42\n"""\n';
+        const original     = resident + await read(projectPath) + '\n[custom]\nmodel_context_window = 17\n';
+        const homeBefore   = await read(homePath);
+        await fs.writeFile(projectPath, original);
+        await fs.writeFile(authPath, '{"fixture":"login-preserved"}\n');
+        await fs.writeFile(templatePath, 'model_context_window = 1000000\nmodel_auto_compact_token_limit = 850000\n');
+
+        const upgraded = await prepareManagedAgentWorkspace(opts);
+        const after    = await read(projectPath);
+        expect(upgraded.artifacts[0].status).toBe(WORKSPACE_ARTIFACT_STATES.UPDATED);
+        expect(after).toContain('model_context_window = 1000000\nmodel_auto_compact_token_limit = 850000\n');
+        expect(after.endsWith(original)).toBe(true);
+        expect(await read(homePath)).toBe(homeBefore);
+        expect(await read(authPath)).toBe('{"fixture":"login-preserved"}\n');
+
+        await fs.writeFile(templatePath, 'model_context_window = "later-invalid-policy"\n');
+        const repeated = await prepareManagedAgentWorkspace(opts);
+        expect(await read(projectPath)).toBe(after);
+        expect(repeated.artifacts[0].status).toBe(WORKSPACE_ARTIFACT_STATES.MATCH);
+    });
+
+    test('Codex context seeding ignores nested keys and literal-string lookalikes', async () => {
+        const opts = options(makeAgent('codex'));
+        await fs.mkdir(path.join(opts.targetRepoRoot, '.codex'), {recursive: true});
+        await fs.writeFile(path.join(opts.targetRepoRoot, '.codex', 'config.template.toml'), [
+            "notes = '''",
+            'model_context_window = 1000000',
+            "'''",
+            '[profile]',
+            'model_auto_compact_token_limit = 850000'
+        ].join('\n'));
+        await prepareManagedAgentWorkspace(opts);
+        const config = await read(path.join(opts.targetRepoRoot, '.codex', 'config.toml'));
+        expect(config).not.toMatch(/model_context_window|model_auto_compact_token_limit/);
+    });
+
+    test('Codex context seeding accepts a template with only one supported default', async () => {
+        const opts = options(makeAgent('codex'));
+        await fs.mkdir(path.join(opts.targetRepoRoot, '.codex'), {recursive: true});
+        await fs.writeFile(path.join(opts.targetRepoRoot, '.codex', 'config.template.toml'), 'model_context_window = 800000\n');
+        await prepareManagedAgentWorkspace(opts);
+        const config = await read(path.join(opts.targetRepoRoot, '.codex', 'config.toml'));
+        expect(config).toContain('model_context_window = 800000\n');
+        expect(config).not.toContain('model_auto_compact_token_limit');
+    });
+
+    for (const value of ['"secret-invalid-value"', '0', '-1', '1.5', '99999999999999999999', '[invalid-secret']) {
+        test(`Codex context seeding refuses malformed policy ${value} without exposing its content`, async () => {
+            const opts         = options(makeAgent('codex'));
+            const templatePath = path.join(opts.targetRepoRoot, '.codex', 'config.template.toml');
+            await fs.mkdir(path.dirname(templatePath), {recursive: true});
+            await fs.writeFile(templatePath, `model_context_window = ${value}\n`);
+            const failure = await prepareManagedAgentWorkspace(opts).catch(error => error);
+            expect(failure).toBeInstanceOf(ManagedWorkspacePreparationError);
+            expect(failure.message).toContain(templatePath);
+            expect(failure.message).not.toContain('secret');
+            await expect(fs.stat(path.join(opts.targetRepoRoot, '.codex', 'config.toml'))).rejects.toMatchObject({code: 'ENOENT'});
+        });
+    }
+
+    test('Codex context seeding refuses a symlinked repository template', async () => {
+        const opts = options(makeAgent('codex'));
+        await fs.mkdir(path.join(opts.targetRepoRoot, '.codex'), {recursive: true});
+        const outside = path.join(repoRoot, 'other-policy.toml');
+        await fs.writeFile(outside, 'model_context_window = 1000000\n');
+        await fs.symlink(outside, path.join(opts.targetRepoRoot, '.codex', 'config.template.toml'));
+        await expect(prepareManagedAgentWorkspace(opts)).rejects.toThrow(/symlinked/);
+    });
+
     test('Codex: template-free runtime → project MCP projection + isolated home policy, all CREATED', async () => {
         const
             opts              = options(makeAgent('codex')),

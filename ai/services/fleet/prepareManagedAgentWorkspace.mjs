@@ -4,6 +4,7 @@ import {writeFileAtomic}                           from '../shared/atomicFileWri
 import path                                        from 'node:path';
 import crypto                                      from 'node:crypto';
 import {isDeepStrictEqual}                         from 'node:util';
+import {parse as parseToml}                        from 'smol-toml';
 import {hydrateCurrentWorktree}                    from '../../scripts/migrations/bootstrapWorktree.mjs';
 import {MCP_SERVERS, resolveMcpMatrix}             from '../../../src/fleet/contract/mcpServers.mjs';
 import {deriveAgentInstanceHome}                   from './deriveAgentInstanceHome.mjs';
@@ -715,7 +716,6 @@ async function prepareHarnessArtifacts({
 async function prepareCodexArtifacts({agent, targetRepoRoot, instanceHome, plan, fileSystem}) {
     const
         projectPath     = path.join(targetRepoRoot, '.codex', 'config.toml'),
-        projectContent  = renderCodexProjectConfig(plan),
         legacyContent   = renderCodexProjectConfig(localizePlan(plan)),
         runtimePrevious = previousNodeRuntimePlan(plan),
         homeRoot        = agent.harnessType === 'codex-desktop' ? path.join(instanceHome, 'codex-home') : instanceHome,
@@ -724,10 +724,11 @@ async function prepareCodexArtifacts({agent, targetRepoRoot, instanceHome, plan,
         homeContent     = renderCodexHomeConfig(),
         remote          = plan.some(server => server.target === 'tenant'),
         artifacts       = [];
+    const contextSeed = await readCodexContextSeed({targetRepoRoot, projectPath, homePath, instanceHome, fileSystem});
 
     artifacts.push(...await convergeTransportArtifact({
         filePath                 : projectPath,
-        desiredContent           : projectContent,
+        desiredContent           : contextSeed + renderCodexProjectConfig(plan),
         legacyContent,
         runtimeLegacyContent     : runtimePrevious && renderCodexProjectConfig(runtimePrevious),
         runtimeLegacyStdioContent: runtimePrevious && renderCodexProjectConfig(localizePlan(runtimePrevious)),
@@ -740,6 +741,16 @@ async function prepareCodexArtifacts({agent, targetRepoRoot, instanceHome, plan,
         trustedRoot              : targetRepoRoot,
         fileSystem
     }));
+
+    if (contextSeed && artifacts[0].status !== WORKSPACE_ARTIFACT_STATES.CREATED) {
+        await publishTextAtomically({
+            filePath: projectPath,
+            content : contextSeed + await fileSystem.readFile(projectPath, 'utf8'),
+            fileSystem
+        });
+        artifacts[0].status = WORKSPACE_ARTIFACT_STATES.UPDATED
+    }
+
     const homeArtifact = await convergeTextArtifact({
         filePath       : homePath,
         desiredContent : homeContent,
@@ -763,6 +774,53 @@ async function prepareCodexArtifacts({agent, targetRepoRoot, instanceHome, plan,
     artifacts.push(await ensureDirectoryArtifact(memoriesPath, instanceHome, fileSystem));
 
     return artifacts;
+}
+
+/**
+ * @summary Bootstrap the selected repository's Codex context policy without owning it thereafter.
+ * Either explicit project/home key preserves the resident's whole policy. Only the two documented
+ * positive integer defaults are seeded; MCP, provider and permission settings are never copied.
+ * @param {Object} options Explicit project/home paths and the bounded promise filesystem seam.
+ * @returns {Promise<String>} Root TOML prefix, or an empty string when no seed is applicable.
+ * @private
+ */
+async function readCodexContextSeed({targetRepoRoot, projectPath, homePath, instanceHome, fileSystem}) {
+    const keys       = ['model_context_window', 'model_auto_compact_token_limit'];
+    const readPolicy = async (filePath, trustedRoot) => {
+        await assertNoSymlinkSegments({rootPath: trustedRoot, targetPath: filePath, fileSystem, label: 'Codex context policy'});
+        let source;
+
+        try {
+            source = await fileSystem.readFile(filePath, 'utf8')
+        } catch (error) {
+            if (error?.code === 'ENOENT') return {};
+            throw error
+        }
+
+        try {
+            return parseToml(source)
+        } catch {
+            throw divergentArtifact(filePath, 'Codex context policy', 'invalid TOML')
+        }
+    };
+
+    for (const [filePath, root] of [[projectPath, targetRepoRoot], [homePath, instanceHome]]) {
+        const policy = await readPolicy(filePath, root);
+        if (keys.some(key => Object.hasOwn(policy, key))) return ''
+    }
+
+    const templatePath = path.join(targetRepoRoot, '.codex', 'config.template.toml');
+    const template     = await readPolicy(templatePath, targetRepoRoot);
+    const entries      = keys.filter(key => Object.hasOwn(template, key)).map(key => [key, template[key]]);
+
+    if (entries.some(([, value]) => !Number.isSafeInteger(value) || value <= 0)) {
+        throw divergentArtifact(templatePath, 'Codex context policy', 'context defaults must be positive safe integers')
+    }
+
+    return entries.length
+        ? '# Initial context defaults from this repository; subsequent settings are resident-owned.\n' +
+            entries.map(([key, value]) => `${key} = ${value}`).join('\n') + '\n\n'
+        : '';
 }
 
 /** @private */
