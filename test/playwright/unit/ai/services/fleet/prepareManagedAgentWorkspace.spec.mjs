@@ -19,6 +19,7 @@ import {
 } from '../../../../../../ai/services/fleet/prepareManagedAgentWorkspace.mjs';
 import {isUnmodifiedGeneration, stampWakeEnvelopePlant} from '../../../../../../ai/services/fleet/generateOpenCodeSeatConfig.mjs';
 import {deriveNodeRuntimeEnv}                           from '../../../../../../ai/services/fleet/deriveNodeRuntimeEnv.mjs';
+import {startAgentProvisioned}                          from '../../../../../../ai/services/fleet/startAgentProvisioned.mjs';
 
 // Temp-filesystem contract tests: the real artifact writer runs, while checkout hydration is an
 // injected recorder. `hydrateCurrentWorktree` has its own real temp-checkout suite; this spec proves
@@ -499,7 +500,8 @@ test.describe('managed workspace logical plan → host apply boundary', () => {
             'mcpMatrix',
             'mcpPlan',
             'hydration',
-            'artifacts'
+            'artifacts',
+            'seatInstructions'
         ]);
         expect(result.mcpPlan[0].args[0]).toBe(path.join(agentosRuntimeRoot, MCP_ENTRYPOINTS[0]));
         expect(path.isAbsolute(result.mcpPlan[0].args[0])).toBe(true);
@@ -661,7 +663,8 @@ test.describe('managed workspace logical plan → host apply boundary', () => {
             'mcpMatrix',
             'mcpPlan',
             'hydration',
-            'artifacts'
+            'artifacts',
+            'seatInstructions'
         ])
     });
 });
@@ -1978,11 +1981,12 @@ test.describe('prepareManagedAgentWorkspace', () => {
 
 test.describe('prepareManagedAgentWorkspace: the seat\'s instructions in its harness home', () => {
     const
-        GATE     = /No AiConfig work without reading ADR-0019/,
-        RECEIPT  = '.neo-fleet-seat-instructions.json',
-        onRepo   = (agent, repoSlug) => ({...agent, metadata: {repo: {repoSlug}}}),
-        sha256   = content => crypto.createHash('sha256').update(content, 'utf8').digest('hex'),
-        withLog  = opts => {const lines = []; return {opts: {...opts, log: line => lines.push(line)}, lines}};
+        GATE    = /No AiConfig work without reading ADR-0019/,
+        RECEIPT = '.neo-fleet-seat-instructions.json',
+        onRepo  = (agent, repoSlug) => ({...agent, metadata: {repo: {repoSlug}}}),
+        sha256  = content => crypto.createHash('sha256').update(content, 'utf8').digest('hex'),
+        homeOf  = (result, harnessType) => path.join(result.instanceHome, harnessType === 'codex-desktop' ? 'codex-home' : '', harnessType === 'claude-code' ? 'CLAUDE.md' : 'AGENTS.md'),
+        absent  = filePath => expect(fs.stat(filePath)).rejects.toMatchObject({code: 'ENOENT'});
 
     test('a Claude seat on the Brain gets the composition as <home>/CLAUDE.md with a receipt, and re-entry is MATCH', async () => {
         const
@@ -2002,10 +2006,10 @@ test.describe('prepareManagedAgentWorkspace: the seat\'s instructions in its har
 
     test('a new Skills release replaces a file Fleet wrote; a person\'s edit refuses the start, naming the path', async () => {
         const
-            agent       = onRepo(makeAgent('claude-code'), 'neomjs/neo-agent-brain'),
-            first       = await prepareManagedAgentWorkspace(options(agent)),
-            filePath    = path.join(first.instanceHome, 'CLAUDE.md'),
-            older       = '# An older generation Fleet wrote\n';
+            agent    = onRepo(makeAgent('claude-code'), 'neomjs/neo-agent-brain'),
+            first    = await prepareManagedAgentWorkspace(options(agent)),
+            filePath = path.join(first.instanceHome, 'CLAUDE.md'),
+            older    = '# An older generation Fleet wrote\n';
 
         // the file and its receipt agree on other bytes: Fleet's own earlier write
         await fs.writeFile(filePath, older);
@@ -2024,8 +2028,8 @@ test.describe('prepareManagedAgentWorkspace: the seat\'s instructions in its har
         })
     });
 
-    test('a checkout carrying .claude/CLAUDE.md supplies a Claude seat\'s instructions: no home file, no artifact, a log line', async () => {
-        const {opts, lines} = withLog(options(onRepo(makeAgent('claude-code'), 'neomjs/neo')));
+    test('a checkout carrying .claude/CLAUDE.md supplies a Claude seat\'s instructions: no home file, no artifact, the decision in the result', async () => {
+        const opts = options(onRepo(makeAgent('claude-code'), 'neomjs/neo'));
 
         await fs.mkdir(path.join(opts.targetRepoRoot, '.claude'), {recursive: true});
         await fs.writeFile(path.join(opts.targetRepoRoot, '.claude', 'CLAUDE.md'), '# The repository\'s own\n');
@@ -2033,12 +2037,12 @@ test.describe('prepareManagedAgentWorkspace: the seat\'s instructions in its har
         const result = await prepareManagedAgentWorkspace(opts);
 
         expect(result.artifacts.map(artifact => artifact.ownedKeys)).not.toContain('seat instructions');
-        await expect(fs.stat(path.join(result.instanceHome, 'CLAUDE.md'))).rejects.toMatchObject({code: 'ENOENT'});
-        expect(lines).toContainEqual(expect.stringMatching(/^seat instructions repository-supplied:/))
+        await absent(path.join(result.instanceHome, 'CLAUDE.md'));
+        expect(result.seatInstructions).toEqual({state: 'repository-supplied', reason: `the checkout carries ${path.join('.claude', 'CLAUDE.md')}`})
     });
 
     test('a checkout carrying AGENTS.md supplies a Codex seat\'s instructions: Codex reads its home file whole, beside the project budget', async () => {
-        const {opts, lines} = withLog(options(onRepo(makeAgent('codex'), 'neomjs/neo')));
+        const opts = options(onRepo(makeAgent('codex'), 'neomjs/neo'));
 
         await fs.mkdir(opts.targetRepoRoot, {recursive: true});
         await fs.writeFile(path.join(opts.targetRepoRoot, 'AGENTS.md'), '# The repository\'s own\n');
@@ -2046,8 +2050,140 @@ test.describe('prepareManagedAgentWorkspace: the seat\'s instructions in its har
         const result = await prepareManagedAgentWorkspace(opts);
 
         expect(result.artifacts.map(artifact => artifact.ownedKeys)).not.toContain('seat instructions');
-        await expect(fs.stat(path.join(result.instanceHome, 'AGENTS.md'))).rejects.toMatchObject({code: 'ENOENT'});
-        expect(lines).toContainEqual(expect.stringMatching(/^seat instructions repository-supplied: the checkout carries AGENTS\.md/))
+        await absent(path.join(result.instanceHome, 'AGENTS.md'));
+        expect(result.seatInstructions).toEqual({state: 'repository-supplied', reason: 'the checkout carries AGENTS.md'})
+    });
+
+    test('once the checkout supplies the instructions, the home file Fleet wrote is retired with its receipt, for every harness', async () => {
+        for (const [harnessType, repoFile] of [['claude-code', 'CLAUDE.md'], ['codex', 'AGENTS.md'], ['codex-desktop', 'AGENTS.md']]) {
+            const
+                opts     = options(onRepo(makeAgent(harnessType, {id: `retire-${harnessType}`}), 'neomjs/neo')),
+                first    = await prepareManagedAgentWorkspace(opts),
+                homeFile = homeOf(first, harnessType);
+
+            expect(first.artifacts.at(-1), harnessType).toMatchObject({path: homeFile, status: WORKSPACE_ARTIFACT_STATES.CREATED});
+
+            await fs.writeFile(path.join(opts.targetRepoRoot, repoFile), '# The repository\'s own\n');
+
+            const second = await prepareManagedAgentWorkspace(opts);
+
+            expect(second.artifacts.at(-1), harnessType).toEqual({path: homeFile, status: WORKSPACE_ARTIFACT_STATES.UPDATED, ownedKeys: 'seat instructions retired'});
+            expect(second.seatInstructions.state, harnessType).toBe('repository-supplied');
+            await absent(homeFile);
+            await absent(path.join(first.instanceHome, RECEIPT))
+        }
+    });
+
+    test('a seat moved to a repository the Skills source does not declare loses the file Fleet wrote', async () => {
+        const
+            first    = await prepareManagedAgentWorkspace(options(onRepo(makeAgent('codex'), 'neomjs/neo-agent-brain'))),
+            homeFile = homeOf(first, 'codex'),
+            moved    = await prepareManagedAgentWorkspace(options(onRepo(makeAgent('codex'), 'acme/app')));
+
+        expect(moved.seatInstructions).toMatchObject({state: 'not-applicable'});
+        expect(moved.artifacts.at(-1)).toMatchObject({path: homeFile, ownedKeys: 'seat instructions retired'});
+        await absent(homeFile)
+    });
+
+    test('a home file edited after Fleet wrote it refuses the start once the seat no longer takes it, and keeps the edit', async () => {
+        const
+            opts     = options(onRepo(makeAgent('claude-code'), 'neomjs/neo')),
+            first    = await prepareManagedAgentWorkspace(opts),
+            homeFile = homeOf(first, 'claude-code');
+
+        await fs.appendFile(homeFile, '\nA rule of my own.\n');
+        const edited = await read(homeFile);
+        await fs.writeFile(path.join(opts.targetRepoRoot, 'CLAUDE.md'), '# The repository\'s own\n');
+
+        await expect(prepareManagedAgentWorkspace(opts)).rejects.toMatchObject({
+            code    : 'FLEET_WORKSPACE_DIVERGENT',
+            artifact: {path: homeFile}
+        });
+        expect(await read(homeFile)).toBe(edited)
+    });
+
+    test('a home file Fleet never wrote stays when the checkout supplies the instructions, and the decision says so', async () => {
+        const opts  = options(onRepo(makeAgent('claude-code'), 'neomjs/neo')),
+              first = await prepareManagedAgentWorkspace({...opts, agent: onRepo(makeAgent('claude-code'), 'acme/app')}),
+              home  = homeOf(first, 'claude-code');
+
+        await fs.writeFile(home, '# The resident\'s own\n');
+        await fs.writeFile(path.join(opts.targetRepoRoot, 'CLAUDE.md'), '# The repository\'s own\n');
+
+        const result = await prepareManagedAgentWorkspace(opts);
+
+        expect(await read(home)).toBe('# The resident\'s own\n');
+        expect(result.seatInstructions).toMatchObject({state: 'repository-supplied', homeFile: `kept: ${home} was not written by Fleet`})
+    });
+
+    test('an AGENTS.md the harness cannot read never stands in for the composition; a symlink to a readable file does', async () => {
+        const
+            unreadable = typeof process.getuid === 'function' && process.getuid() !== 0,
+            cases      = [
+                ['a directory', async file => fs.mkdir(file), 'not a file'],
+                ['a link to nothing', async file => fs.symlink(path.join(root, 'nowhere.md'), file), 'a link to nothing'],
+                ...(unreadable ? [['an unreadable file', async file => {await fs.writeFile(file, '# locked\n'); await fs.chmod(file, 0o000)}, 'unreadable']] : [])
+            ];
+
+        for (const [label, place, why] of cases) {
+            const opts = options(onRepo(makeAgent('codex', {id: `entry-${why.replace(/\W+/g, '-')}`}), 'neomjs/neo'));
+
+            await fs.mkdir(opts.targetRepoRoot, {recursive: true});
+            await place(path.join(opts.targetRepoRoot, 'AGENTS.md'));
+
+            const result = await prepareManagedAgentWorkspace(opts);
+
+            expect(result.artifacts.at(-1), label).toMatchObject({path: homeOf(result, 'codex'), status: WORKSPACE_ARTIFACT_STATES.CREATED});
+            expect(result.seatInstructions, label).toMatchObject({state: 'projected', ignored: [`AGENTS.md (${why})`]})
+        }
+
+        const linked = options(onRepo(makeAgent('codex', {id: 'entry-linked'}), 'neomjs/neo'));
+
+        await fs.mkdir(linked.targetRepoRoot, {recursive: true});
+        await fs.writeFile(path.join(root, 'shared-agents.md'), '# Shared\n');
+        await fs.symlink(path.join(root, 'shared-agents.md'), path.join(linked.targetRepoRoot, 'AGENTS.md'));
+
+        const supplied = await prepareManagedAgentWorkspace(linked);
+
+        expect(supplied.seatInstructions).toEqual({state: 'repository-supplied', reason: 'the checkout carries AGENTS.md'});
+        await absent(homeOf(supplied, 'codex'))
+    });
+
+    test('a real composed start returns the instruction decision on the status it hands its caller, with no logger injected', async () => {
+        const
+            started   = [],
+            lifecycle = agent => ({
+                isRunning      : () => false,
+                status         : id => ({id, running: false, state: 'stopped'}),
+                getInstanceRoot: () => instanceRoot,
+                getRegistry    : () => ({getAgent: () => agent, getDefinition: () => agent, resolveCredential: () => 'ghp_fixture_only'}),
+                start          : (id, opts) => { started.push(id); return {id, running: true, state: 'running', cwd: opts.cwd} }
+            }),
+            start = async (agent, repoRoot) => startAgentProvisioned({
+                lifecycleService: lifecycle(agent),
+                agentId         : agent.id,
+                managedRoot     : root,
+                ensureRepo      : async () => ({repoPath: repoRoot}),
+                prepareWorkspace: args => prepareManagedAgentWorkspace({...args, hydrateWorkspace: makeHydrate()}),
+                agentosRuntimeRoot,
+                nodePath        : NODE_PATH
+            }),
+            supplied = {...makeAgent('claude-code', {id: 'composed-a'}), metadata: {repo: {repoSlug: 'neomjs/neo', cloneUrl: 'https://github.com/neomjs/neo.git'}}},
+            outside  = {...makeAgent('claude-code', {id: 'composed-b'}), metadata: {repo: {repoSlug: 'acme/app', cloneUrl: 'https://github.com/acme/app.git'}}},
+            suppliedRoot = path.join(repoRoot, 'composed-a');
+
+        await fs.mkdir(suppliedRoot, {recursive: true});
+        await fs.writeFile(path.join(suppliedRoot, 'CLAUDE.md'), '# The repository\'s own\n');
+
+        expect(await start(supplied, suppliedRoot)).toMatchObject({
+            state           : 'running',
+            seatInstructions: {state: 'repository-supplied', reason: 'the checkout carries CLAUDE.md'}
+        });
+        expect(await start(outside, path.join(repoRoot, 'composed-b'))).toMatchObject({
+            state           : 'running',
+            seatInstructions: {state: 'not-applicable', reason: 'the Skills source declares no repository \'acme/app\''}
+        });
+        expect(started).toEqual(['composed-a', 'composed-b'])
     });
 
     test('Codex Desktop gets AGENTS.md inside its nested Codex home', async () => {
@@ -2059,12 +2195,11 @@ test.describe('prepareManagedAgentWorkspace: the seat\'s instructions in its har
         })
     });
 
-    test('a seat on a repository the Skills source does not declare starts without the file, and the log says why', async () => {
-        const {opts, lines} = withLog(options(onRepo(makeAgent('codex'), 'acme/app')));
-        const result        = await prepareManagedAgentWorkspace(opts);
+    test('a seat on a repository the Skills source does not declare starts without the file, and the result says why', async () => {
+        const result = await prepareManagedAgentWorkspace(options(onRepo(makeAgent('codex'), 'acme/app')));
 
         expect(result.artifacts.map(artifact => artifact.ownedKeys)).not.toContain('seat instructions');
-        await expect(fs.stat(path.join(result.instanceHome, 'AGENTS.md'))).rejects.toMatchObject({code: 'ENOENT'});
-        expect(lines).toContainEqual(expect.stringMatching(/^seat instructions not-applicable:/))
+        await absent(path.join(result.instanceHome, 'AGENTS.md'));
+        expect(result.seatInstructions).toEqual({state: 'not-applicable', reason: 'the Skills source declares no repository \'acme/app\''})
     })
 });

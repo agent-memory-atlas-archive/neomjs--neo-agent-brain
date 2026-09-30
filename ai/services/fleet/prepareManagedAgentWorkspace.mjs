@@ -15,7 +15,7 @@ import {
     createManagedAgentWorkspacePlan
 } from './managedAgentWorkspacePlan.mjs';
 import {OPENCODE_SEAT_SERVERS, WAKE_ENVELOPE_PLANT_FILE_NAME, generateOpenCodeSeatConfig, isUnmodifiedGeneration} from './generateOpenCodeSeatConfig.mjs';
-import {SEAT_INSTRUCTION_STATES, projectSeatInstructions} from './projectSeatInstructions.mjs';
+import {SEAT_INSTRUCTION_STATES, projectSeatInstructions}                                                         from './projectSeatInstructions.mjs';
 
 export {createManagedAgentWorkspacePlan} from './managedAgentWorkspacePlan.mjs';
 
@@ -254,7 +254,8 @@ function bindManagedAgentWorkspacePlan({logicalPlan, agentosRuntimeRoot, nodePat
  * @param {Function} [options.deriveInstanceHome] Per-agent home derivation seam.
  * @param {Object} [options.fileSystem] Promise filesystem seam.
  * @param {Function} [options.log] Hydration logger.
- * @returns {Promise<{agentosRuntimeRoot: String, targetRepoRoot: String, instanceHome: String, mcpMatrix: Object, mcpPlan: Object[], hydration: Object, artifacts: Object[]}>}
+ * @returns {Promise<{agentosRuntimeRoot: String, targetRepoRoot: String, instanceHome: String, mcpMatrix: Object, mcpPlan: Object[], hydration: Object, artifacts: Object[], seatInstructions: Object}>}
+ *     `seatInstructions` is the decision about the seat's instruction file: `{state, reason, ignored?, homeFile?}`.
  * @throws {ManagedWorkspacePreparationError} For invalid plans/bindings, unsafe paths, unsupported
  *     capabilities, divergent content, or effect failures.
  */
@@ -356,7 +357,7 @@ async function applyManagedAgentWorkspacePlanUnchecked({
         fileSystem
     });
 
-    const instructions = await convergeSeatInstructions({
+    const seatInstructions = await convergeSeatInstructions({
         harnessType   : agent.harnessType,
         targetRepoRoot: canonicalTargetRepoRoot,
         instanceHome,
@@ -365,7 +366,7 @@ async function applyManagedAgentWorkspacePlanUnchecked({
         log
     });
 
-    instructions && artifacts.push(instructions);
+    seatInstructions.artifact && artifacts.push(seatInstructions.artifact);
 
     return {
         agentosRuntimeRoot: canonicalAgentosRuntimeRoot,
@@ -381,7 +382,8 @@ async function applyManagedAgentWorkspacePlanUnchecked({
             secretEnv         : [...server.secretEnv]
         })),
         hydration,
-        artifacts
+        artifacts,
+        seatInstructions  : seatInstructions.observation
     }
 }
 
@@ -422,7 +424,8 @@ async function applyManagedAgentWorkspacePlanUnchecked({
  * @param {Object}  [options.runtime=process]     Host runtime facts for child execution mode.
  * @param {Object}  [options.fileSystem]          Promise filesystem seam.
  * @param {Function}[options.log]                 Hydration logger.
- * @returns {Promise<{agentosRuntimeRoot: String, targetRepoRoot: String, instanceHome: String, mcpMatrix: Object, mcpPlan: Object[], hydration: Object, artifacts: Object[]}>}
+ * @returns {Promise<{agentosRuntimeRoot: String, targetRepoRoot: String, instanceHome: String, mcpMatrix: Object, mcpPlan: Object[], hydration: Object, artifacts: Object[], seatInstructions: Object}>}
+ *     `seatInstructions` is the decision about the seat's instruction file: `{state, reason, ignored?, homeFile?}`.
  * @throws {ManagedWorkspacePreparationError} for unsupported adapters or divergent owned content.
  * @see createManagedAgentWorkspacePlan
  * @see applyManagedAgentWorkspacePlan
@@ -744,36 +747,93 @@ function harnessHomeRoot(harnessType, instanceHome) {
  * @summary Converges the seat's maintainer instructions in its harness home (`projectSeatInstructions`
  * decides the file and its text). The file changes with every Skills release, so it is converged against
  * a receipt of Fleet's last write rather than as create-only content; a person's edit still refuses the
- * start. A projection that writes nothing is logged with its reason and adds no artifact.
+ * start. When the seat stops taking the file, Fleet retires the copy it wrote, so stale rules never load
+ * beside the checkout's own. The decision travels in the preparation result as `observation`.
  * @param {Object} options
- * @returns {Promise<Object|null>} The artifact, or `null` when nothing is Fleet's to write
+ * @returns {Promise<{artifact: Object|null, observation: Object}>}
  * @private
  */
 async function convergeSeatInstructions({harnessType, targetRepoRoot, instanceHome, repoSlug, fileSystem, log}) {
     const
-        ownedLabel = 'seat instructions',
-        projection = await projectSeatInstructions({
+        ownedLabel  = 'seat instructions',
+        receiptPath = path.join(instanceHome, '.neo-fleet-seat-instructions.json'),
+        projection  = await projectSeatInstructions({
             harnessType,
             homeRoot: harnessHomeRoot(harnessType, instanceHome),
             repoSlug,
             targetRepoRoot,
             fileSystem
-        });
+        }),
+        observation = {
+            state : projection.state,
+            reason: projection.reason,
+            ...(projection.ignored ? {ignored: projection.ignored} : {})
+        };
 
-    if (projection.state !== SEAT_INSTRUCTION_STATES.PROJECTED) {
-        log(`${ownedLabel} ${projection.state}: ${projection.reason}`);
-        return null
+    if (projection.state === SEAT_INSTRUCTION_STATES.PROJECTED) {
+        return {
+            artifact: await convergeTextArtifact({
+                filePath       : projection.filePath,
+                desiredContent : projection.content,
+                ownedProjection: wholeFileOwnedProjection,
+                ownedLabel,
+                trustedRoot    : instanceHome,
+                fileSystem,
+                receiptPath
+            }),
+            observation
+        }
     }
 
-    return convergeTextArtifact({
-        filePath       : projection.filePath,
-        desiredContent : projection.content,
-        ownedProjection: wholeFileOwnedProjection,
-        ownedLabel,
-        trustedRoot    : instanceHome,
-        fileSystem,
-        receiptPath    : path.join(instanceHome, '.neo-fleet-seat-instructions.json')
-    })
+    log(`${ownedLabel} ${projection.state}: ${projection.reason}`);
+
+    if (!projection.filePath) return {artifact: null, observation};
+
+    const retired = await retireSeatInstructions({filePath: projection.filePath, receiptPath, trustedRoot: instanceHome, fileSystem, ownedLabel});
+
+    return {
+        artifact   : retired.artifact,
+        observation: retired.homeFile ? {...observation, homeFile: retired.homeFile} : observation
+    }
+}
+
+/**
+ * @summary Removes the instructions file Fleet wrote into a seat's home once the seat no longer takes it,
+ * with its receipt. Only a file that still hashes to Fleet's last write is Fleet's to remove. A file with no
+ * receipt was never Fleet's and stays, reported in `homeFile`; a file edited after Fleet wrote it refuses
+ * the start, because its rules would load beside the ones the seat now takes.
+ * @param {Object} options
+ * @returns {Promise<{artifact: Object|null, homeFile?: String}>}
+ * @private
+ */
+async function retireSeatInstructions({filePath, receiptPath, trustedRoot, fileSystem, ownedLabel}) {
+    await assertNoSymlinkSegments({rootPath: trustedRoot, targetPath: filePath, fileSystem, label: ownedLabel});
+
+    let existing;
+
+    try {
+        existing = await fileSystem.readFile(filePath, 'utf8')
+    } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+
+        await removeContentReceipt({receiptPath, trustedRoot, fileSystem});
+        return {artifact: null}
+    }
+
+    const recorded = await readContentReceipt({receiptPath, filePath, trustedRoot, fileSystem});
+
+    if (recorded === null) {
+        return {artifact: null, homeFile: `kept: ${filePath} was not written by Fleet`}
+    }
+
+    if (recorded !== hashContent(existing)) {
+        throw divergentArtifact(filePath, ownedLabel, 'edited after Fleet wrote it, and the seat no longer takes it')
+    }
+
+    await fileSystem.unlink(filePath);
+    await removeContentReceipt({receiptPath, trustedRoot, fileSystem});
+
+    return {artifact: {path: filePath, status: WORKSPACE_ARTIFACT_STATES.UPDATED, ownedKeys: `${ownedLabel} retired`}}
 }
 
 /** @private */
@@ -1903,6 +1963,20 @@ async function writeContentReceipt({receiptPath, filePath, content, trustedRoot,
     if (existing !== receipt) {
         await fileSystem.mkdir(path.dirname(receiptPath), {recursive: true});
         await publishTextAtomically({filePath: receiptPath, content: receipt, fileSystem})
+    }
+}
+
+/**
+ * @summary Removes a content receipt once its file is gone; an absent receipt is already removed.
+ * @private
+ */
+async function removeContentReceipt({receiptPath, trustedRoot, fileSystem}) {
+    await assertNoSymlinkSegments({rootPath: trustedRoot, targetPath: receiptPath, fileSystem, label: 'content receipt'});
+
+    try {
+        await fileSystem.unlink(receiptPath)
+    } catch (error) {
+        if (error?.code !== 'ENOENT') throw error
     }
 }
 
