@@ -223,6 +223,89 @@ The robust local setup is:
 Memory Core's shared layer is identity-tagged by design. Separate identities preserve
 provenance while still letting the team build common graph context.
 
+### Bring an existing agent into a Fleet seat
+
+Most teams do not start from zero: one Claude Code or Codex agent already runs by hand, on
+the harness's default data dir, with months of markdown memory behind it. When the Fleet
+Manager takes that agent over it provisions a *new* seat — a fresh clone at
+`<NEO_FLEET_AGENTS_ROOT>/<id>/<owner>/<repo>` and a fresh harness home at
+`<id>/harness/<type>`, launched with its own `--user-data-dir`. Fleet writes the seat's MCP
+config into that home and hands the identity and the PAT to the process, so the old
+checkout's `.env` retires. Everything the harness keys by *path* stays where it was, and
+the agent would boot with an empty memory index while every file it ever wrote sits
+orphaned under the old path. The move is a copy, done before the first session, proven by
+a diff, and never a move.
+
+What Claude Code keys by the project cwd:
+
+| Surface | Where | In the move? |
+|---|---|---|
+| Markdown memory (the index and its files) | `~/.claude/projects/<slug>/memory/` | Copy |
+| Session transcripts | `~/.claude/projects/<slug>/*.jsonl` | Optional — resume history only; the Memory Core is the archive |
+| Project entry (allowed tools, MCP toggles, trust) | `~/.claude.json` → `projects["<cwd>"]` | Copy the entry onto the new cwd |
+| Permission allowlist | `<checkout>/.claude/settings.local.json` | Copy into the new clone, after Fleet cloned it |
+| App profile (login, sessions, MCP config) | the instance's `--user-data-dir` | No — sign in once; Fleet writes the MCP config |
+
+The slug is the cwd with every character outside `A–Z`, `a–z` and `0–9` replaced by `-`,
+a space included: `/Users/me/agents/ada/neomjs/neo` becomes
+`-Users-me-agents-ada-neomjs-neo`. Claude creates the directory on the first session; if
+the rule ever changes, the directory it creates *is* the slug — copy into it before the
+second session.
+
+Codex keys its project trust by path in `~/.codex/config.toml`; re-key it for the new clone.
+Where Codex keeps per-project memory, and whether it is file-based, is the Codex seat's fact
+to state — this section carries it once a Codex maintainer has read it off a live seat.
+
+The recipe, in order:
+
+1. Register the agent in the Fleet Manager and do **not** start it. Note the seat's clone
+   path; derive the slug from it.
+2. Make sure the agent is not running anywhere — its memory files must not change while
+   you copy.
+3. Copy the memory directory and prove the copy:
+
+   ```bash
+   OLD=~/.claude/projects/<old slug>
+   NEW=~/.claude/projects/<new slug>
+   mkdir -p "$NEW/memory"
+   rsync -a "$OLD/memory/" "$NEW/memory/"
+   diff -rq "$OLD/memory" "$NEW/memory" && echo memory-identical
+   ```
+
+4. Clone the project entry. Back the file up first: every running Claude Code instance
+   rewrites `~/.claude.json` whole, so re-check the entry after the seat's first session.
+
+   ```bash
+   cp ~/.claude.json ~/.claude.json.bak-$(date +%Y%m%d%H%M)
+   jq --arg old "<old cwd>" --arg new "<new cwd>" '.projects[$new] = .projects[$old]' \
+     ~/.claude.json > "$TMPDIR/claude.json" && mv "$TMPDIR/claude.json" ~/.claude.json
+   ```
+
+5. Start the seat in the Fleet Manager and sign in inside its window. Only now copy
+   `.claude/settings.local.json` into the new clone: the clone exists after the first Start,
+   and nothing may be created under the seat folder before it — `git clone` refuses a
+   directory that is not empty.
+6. Open the new clone in the harness and spend one turn on verification: ask the agent for
+   the identity line its memory index loaded and the absolute path of the memory directory
+   it writes to, and have it write one witness file there. The file must appear in the new
+   directory and not in the old one.
+7. Rollback is the old launch. Nothing was moved, so nothing needs restoring.
+8. Retire the old directory only after weeks of clean sessions, by leaving a pointer file in
+   it — never by deleting it.
+
+Two things the recipe does not solve, owned elsewhere: quitting the Fleet Manager currently
+stops the peers it launched, so checkpoint an agent before a permission change or an update
+(the installed shell's
+[macOS permissions section](https://github.com/neomjs/neo-agent-institution/blob/dev/harness/README.md#macos-permissions-when-starting-an-agent)
+says exactly what happens); and a freshly provisioned seat starts without a wake route —
+the agent's existing route keeps delivering to its old instance until the seat registers its
+own.
+
+I am Clio, `@neo-fable-clio`, Claude Fable 5.1. I ran steps 2 to 4 for two seats of our own
+team on the evening this section was written: 890 and 33 memory files, `diff -rq` silent both
+times, nothing launched — their first Fleet start waits on the quit behaviour above. The copy
+is the boring half. The discipline is refusing to move.
+
 ## Isolate Data Roots
 
 For a completely separate local team, do not point your harnesses at upstream Neo's
@@ -327,3 +410,8 @@ identity is an authenticated request contract.
   deltas, not source files to clone or merge.
 - `learn/tree.json` is consumed by the Portal Learn view and the Knowledge Base learning
   source, so public guides must be registered there.
+- `ai/services/fleet/deriveAgentRepoPath.mjs` and `ai/services/fleet/deriveAgentInstanceHome.mjs`
+  derive a seat's clone path and harness home; `ai/services/fleet/deriveHarnessLaunchSpec.mjs`
+  passes the home as each harness family's isolation flag or variable.
+- `ai/services/fleet/FleetLifecycleService.mjs` builds the seat's launch environment — the
+  identity and the credential ride it, which is why a seat needs no `.env` of its own.
