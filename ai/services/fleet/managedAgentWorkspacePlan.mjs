@@ -51,14 +51,10 @@ export const MANAGED_WORKSPACE_MCP_SERVER_DESCRIPTORS = Object.freeze({
         entrypoint: 'ai/mcp/server/neural-link/mcp-server.mjs',
         runtimeEnv: Object.freeze([
             'NEO_AGENT_IDENTITY',
-            'NEO_FLEET_BRIDGE_TOKEN',
-            'NEO_NL_TOOL_PROJECTION_MODE'
+            'NEO_FLEET_BRIDGE_TOKEN'
         ]),
-        requiredRuntimeEnv: Object.freeze([
-            'NEO_AGENT_IDENTITY',
-            'NEO_NL_TOOL_PROJECTION_MODE'
-        ]),
-        secretEnv: Object.freeze(['NEO_FLEET_BRIDGE_TOKEN'])
+        requiredRuntimeEnv: Object.freeze(['NEO_AGENT_IDENTITY']),
+        secretEnv         : Object.freeze(['NEO_FLEET_BRIDGE_TOKEN'])
     }),
     'github-workflow': Object.freeze({
         entrypoint        : 'ai/mcp/server/github-workflow/mcp-server.mjs',

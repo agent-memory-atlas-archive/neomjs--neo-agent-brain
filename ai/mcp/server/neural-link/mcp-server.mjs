@@ -22,7 +22,7 @@ program
     .option('-c, --config <path>', 'Path to the configuration file', sanitizeInput)
     .option('-w, --cwd <path>', 'Working directory for the bridge process')
     .option('-d, --debug', 'Enable debug logging')
-    .option('--tool-projection-mode <mode>', 'Pin this server instance to a forced tool-projection ceiling (e.g. harness-embedded) a client cannot widen past. Falls back to the NEO_NL_TOOL_PROJECTION_MODE env var (the Fleet Manager spawn-injection channel); CLI flag wins. Unset = full developer/operator surface.')
+    .option('--tool-projection-mode <mode>', 'Pin this server instance to a forced tool-projection ceiling (e.g. harness-embedded) a client cannot widen past. Falls back to the NEO_NL_TOOL_PROJECTION_MODE env var; CLI flag wins. Unset = full developer/operator surface.')
     .parse(process.argv);
 
 const options = program.opts();

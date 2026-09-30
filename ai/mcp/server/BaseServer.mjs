@@ -98,8 +98,8 @@ class BaseServer extends Base {
     configFile = null
     /**
      * Server-instance forced tool-projection mode — the security *ceiling* for the tool surface this
-     * instance exposes, set at boot by the spawner (the Fleet Manager when it launches a server for an
-     * embedded agent; neural-link's `--tool-projection-mode harness-embedded` CLI flag). When set,
+     * instance exposes, explicitly selected at server launch (for example, neural-link's
+     * `--tool-projection-mode harness-embedded` CLI flag). When set,
      * {@link buildToolProjectionContext} pins every request to this mode, so a client can NEVER widen
      * its surface by omitting or altering request `_meta` — the projection becomes a server-bound
      * capability, not a client-asserted convention. Default `null` = no ceiling: the full

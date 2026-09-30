@@ -22,6 +22,7 @@ import Neo                          from 'neo.mjs/src/Neo.mjs';
 import * as core                    from 'neo.mjs/src/core/_export.mjs';
 import AiConfig                     from '../../../../ai/config.template.mjs';
 import FleetLifecycleService        from '../../../../ai/services/fleet/FleetLifecycleService.mjs';
+import ToolService                  from '../../../../ai/mcp/ToolService.mjs';
 import {generateOpenCodeSeatConfig} from '../../../../ai/services/fleet/generateOpenCodeSeatConfig.mjs';
 
 let nextPid = 1000;
@@ -187,7 +188,7 @@ test.describe('Neo.ai.services.fleet.FleetLifecycleService', () => {
         expect(process.env.GH_TOKEN).not.toBe(pat);
     });
 
-    test('start mints + injects a Bridge token + forced NL projection into the child env', () => {
+    test('start provisions Bridge authentication without imposing an NL projection', () => {
         const pat   = 'ghp_dual_class';
         const spawn = install({agents: {a: agentDef('a')}, creds: {a: pat}});
         FleetLifecycleService.start('a');
@@ -197,8 +198,7 @@ test.describe('Neo.ai.services.fleet.FleetLifecycleService', () => {
         expect(env.NEO_FLEET_BRIDGE_TOKEN).toBe('bridge_a_token');
         expect(env.NEO_FLEET_BRIDGE_TOKEN).not.toBe(env.GH_TOKEN);
         expect(env.NEO_FLEET_BRIDGE_TOKEN).not.toBe(env.NEO_MCP_REMOTE_TOKEN);
-        // forced NL projection: FM-spawned ⇒ embedded ⇒ harness-embedded, by construction
-        expect(env.NEO_NL_TOOL_PROJECTION_MODE).toBe('harness-embedded');
+        expect(env.NEO_NL_TOOL_PROJECTION_MODE).toBeUndefined();
         // the PAT injection is unaffected
         expect(env.GH_TOKEN).toBe(pat);
         // injected on a COPY of process.env; parent env never mutated to carry the bridge token
@@ -216,11 +216,35 @@ test.describe('Neo.ai.services.fleet.FleetLifecycleService', () => {
         expect(JSON.stringify(FleetLifecycleService.status('a'))).not.toContain(token);
     });
 
-    test('forced NL projection is set by construction for every FM spawn (fail-closed invariant)', () => {
-        // even a tokenless agent (no PAT) gets the forced embedded projection — never the full surface
-        const spawn = install({agents: {a: agentDef('a')}, creds: {}});
+    test('an FM-launched agent can list and call an NL mutation while explicit restrictions still apply', async () => {
+        const spawn = install({agents: {a: agentDef('a')}});
         FleetLifecycleService.start('a');
-        expect(spawn.calls[0].opts.env.NEO_NL_TOOL_PROJECTION_MODE).toBe('harness-embedded');
+
+        const target = {text: 'before'},
+              tools  = Neo.create(ToolService, {
+                  openApiFilePath: path.resolve(import.meta.dirname, '../../../../ai/mcp/server/neural-link/openapi.yaml'),
+                  serviceMapping : {
+                      set_instance_properties: async ({properties}) => Object.assign(target, properties)
+                  }
+              }),
+              options = {toolProjection: spawn.calls[0].opts.env.NEO_NL_TOOL_PROJECTION_MODE};
+
+        try {
+            expect(tools.listTools(options).tools.some(tool => tool.name === 'set_instance_properties')).toBe(true);
+            await tools.callTool('set_instance_properties', {id: 'fixture', properties: {text: 'after'}}, options);
+            expect(target.text).toBe('after');
+
+            for (const mode of ['harness-embedded', 'local-readonly-probe', 'unknown-profile']) {
+                const restricted = {toolProjection: mode};
+                expect(tools.listTools(restricted).tools.some(tool => tool.name === 'set_instance_properties')).toBe(false);
+                await expect(tools.callTool('set_instance_properties', {
+                    id: 'fixture', properties: {text: 'forbidden'}
+                }, restricted)).rejects.toThrow(/not visible/);
+                expect(target.text).toBe('after');
+            }
+        } finally {
+            tools.destroy();
+        }
     });
 
     test('SECURITY: start fails fast when bridgeTokenEnvVar collides with credentialEnvVar (Bridge token would land in the PAT slot)', () => {
@@ -230,9 +254,9 @@ test.describe('Neo.ai.services.fleet.FleetLifecycleService', () => {
         expect(spawn.calls).toHaveLength(0); // guard is fail-fast: never spawned, no secret injected
     });
 
-    test('SECURITY: start fails fast when a key collides with the fixed forced-projection var, or is empty', () => {
+    test('SECURITY: start fails fast when a key collides with the reserved NL-policy var, or is empty', () => {
         install({agents: {a: agentDef('a')}, creds: {a: 'ghp_x'}});
-        FleetLifecycleService.bridgeTokenEnvVar = 'NEO_NL_TOOL_PROJECTION_MODE'; // collides w/ the FIXED forced var
+        FleetLifecycleService.bridgeTokenEnvVar = 'NEO_NL_TOOL_PROJECTION_MODE'; // reserved NL policy slot
         expect(() => FleetLifecycleService.start('a')).toThrow(/env-key contract/);
 
         const spawn = install({agents: {a: agentDef('a')}, creds: {a: 'ghp_x'}}); // fresh install resets the keys

@@ -972,9 +972,8 @@ test.describe('prepareManagedAgentWorkspace', () => {
             agentosRuntimeRoot
         ]);
         expect(nl.env).toEqual({
-            NEO_AGENT_IDENTITY         : '${NEO_AGENT_IDENTITY}',
-            NEO_FLEET_BRIDGE_TOKEN     : '${NEO_FLEET_BRIDGE_TOKEN}',
-            NEO_NL_TOOL_PROJECTION_MODE: '${NEO_NL_TOOL_PROJECTION_MODE}'
+            NEO_AGENT_IDENTITY    : '${NEO_AGENT_IDENTITY}',
+            NEO_FLEET_BRIDGE_TOKEN: '${NEO_FLEET_BRIDGE_TOKEN}'
         });
         expect(raw).not.toContain('secret-token-value');
         await expect(fs.stat(path.join(opts.targetRepoRoot, '.mcp.json'))).rejects.toMatchObject({code: 'ENOENT'});
@@ -999,11 +998,24 @@ test.describe('prepareManagedAgentWorkspace', () => {
             nl         = JSON.parse(raw).mcpServers['neo-mjs-neural-link'];
 
         expect(nl.env).toEqual({
-            NEO_AGENT_IDENTITY         : 'agent-a',
-            NEO_NL_TOOL_PROJECTION_MODE: 'harness-embedded'
+            NEO_AGENT_IDENTITY: 'agent-a'
         });
         expect(raw).not.toContain('NEO_FLEET_BRIDGE_TOKEN');
         expect(raw).not.toContain('secret-token-value');
+    });
+
+    test('Claude Desktop: an existing explicit NL projection is preserved as a divergence', async () => {
+        const opts       = options(makeAgent('claude-desktop')),
+              result     = await prepareManagedAgentWorkspace(opts),
+              configPath = path.join(result.instanceHome, 'claude_desktop_config.json'),
+              config     = JSON.parse(await read(configPath));
+
+        config.mcpServers['neo-mjs-neural-link'].env.NEO_NL_TOOL_PROJECTION_MODE = 'harness-embedded';
+        const existing = JSON.stringify(config, null, 2) + '\n';
+        await fs.writeFile(configPath, existing);
+
+        await expect(prepareManagedAgentWorkspace(opts)).rejects.toMatchObject({code: 'FLEET_WORKSPACE_DIVERGENT'});
+        expect(await read(configPath)).toBe(existing);
     });
 
     test('Claude Desktop: a secret-free matrix materializes the exact contained profile config', async () => {
