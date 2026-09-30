@@ -49,15 +49,17 @@ export function readReport(side, filePath) {
  *
  * A test fails when its final status is `unexpected` or `flaky`: the unit config sets
  * `failOnFlakyTests` in CI, so a pass that needed a retry disqualifies the run there, and it does
- * here. A test with no result never ran: the run ended before reaching it. Printed paths are
- * relative to `repoRoot`, the form the reporter prints and the ledger fingerprints.
+ * here. A test with no result never ran: the run ended before reaching it, and its status says
+ * nothing about it. A failure's message is its first error's, or the value a test threw that was no
+ * error. Printed paths are relative to `repoRoot`, the form the reporter prints and the ledger
+ * fingerprints.
  *
  * @param {Object} report   A Playwright JSON report
  * @param {String} side     `head` or `base`, named in a refusal
  * @param {String} repoRoot The checkout printed paths are relative to
  * @returns {{failures: Map<String, Object>, counts: Object, unrun: Set<String>}} Failures keyed by
  *          test identity, and the identities of the tests that never ran
- * @throws {Error} When the report ran no test
+ * @throws {Error} When the report recorded no test result, whatever tests it lists
  */
 export function summarizeReport(report, side, repoRoot = process.cwd()) {
     const counts   = {expected: 0, unexpected: 0, flaky: 0, skipped: 0},
@@ -65,15 +67,18 @@ export function summarizeReport(report, side, repoRoot = process.cwd()) {
           unrun    = new Set(),
           rootDir  = report?.config?.rootDir ?? repoRoot;
 
+    let recorded = 0;
+
     function visit(suite, titles) {
         for (const spec of suite.specs ?? []) {
             for (const test of spec.tests ?? []) {
                 const titlePath = [...titles, spec.title],
                       project   = test.projectName ?? '',
-                      key       = `${project} › ${spec.file} › ${titlePath.join(' › ')}`;
+                      key       = `${project} › ${spec.file} › ${titlePath.join(' › ')}`,
+                      error     = test.results?.find(result => result.error)?.error;
 
                 counts[test.status] = (counts[test.status] ?? 0) + 1;
-                test.results?.length || unrun.add(key);
+                test.results?.length ? recorded++ : unrun.add(key);
 
                 if (test.status === 'unexpected' || test.status === 'flaky') {
                     failures.set(key, {
@@ -82,7 +87,7 @@ export function summarizeReport(report, side, repoRoot = process.cwd()) {
                         line   : spec.line,
                         column : spec.column,
                         titlePath,
-                        message: clean(test.results?.find(result => result.error)?.error?.message)
+                        message: clean(error?.message ?? error?.value)
                     })
                 }
             }
@@ -100,8 +105,8 @@ export function summarizeReport(report, side, repoRoot = process.cwd()) {
         failures.set(`global › ${first}`, {global: true, message: first})
     }
 
-    if (!Object.values(counts).some(Boolean)) {
-        throw new Error(`the ${side} report ran no test`)
+    if (!recorded) {
+        throw new Error(`the ${side} report recorded no test result`)
     }
 
     return {failures, counts, unrun}
@@ -136,6 +141,10 @@ export function diffFailures(head, base) {
  * @summary Prints failures in the reporter's failure grammar: a numbered block per test with its
  * error, then the `N failed` epilogue naming each test once. A top-level error has no location, so
  * it is printed as a plain line before the blocks and stays out of the epilogue.
+ *
+ * The ledger keys a note on the first `Error:` line of a block, so each block opens with one: a
+ * typed error, a timeout or a thrown value is prefixed, and a failure the report records no error
+ * for says so. No introduced test is dropped for want of a symptom.
  * @param {Object[]} failures Values of {@link summarizeReport}'s map
  * @returns {String}
  */
@@ -145,9 +154,15 @@ export function formatFailureLog(failures) {
           header  = failure => `[${failure.project}] › ${failure.file}:${failure.line}:${failure.column} › ${failure.titlePath.join(' › ')}`;
 
     located.forEach((failure, index) => {
+        const message = failure.message.split('\n'),
+              first   = message.findIndex(line => line.trim()),
+              error   = first < 0
+                  ? ['Error: the report records no error for this test']
+                  : [/^\s*Error: /.test(message[first]) ? message[first] : `Error: ${message[first].trim()}`, ...message.slice(first + 1)];
+
         lines.push('', `  ${index + 1}) ${header(failure)}`, '');
 
-        for (const line of failure.message.split('\n').slice(0, MESSAGE_LINES)) {
+        for (const line of error.slice(0, MESSAGE_LINES)) {
             lines.push(`    ${line}`.trimEnd())
         }
     });
@@ -197,7 +212,8 @@ export function formatSummary({head, base, diff}) {
  * appends the summary to `GITHUB_STEP_SUMMARY` when the runner provides one.
  * @param {String[]} argv
  * @param {Object}   env
- * @returns {Number} 1 on an introduced failure, an unreadable side or a head run cut short, else 0
+ * @returns {Number} 1 on an introduced failure, an unreadable side, a side that recorded no result or
+ *          a head run cut short, else 0
  */
 export function main(argv = process.argv.slice(2), env = process.env) {
     try {
