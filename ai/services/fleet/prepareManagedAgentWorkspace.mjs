@@ -1409,8 +1409,9 @@ function codexHomeOwnedProjection(source) {
 
 /**
  * @summary Add the narrow Codex project-trust row only while remote MCP is selected, then remove
- * exactly Fleet's marked block on opt-out. A resident-authored trust row is preserved; an explicit
- * non-trusted row rejects remote admission. This keeps the no-intent home artifact byte-identical
+ * exactly Fleet's marked block on opt-out. Re-entry reads semantic trust, preserving native settings
+ * inserted inside Fleet's comments; mixed blocks cannot be removed on opt-out. A non-trusted row
+ * rejects remote admission. This keeps the no-intent home artifact byte-identical
  * to the stdio baseline while making the generated project MCP config consumable at runtime.
  * @param {Object} options
  * @returns {Promise<Boolean>} whether Fleet changed the home artifact.
@@ -1428,12 +1429,15 @@ async function convergeCodexRemoteTrust({filePath, repoPath, remote, trustedRoot
         source        = await fileSystem.readFile(filePath, 'utf8'),
         expectedBlock = renderCodexRemoteTrustBlock(repoPath),
         begin         = source.indexOf(CODEX_REMOTE_TRUST_BEGIN),
-        endMarker     = begin < 0 ? -1 : source.indexOf(CODEX_REMOTE_TRUST_END, begin),
-        secondBegin   = begin < 0 ? -1 : source.indexOf(CODEX_REMOTE_TRUST_BEGIN, begin + 1);
+        endMarker     = source.indexOf(CODEX_REMOTE_TRUST_END),
+        secondBegin   = begin < 0 ? -1 : source.indexOf(CODEX_REMOTE_TRUST_BEGIN, begin + 1),
+        secondEnd     = endMarker < 0 ? -1 : source.indexOf(CODEX_REMOTE_TRUST_END, endMarker + 1);
 
-    if ((begin < 0) !== (endMarker < 0) || secondBegin >= 0) {
+    if ((begin < 0) !== (endMarker < 0) || secondBegin >= 0 || secondEnd >= 0 || endMarker < begin) {
         throw transportDivergence(filePath, 'projects.<managed-repo>.trust_level', 'malformed Fleet trust marker')
     }
+
+    const existingTrust = remote ? readCodexProjectTrust(source, repoPath, filePath) : undefined;
 
     if (begin >= 0) {
         const
@@ -1441,7 +1445,7 @@ async function convergeCodexRemoteTrust({filePath, repoPath, remote, trustedRoot
             block = source.slice(begin, end);
 
         if (remote) {
-            if (block !== expectedBlock) {
+            if (existingTrust !== 'trusted') {
                 throw transportDivergence(filePath, 'projects.<managed-repo>.trust_level', 'Fleet trust block diverged')
             }
             return false
@@ -1467,9 +1471,7 @@ async function convergeCodexRemoteTrust({filePath, repoPath, remote, trustedRoot
 
     if (!remote) return false;
 
-    const existingTrust = readCodexProjectTrust(source, repoPath);
-
-    if (existingTrust === '"trusted"') return false;
+    if (existingTrust === 'trusted') return false;
     if (existingTrust !== undefined) {
         throw transportDivergence(filePath, 'projects.<managed-repo>.trust_level', 'resident trust row is not trusted')
     }
@@ -1497,27 +1499,12 @@ function renderCodexRemoteTrustBlock(repoPath) {
     ].join('\n')
 }
 
-/** @private */
-function readCodexProjectTrust(source, repoPath) {
-    const wanted = `projects.${JSON.stringify(repoPath)}.trust_level`;
-    let   table  = '';
-
-    for (const rawLine of source.split(/\r?\n/)) {
-        const header = parseTomlTableHeader(rawLine);
-
-        if (header) {
-            table = header.array ? '' : header.body;
-            continue
-        }
-
-        const line = rawLine.replace(/\s+#.*$/, '').trim();
-        if (!line) continue;
-
-        const entry = line.match(/^([A-Za-z0-9_-]+)\s*=\s*(.+)$/);
-        if (!entry) continue;
-
-        const key = table ? `${table}.${entry[1]}` : entry[1];
-        if (key === wanted) return entry[2].trim()
+/** @summary Read native TOML trust without exposing resident source in parser diagnostics. @private */
+function readCodexProjectTrust(source, repoPath, filePath) {
+    try {
+        return parseToml(source).projects?.[repoPath]?.trust_level
+    } catch {
+        throw transportDivergence(filePath, 'projects.<managed-repo>.trust_level', 'invalid Codex home TOML')
     }
 }
 
