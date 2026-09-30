@@ -1,5 +1,6 @@
 import {test, expect} from '@playwright/test';
-import fs             from 'node:fs';
+import nodeFs         from 'node:fs';
+import {createRequire} from 'node:module';
 import os             from 'node:os';
 import path           from 'node:path';
 import {
@@ -8,6 +9,8 @@ import {
     inspectCodexDesktopCrashpadProcesses,
     probeCodexDesktopCapabilities
 } from '../../../../../../ai/services/fleet/manageCodexDesktopRuntime.mjs';
+
+const fs = process.versions.electron ? createRequire(import.meta.url)('original-fs') : nodeFs;
 
 const REQUIRED_ASAR_MARKERS = [
     'CODEX_ELECTRON_USER_DATA_PATH',
@@ -18,6 +21,24 @@ const REQUIRED_ASAR_MARKERS = [
     'enableUpdater'
 ].join('\n');
 
+/** @summary Encode one packed file using ASAR's two Pickle headers and aligned JSON payload. */
+function makeArchive(content) {
+    const
+        data       = Buffer.from(content),
+        json       = Buffer.from(JSON.stringify({files: {'main.js': {size: data.length, offset: '0'}}})),
+        header     = Buffer.alloc(8 + Math.ceil(json.length / 4) * 4),
+        headerSize = Buffer.alloc(8);
+
+    header.writeUInt32LE(header.length - 4, 0);
+    header.writeUInt32LE(json.length, 4);
+    json.copy(header, 8);
+    headerSize.writeUInt32LE(4, 0);
+    headerSize.writeUInt32LE(header.length, 4);
+
+    return Buffer.concat([headerSize, header, data]);
+}
+
+/** @summary Create a physical app bundle whose ASAR is also readable by Electron's virtual fs. */
 function makeBundle({asar = REQUIRED_ASAR_MARKERS, framework = 'user-data-dir'} = {}) {
     const
         appBundle     = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-desktop-probe-')),
@@ -33,11 +54,11 @@ function makeBundle({asar = REQUIRED_ASAR_MARKERS, framework = 'user-data-dir'} 
     }
 
     fs.writeFileSync(main, '#!/bin/sh\n', {mode: 0o755});
-    fs.writeFileSync(appAsar, asar);
+    fs.writeFileSync(appAsar, makeArchive(asar));
     fs.writeFileSync(frameworkPath, framework);
     fs.writeFileSync(crashpad, '#!/bin/sh\n', {mode: 0o755});
 
-    return {appBundle, main, crashpad};
+    return {appBundle, appAsar, main, crashpad};
 }
 
 test.describe('manageCodexDesktopRuntime', () => {
@@ -48,8 +69,12 @@ test.describe('manageCodexDesktopRuntime', () => {
     });
 
     test('capability probe proves the packaged profile/project/updater tuple without a version allowlist', () => {
-        const fixture = makeBundle();
+        const fixture = makeBundle(), noAsar = process.noAsar;
         roots.push(fixture.appBundle);
+
+        if (process.versions.electron) {
+            expect(nodeFs.readFileSync(path.join(fixture.appAsar, 'main.js'), 'utf8')).toBe(REQUIRED_ASAR_MARKERS);
+        }
 
         expect(probeCodexDesktopCapabilities({binaryPath: fixture.main})).toEqual({
             available         : true,
@@ -58,6 +83,9 @@ test.describe('manageCodexDesktopRuntime', () => {
             crashpadExecutable: fs.realpathSync(fixture.crashpad),
             appBundle         : fs.realpathSync(fixture.appBundle)
         });
+
+        expect(process.noAsar).toBe(noAsar);
+        expect(nodeFs.statSync(fixture.appAsar).isDirectory()).toBe(Boolean(process.versions.electron));
     });
 
     test('capability probe fails closed when updater env presence lacks the falsifiable false predicate', () => {
@@ -105,6 +133,18 @@ test.describe('manageCodexDesktopRuntime', () => {
             available: false,
             reason   : 'binary-is-not-an-app-bundle-main'
         });
+    });
+
+    test('capability probe retains filesystem injection and refuses missing resources or non-executable mains', () => {
+        const fixture = makeBundle();
+        roots.push(fixture.appBundle);
+
+        expect(probeCodexDesktopCapabilities({binaryPath: fixture.main, fsImpl: fs}).available).toBe(true);
+        fs.unlinkSync(fixture.appAsar);
+        expect(probeCodexDesktopCapabilities({binaryPath: fixture.main}).reason).toBe('required-app-bundle-resource-unavailable');
+
+        fs.chmodSync(fixture.main, 0o644);
+        expect(probeCodexDesktopCapabilities({binaryPath: fixture.main}).reason).toBe('packaged-main-unavailable');
     });
 
     test('classifier owns only exact executable + contained database and leaves foreign profiles untouched', () => {

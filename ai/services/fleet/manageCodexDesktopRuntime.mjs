@@ -1,8 +1,11 @@
 import {execFileSync} from 'node:child_process';
 import fs             from 'node:fs';
+import {createRequire} from 'node:module';
 import path           from 'node:path';
 
 const
+    // Electron virtualizes ASAR paths; bundle inspection needs their physical bytes.
+    bundleFs = process.versions.electron ? createRequire(import.meta.url)('original-fs') : fs,
     ASAR_MARKERS = Object.freeze([
         'CODEX_ELECTRON_USER_DATA_PATH',
         '--open-project',
@@ -36,11 +39,11 @@ const
  *
  * @param {Object} options
  * @param {String} options.binaryPath Config-resolved packaged main binary.
- * @param {Object} [options.fsImpl] Injectable fs seam; defaults to `node:fs`.
+ * @param {Object} [options.fsImpl] Physical fs reader; defaults to Electron's `original-fs` or Node fs.
  * @returns {{available: Boolean, reason: String|null, binaryPath: String|null,
  *            crashpadExecutable: String|null, appBundle: String|null}}
  */
-export function probeCodexDesktopCapabilities({binaryPath, fsImpl = fs} = {}) {
+export function probeCodexDesktopCapabilities({binaryPath, fsImpl = bundleFs} = {}) {
     if (typeof binaryPath !== 'string' || !path.isAbsolute(binaryPath)) {
         return unavailable('binary-path-must-be-absolute');
     }
