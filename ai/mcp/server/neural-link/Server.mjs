@@ -13,10 +13,9 @@ export const getCurrentTurnId = () => _turnId;
 /**
  * @summary Resolves the server-instance forced tool-projection mode from its launch sources, in
  * precedence order: the explicit `--tool-projection-mode` CLI flag wins; else the
- * `NEO_NL_TOOL_PROJECTION_MODE` env var (the channel the Fleet Manager spawner injects for embedded
- * agents — a fixed cross-process contract name, not a configurable field on either side); else `null`
- * (unforced → the full developer/operator
- * surface, the trusted dev/operator launch). The single testable authority for this resolution.
+ * `NEO_NL_TOOL_PROJECTION_MODE` env var (an explicit server-launch ceiling); else `null`
+ * (unforced → the full developer/operator surface). Fleet-managed launches leave this unset.
+ * The single testable authority for this resolution.
  * @param {String|null} [cliMode] The `--tool-projection-mode` value (null/undefined when the flag is absent).
  * @param {Object} [env=process.env] Env source (injectable for tests).
  * @returns {String|null}
@@ -97,8 +96,8 @@ class Server extends BaseServer {
      * @summary Resolves the Neural Link harness projection context for ListTools / CallTool.
      *
      * **Server-instance forced mode is the ceiling.** When this instance was launched with a forced
-     * {@link toolProjectionMode} (the spawner / Fleet Manager pinning an embedded-agent server via
-     * `--tool-projection-mode`), every request is pinned to it and the client `_meta` is ignored — a
+     * {@link toolProjectionMode} (explicitly selected via `--tool-projection-mode` or its environment
+     * variable), every request is pinned to it and the client `_meta` is ignored — a
      * client can NEVER widen its surface by omitting or altering `_meta`. Capability binds to what the
      * server instance *is*, not to what the client *claims*.
      *
