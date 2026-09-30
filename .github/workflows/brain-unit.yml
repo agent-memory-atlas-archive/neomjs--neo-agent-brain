@@ -159,6 +159,7 @@ jobs:
                   test/playwright/unit/ai/services/memory-core/helpers/prLaneActivityStore.spec.mjs
                   test/playwright/unit/ai/FleetLifecycleService.spec.mjs
                   test/playwright/unit/ai/services/fleet/prepareManagedAgentWorkspace.spec.mjs
+                  test/playwright/unit/ai/services/fleet/projectSeatInstructions.spec.mjs
                   test/playwright/unit/ai/scripts/diagnostics/captureParityLatencyPair.spec.mjs
                   test/playwright/unit/ai/deriveAgentRepoPath.spec.mjs
                   test/playwright/unit/ai/services/fleet/deriveAgentInstanceHome.spec.mjs
