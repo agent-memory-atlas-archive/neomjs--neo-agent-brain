@@ -29,7 +29,10 @@ function report(rows, {errors = [], rootDir = `${ROOT}/test/playwright/unit`} = 
         suite.specs.push({title, file, line, column, tests: [{
             projectName: project,
             status,
-            results    : status === 'unexpected' ? [{status: 'failed', error: {message}}] : [{status: 'passed'}]
+            results    : {
+                flaky     : [{status: 'failed', error: {message}}, {status: 'passed'}],
+                unexpected: [{status: 'failed', error: {message}}]
+            }[status] ?? [{status: 'passed'}]
         }]})
     }
 
@@ -78,8 +81,11 @@ test.describe('compareUnitFailures', () => {
         })
     });
 
-    test('a test that passed on a retry is not a failure', () => {
-        expect(diff([{title: 'retried', status: 'flaky'}], [pass('retried')]).introduced).toEqual([])
+    test('a test that passed only on a retry fails, as the unit config\'s failOnFlakyTests does in CI', () => {
+        const flaky = {title: 'retried', status: 'flaky'};
+
+        expect(diff([flaky], [pass('retried')]).introduced).toEqual(['unit-brain › ai/a.spec.mjs › retried']);
+        expect(diff([flaky], [flaky]).preexisting).toEqual(['unit-brain › ai/a.spec.mjs › retried'])
     });
 
     test('a top-level error is diffed by its first line', () => {

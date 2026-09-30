@@ -62,9 +62,13 @@ jobs:
               # postinstall inside every consumer's install.
               run: npm run prepare
 
+            # The suite takes about five minutes here. A test that blocks its worker for good cannot
+            # time itself out, so the run is bounded as a whole: at the limit Playwright still writes
+            # the report, names what it interrupted, and records the timeout as a top-level error the
+            # comparison diffs like any failure.
             - name: Run the unit config
               continue-on-error: true
-              run: npm run test-unit
+              run: npm run test-unit -- --global-timeout=900000
 
             - name: Keep the report
               if: ${{ !cancelled() }}

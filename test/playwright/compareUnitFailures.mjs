@@ -47,8 +47,9 @@ export function readReport(side, filePath) {
 /**
  * @summary Folds one report into its failing tests and its outcome counts.
  *
- * A test fails when its final status is `unexpected`; a `flaky` test passed on a retry and is not a
- * failure. Printed paths are relative to `repoRoot`, the form the reporter prints and the ledger
+ * A test fails when its final status is `unexpected` or `flaky`: the unit config sets
+ * `failOnFlakyTests` in CI, so a pass that needed a retry disqualifies the run there, and it does
+ * here. Printed paths are relative to `repoRoot`, the form the reporter prints and the ledger
  * fingerprints.
  *
  * @param {Object} report   A Playwright JSON report
@@ -67,7 +68,7 @@ export function summarizeReport(report, side, repoRoot = process.cwd()) {
             for (const test of spec.tests ?? []) {
                 counts[test.status] = (counts[test.status] ?? 0) + 1;
 
-                if (test.status === 'unexpected') {
+                if (test.status === 'unexpected' || test.status === 'flaky') {
                     const titlePath = [...titles, spec.title],
                           project   = test.projectName ?? '';
 
