@@ -960,6 +960,28 @@ test.describe('Neo.ai.services.fleet.FleetLifecycleService — curated launch + 
         }
     });
 
+    test('SECURITY: codex-desktop never inherits the packaged parent Node execution mode', () => {
+        const previous = process.env.ELECTRON_RUN_AS_NODE;
+        const spawn    = install({agents: {desktop: curatedAgent('desktop', 'codex-desktop')}, creds: {}});
+
+        FleetLifecycleService.instanceRoot       = '/srv/fleet/instances';
+        FleetLifecycleService.harnessBinaryPaths = {'codex-desktop': process.execPath, codex: process.execPath};
+        FleetLifecycleService.codexDesktopCapabilityProbeFn = () => ({
+            available         : true,
+            crashpadExecutable: '/app/browser_crashpad_handler'
+        });
+        process.env.ELECTRON_RUN_AS_NODE = '1';
+
+        try {
+            FleetLifecycleService.start('desktop', {cwd: '/srv/checkouts/desktop'});
+            expect(spawn.calls).toHaveLength(1);
+            expect(spawn.calls[0].opts.env.ELECTRON_RUN_AS_NODE).toBeUndefined();
+        } finally {
+            if (previous === undefined) delete process.env.ELECTRON_RUN_AS_NODE;
+            else process.env.ELECTRON_RUN_AS_NODE = previous;
+        }
+    });
+
     test('SECURITY: a launch env naming a reserved slot is rejected fail-fast, before any secret is minted', () => {
         install({agents: {a: agentDef('a', {metadata: {launch: {command: 'x', args: [], env: {NEO_AGENT_IDENTITY: 'spoofed'}}}})}, creds: {}});
         expect(() => FleetLifecycleService.start('a')).toThrow(/collides with a reserved env slot/);

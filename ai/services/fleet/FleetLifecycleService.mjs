@@ -2,6 +2,7 @@ import {execFile, execFileSync, spawn}                              from 'child_
 import fs                                                           from 'fs';
 import path                                                         from 'path';
 import {fileURLToPath}                                              from 'url';
+import {isDeepStrictEqual}                                          from 'node:util';
 import AiConfig                                                     from '../../config.mjs';
 import {generateLocalBearerToken}                                   from '../../mcp/server/shared/helpers/localBearer.mjs';
 import Base                                                         from 'neo.mjs/src/core/Base.mjs';
@@ -9,7 +10,7 @@ import {MCP_SERVERS}                                                from '../../
 import {REMOTE_MCP_CREDENTIAL_ENV_VAR}                              from './mcpServers.mjs';
 import {deriveAgentInstanceHome}                                    from './deriveAgentInstanceHome.mjs';
 import {deriveHarnessLaunchSpec}                                    from './deriveHarnessLaunchSpec.mjs';
-import {deriveNodeRuntimeEnv}                                       from './deriveNodeRuntimeEnv.mjs';
+import {deriveNodeRuntimeEnv, NODE_RUNTIME_ENV}                     from './deriveNodeRuntimeEnv.mjs';
 import FleetRegistryService                                         from './FleetRegistryService.mjs';
 import {cleanupCodexDesktopCrashpad, probeCodexDesktopCapabilities} from './manageCodexDesktopRuntime.mjs';
 
@@ -1468,9 +1469,7 @@ class FleetLifecycleService extends Base {
                 !planRow.args.every(value => typeof value === 'string') ||
                 !Array.isArray(planRow.runtimeEnv) ||
                 !planRow.runtimeEnv.every(value => /^[A-Z][A-Z0-9_]*$/.test(value)) ||
-                (planRow.environment &&
-                    (Object.keys(planRow.environment).join(',') !== 'ELECTRON_RUN_AS_NODE' ||
-                        planRow.environment.ELECTRON_RUN_AS_NODE !== '1'))) {
+                (planRow.environment && !isDeepStrictEqual(planRow.environment, NODE_RUNTIME_ENV))) {
                 throw new Error(`FleetLifecycleService.inspectPreparedRemoteMcpAdapter: prepared plan did not preserve the exact generated descriptor for '${name}'.`)
             }
 
@@ -1494,9 +1493,7 @@ class FleetLifecycleService extends Base {
             } else if (transport.type !== 'stdio' ||
                 planRow.target !== 'resident' ||
                 planRow.transport !== 'stdio' ||
-                (planRow.environment &&
-                    (Object.keys(transport.env || {}).join(',') !== 'ELECTRON_RUN_AS_NODE' ||
-                        transport.env.ELECTRON_RUN_AS_NODE !== '1'))) {
+                (planRow.environment && !isDeepStrictEqual(transport.env, NODE_RUNTIME_ENV))) {
                 throw new Error(`FleetLifecycleService.inspectPreparedRemoteMcpAdapter: installed '${harnessType}' did not preserve '${name}' local stdio execution contract.`)
             }
         }

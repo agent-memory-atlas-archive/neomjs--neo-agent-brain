@@ -1194,7 +1194,8 @@ function renderCodexMcpTable(server) {
         `[mcp_servers.\"${server.name}\"]`,
         `command = ${JSON.stringify(server.command)}`,
         `args = ${JSON.stringify(server.args)}`,
-        ...(server.environment ? ['env = { ELECTRON_RUN_AS_NODE = "1" }'] : []),
+        ...(server.environment ? [`env = { ${Object.entries(server.environment)
+            .map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join(', ')} }`] : []),
         `env_vars = ${JSON.stringify(server.runtimeEnv)}`,
         'startup_timeout_sec = 30',
         'tool_timeout_sec = 120',

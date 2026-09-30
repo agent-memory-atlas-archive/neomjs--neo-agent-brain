@@ -23,10 +23,12 @@ import net                               from 'node:net';
 import os                                from 'node:os';
 import path                              from 'node:path';
 import {performance}                     from 'node:perf_hooks';
+import {isDeepStrictEqual}               from 'node:util';
 import {Client}                          from '@modelcontextprotocol/sdk/client/index.js';
 import {StdioClientTransport}            from '@modelcontextprotocol/sdk/client/stdio.js';
 import {StreamableHTTPClientTransport}   from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {assertServedPlane, readToolJson} from './mcpHealthcheck.mjs';
+import {NODE_RUNTIME_ENV}                from '../../services/fleet/deriveNodeRuntimeEnv.mjs';
 import {
     MIN_SAMPLES,
     PARITY_BOOT_EVENT,
@@ -201,7 +203,7 @@ function validateCapturePlan(capturePlan) {
             server.name !== `neo-mjs-${key}` ||
             server.enabled !== true ||
             !hasExactKeys(server.stdio, ['command', 'args', 'envVars', ...(environment ? ['environment'] : [])]) ||
-            (environment && (!hasExactKeys(environment, ['ELECTRON_RUN_AS_NODE']) || environment.ELECTRON_RUN_AS_NODE !== '1')) ||
+            (environment && !isDeepStrictEqual(environment, NODE_RUNTIME_ENV)) ||
             !path.isAbsolute(server.stdio.command || '') ||
             !Array.isArray(server.stdio.args) ||
             server.stdio.args.length === 0 ||
