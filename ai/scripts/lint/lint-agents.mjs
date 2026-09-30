@@ -39,7 +39,6 @@ const ROOT_DIR   = path.resolve(__dirname, '../../..');
  */
 const TOP_LEVEL_MAP_FILES = new Set([
     'AGENTS.md',
-    'AGENTS_STARTUP.md',
     '.agents/ANTIGRAVITY_RULES.md'
 ]);
 
@@ -213,7 +212,7 @@ function isExempt(text) {
 
 /**
  * Returns true when the file path falls within the lint scope. Covers turn-loaded Map
- * substrate (AGENTS.md / AGENTS_STARTUP.md / ANTIGRAVITY_RULES.md), skill substrate
+ * substrate (AGENTS.md / ANTIGRAVITY_RULES.md), skill substrate
  * (.agents/skills/**\/*.md), and Agent OS substrate (learn/agentos/**\/*.md).
  * Manifests, JSON, and other non-markdown substrate are out of scope.
  * @param {string} filePath
@@ -310,7 +309,7 @@ function main() {
         console.log('  --base <ref>   Git ref to diff HEAD against (default: origin/dev)');
         console.log('');
         console.log('Flags NEW <a id> / <a name> HTML anchor-tag insertions in:');
-        console.log('  - AGENTS.md / AGENTS_STARTUP.md / .agents/ANTIGRAVITY_RULES.md  (Map substrate)');
+        console.log('  - AGENTS.md / .agents/ANTIGRAVITY_RULES.md                      (Map substrate)');
         console.log('  - .agents/skills/**/*.md                                          (skill substrate)');
         console.log('  - learn/agentos/**/*.md                                           (Agent OS substrate)');
         console.log('');

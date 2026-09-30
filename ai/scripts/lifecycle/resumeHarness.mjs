@@ -4,8 +4,8 @@
  *
  * This script implements the fresh-session-spawn primitive: a sunsetted transcript
  * is terminal, so recovery preserves swarm coordination by opening a new chat session
- * in the target harness and pasting a boot-grounding prompt that starts from
- * AGENTS_STARTUP.md.
+ * in the target harness and pasting a boot-grounding prompt that starts from the
+ * context-recovery skill.
  *
  * @see ai/scripts/lifecycle/checkSunsetted.mjs (caller; supplies originSessionId)
  * @see ai/daemons/SwarmHeartbeatService.mjs
@@ -290,8 +290,9 @@ export async function resolveResumeHarnessInstancePid({
 /**
  * @summary Builds the fresh-session boot prompt used by resume recovery.
  *
- * Instructs the fresh agent to read AGENTS_STARTUP.md, persist a meaningful
- * non-empty boot heartbeat, and pick up prior context via Memory Core + sandman_handoff.
+ * Instructs the fresh agent to recover through the context-recovery skill, persist a
+ * meaningful non-empty boot heartbeat, and pick up prior context via Memory Core + sandman_handoff.
+ * The per-turn instructions load through the harness itself, so the prompt names no file.
  * @param {string} identity        Agent identity (e.g. '@neo-opus-ada').
  * @param {string} reason          Human-readable sunset cause from checkSunsetted.
  * @param {string} originSessionId Memory Core session ID of the just-sunsetted run; falsy → omitted gracefully.
@@ -302,7 +303,7 @@ function buildBootGroundingPrompt(identity, reason, originSessionId) {
         ? `Origin Session ID: ${originSessionId}.`
         : 'Origin Session ID unavailable in recovery payload — pull most recent SUNSET-tagged memory for this identity instead.';
     return [
-        `hi ${identity}, please read @AGENTS_STARTUP.md, then call add_memory once as a boot heartbeat with explicit non-empty prompt/thought/response fields (for example: prompt="Boot heartbeat for ${identity}", thought="Fresh recovery boot after AGENTS_STARTUP.md read; Memory Core write-path health check.", response="Boot heartbeat saved; continuing recovery."), then proceed normally.`,
+        `hi ${identity}, please use the context-recovery skill, then call add_memory once as a boot heartbeat with explicit non-empty prompt/thought/response fields (for example: prompt="Boot heartbeat for ${identity}", thought="Fresh recovery boot; Memory Core write-path health check.", response="Boot heartbeat saved; continuing recovery."), then proceed normally.`,
         `Recovery context: ${reason}.`,
         `${sessionAnchor} Read the latest Memory Core Sandman handoff and your session context to resume swarm coordination from the prior session anchor.`
     ].join(' ');
@@ -368,8 +369,8 @@ export async function resumeHarness(identity, reason, originSessionId, abandoned
         // File doesn't exist or other error, proceed
     }
 
-    // Boot-grounding prompt for a fresh transcript. The fresh agent starts from
-    // AGENTS_STARTUP.md and re-anchors prior context via Memory Core + sandman_handoff.
+    // Boot-grounding prompt for a fresh transcript. The fresh agent starts from the
+    // context-recovery skill and re-anchors prior context via Memory Core + sandman_handoff.
     const payload = buildBootGroundingPrompt(identity, reason, originSessionId);
 
     // Harness routing derives identity IDs from `identityRoots.mjs` via `harnessRouting.mjs`.
@@ -493,7 +494,7 @@ export async function resumeHarness(identity, reason, originSessionId, abandoned
             //   3. Cmd+`freshSessionShortcut` — spawn a NEW chat session (Cmd+N for Antigravity + Claude Desktop).
             //      This creates a new chat instead of writing into the sunsetted one.
             //   4. Save clipboard / cut input — focus-steal protection
-            //   5. Paste boot-grounding prompt (now refers to AGENTS_STARTUP.md, not "resuming sunsetted session")
+            //   5. Paste the boot-grounding prompt
             //   6. Press Enter (Key Code 36) — established in bridge-daemon.mjs
             //   7. Restore user input + clipboard
             const osascriptArgs = [

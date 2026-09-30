@@ -83,7 +83,6 @@ export const PATH_RULES = [
     {prefix: '.gitignore',                      subsystem: 'ci-test-infra'},
     {prefix: '.neo-ai-data/concepts/',          subsystem: 'dream-nightshift'},
     {prefix: 'AGENTS.md',                       subsystem: 'skill-machinery'},
-    {prefix: 'AGENTS_STARTUP.md',               subsystem: 'skill-machinery'},
     {prefix: 'README.md',                       subsystem: 'docs-internal'},
     {prefix: 'ROADMAP.md',                      subsystem: 'docs-internal'},
     {prefix: 'package.json',                    subsystem: 'ci-test-infra'},

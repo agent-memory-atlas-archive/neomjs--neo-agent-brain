@@ -156,8 +156,6 @@ test.describe('ai/scripts/migrations/renameAgentIdentities', () => {
             'ai',
             '.github',
             'README.md',
-            'AGENTS.md',
-            'AGENTS_STARTUP.md',
             'learn',
             'test/playwright/unit/ai/mcp/server/shared/services/RequestContextService.spec.mjs',
             'test/playwright/unit/ai/scripts/lifecycle/resumeHarness.spec.mjs',

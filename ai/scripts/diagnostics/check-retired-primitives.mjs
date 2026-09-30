@@ -48,7 +48,6 @@ const ACTIVE_ANTIGRAVITY_ROOTS = [
     '.github/AI_QUICK_START.md',
     '.gitignore',
     '.npmignore',
-    'AGENTS_STARTUP.md',
     'ai/mcp/server/shared/services/StdioIdentityResolver.mjs',
     'learn/agentos/tooling/'
 ];
