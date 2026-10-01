@@ -13,13 +13,13 @@ setup({
     }
 });
 
-import {test, expect}         from '@playwright/test';
-import Neo                    from 'neo.mjs/src/Neo.mjs';
-import * as core              from 'neo.mjs/src/core/_export.mjs';
-import {execFileSync}         from 'node:child_process';
-import fs                     from 'node:fs';
-import os                     from 'node:os';
-import path                   from 'node:path';
+import {test, expect}          from '@playwright/test';
+import Neo                     from 'neo.mjs/src/Neo.mjs';
+import * as core               from 'neo.mjs/src/core/_export.mjs';
+import {execFileSync}          from 'node:child_process';
+import fs                      from 'node:fs';
+import os                      from 'node:os';
+import path                    from 'node:path';
 import {readRuntimeProvenance} from '../../../../../../../ai/scripts/lifecycle/hooks/projectSeatHooks.mjs';
 import {
     formatReport,
@@ -199,8 +199,15 @@ test.describe('seat projection provenance', () => {
 
     test('an unwritable trace never disturbs the boot', async () => {
         // The hook must never block a session. A trace it cannot write is a worse reason to fail a boot
-        // than the condition it was recording, and the transcript line is emitted regardless.
-        expect(recordTrace('/proc/definitely-not-writable-by-this-test', 'x verdict'), 'it reports failure').toBe(false)
+        // than the condition it was recording, and the transcript line is emitted regardless. The root
+        // lies below a regular file, which no platform or user can create; under `/proc`, Linux's
+        // recursive mkdir never returns.
+        const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'seat-provenance-')), 'a-file');
+
+        scratchDirs.push(path.dirname(file));
+        fs.writeFileSync(file, '');
+
+        expect(recordTrace(path.join(file, 'root'), 'x verdict'), 'it reports failure').toBe(false)
     });
     test('INTEGRATION: a seat projected from a parked root is byte-CURRENT and provenance-WRONG', async () => {
         // AC-3, and the control is the whole point. `stale`/`missing` empty is not incidental — it is
