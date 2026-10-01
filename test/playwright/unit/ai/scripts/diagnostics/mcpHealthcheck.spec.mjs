@@ -761,7 +761,7 @@ test.describe('mcpHealthcheck — a liveness expectation is a SET', () => {
         }
     });
 
-    test('EVERY compose probe command gives itself a budget one second inside the timeout that ends its check (#579)', () => {
+    test('EVERY compose probe command bounds each of its operations one second under the timeout that ends the whole check (#579)', () => {
         const probes = probeBlocks();
 
         expect(probes.map(({probe}) => probe), 'kb-server and mc-server in each file').toEqual(composeFiles.flatMap(file => [`${file} kb-server`, `${file} mc-server`]));
@@ -769,7 +769,7 @@ test.describe('mcpHealthcheck — a liveness expectation is a SET', () => {
         for (const {command, probe, timeoutMs} of probes) {
             const budget = command.includes('--timeout-ms') ? Number(command[command.indexOf('--timeout-ms') + 1]) : null;
 
-            expect(budget, `${probe}: the probe reports its timing split before Docker ends the check`).toBe(timeoutMs - 1000)
+            expect(budget, `${probe}: --timeout-ms is the check's timeout less one second`).toBe(timeoutMs - 1000)
         }
     });
 
@@ -796,7 +796,7 @@ test.describe('mcpHealthcheck — a liveness expectation is a SET', () => {
         expect(receipts).toHaveLength(composeFiles.length * 2);
 
         for (const {armed, probe, timeoutMs} of receipts) {
-            expect(armed, `${probe}: connect, then the tool call, each one second inside Docker's timeout`).toEqual([timeoutMs - 1000, timeoutMs - 1000])
+            expect(armed, `${probe}: the connect, then the tool call, each armed at the declared per-operation budget`).toEqual([timeoutMs - 1000, timeoutMs - 1000])
         }
     });
 

@@ -205,14 +205,16 @@ services:
     # interval after a check completes and reports `unhealthy` after `retries` consecutive
     # failures, so a dead service is reported within 4 × (30 s + 15 s) = 180 s when every check
     # runs to its timeout (12 × (10 s + 10 s) = 240 s before) and 4 × 30 s = 120 s when checks
-    # fail at once (unchanged). The probe's own budget, `--timeout-ms 14000`, sits a second inside
-    # that timeout: a slow tool call gets 14 s, and the probe still reports its timing split before
-    # Docker ends the check. Without the flag it stops at its 8 s default and the 15 s never
-    # applies. The budget covers a probe whose interpreter start is inflated by CPU contention,
-    # which is what its startup timing separates from a stalled service. Cadence is the whole
-    # saving here: kb-server's `healthcheck` takes no `freshObservability` option and ignores the
-    # one the probe sends. (The rationale sits above the key on purpose: the bridge spec's
-    # cross-artifact arm reads `timeout` within 400 characters of the probe's path.)
+    # fail at once (unchanged). `--timeout-ms 14000` bounds each of the probe's operations, the
+    # connect and then the tool call, while Docker's 15 s bounds the whole check. A tool call
+    # slower than the old 8 s default passes when it answers inside both. One that does not trips
+    # the probe's own timeout, which reports its timing split, as long as the connect was quick;
+    # after a slow connect, Docker may end the check first. The budget covers a probe whose
+    # interpreter start is inflated by CPU contention, which is what its startup timing separates
+    # from a stalled service. Cadence is the whole saving here: kb-server's `healthcheck` takes no
+    # `freshObservability` option and ignores the one the probe sends. (The rationale sits above
+    # the key on purpose: the bridge spec's cross-artifact arm reads `timeout` within 400
+    # characters of the probe's path.)
     healthcheck:
       test        : ["CMD", "node", "./ai/scripts/diagnostics/mcpHealthcheck.mjs", "--url", "http://127.0.0.1:3000", "--client-name", "neo-kb-container-healthcheck", "--timeout-ms", "14000"]
       interval    : 30s
