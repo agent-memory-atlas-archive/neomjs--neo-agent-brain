@@ -14,13 +14,36 @@ concurrency:
     cancel-in-progress: true
 
 jobs:
-    unit:
+    # The whole unit config runs twice, on the change and on its base, and `unit` compares the two
+    # failure sets: it fails only on a test the change breaks. Neither run fails its own job — its
+    # report is its output — so the base's known reds never reach the defect ledger's CI ingest, and
+    # neither step is named like a green suite run the ingest would take as recovery evidence.
+    suite:
+        name: suite (${{ matrix.side }})
         runs-on: ubuntu-latest
         timeout-minutes: 30
+        strategy:
+            fail-fast: false
+            matrix:
+                side: [head, base]
         env:
             NEO_TEST_SKIP_CI: 'true'
         steps:
             - uses: actions/checkout@v7
+              with:
+                  fetch-depth: 2
+
+            # A pull request's head is the merge commit GitHub tests, so its first parent is exactly
+            # the base that merge was computed against. A push is measured against the tip it replaced.
+            - name: Check out the base
+              if: matrix.side == 'base'
+              run: |
+                  if [ "${{ github.event_name }}" = pull_request ]; then
+                      git checkout --detach HEAD^1
+                  else
+                      git fetch --no-tags --depth=1 origin "${{ github.event.before }}"
+                      git checkout --detach FETCH_HEAD
+                  fi
 
             - uses: actions/setup-node@v7
               with:
@@ -39,139 +62,45 @@ jobs:
               # postinstall inside every consumer's install.
               run: npm run prepare
 
-            - name: Verify the received unit collection
-              run: npm run test-unit -- --list
+            # The last test ends about 6.5 minutes in on this runner, but the run does not exit on
+            # its own: its teardown never starts. The bound ends it with the report written and the
+            # timeout recorded as a top-level error, which both sides share. A head run the bound
+            # cuts short leaves tests unrun, and the comparison refuses those rather than trusting them.
+            - name: Run the unit config
+              continue-on-error: true
+              run: npm run test-unit -- --global-timeout=600000
 
-            # `--list` above COLLECTS; only the specs named here execute. A cross-PR drift detector
-            # is worthless outside this list, so it belongs in it.
-            - name: Run the move-first Brain smoke
-              run: >-
-                  npm run test-unit --
-                  test/playwright/unit/ai/AgentOrchestrator.spec.mjs
-                  test/playwright/unit/ai/Env.spec.mjs
-                  test/playwright/unit/harness/terminateDaemon.spec.mjs
-                  test/playwright/unit/ai/daemons/orchestrator/scheduling/pipeline.spec.mjs
-                  test/playwright/unit/ai/daemons/orchestrator/services/heavyMaintenanceWaiterLedger.spec.mjs
-                  test/playwright/unit/ai/daemons/orchestrator/services/coreCorpusProjection.spec.mjs
-                  test/playwright/unit/ai/services/github-workflow/IssueSyncer.spec.mjs
-                  test/playwright/unit/ai/services/github-workflow/ReleaseNotesSyncer.spec.mjs
-                  test/playwright/unit/ai/services/github-workflow/SyncService.Stage2.spec.mjs
-                  test/playwright/unit/ai/scripts/maintenance/syncGithubWorkflow.spec.mjs
-                  test/playwright/unit/ai/services/github-workflow/Round2DispositionRelation.spec.mjs
-                  test/playwright/unit/ai/daemons/orchestrator/scheduling/communityReconciliation.spec.mjs
-                  test/playwright/unit/ai/daemons/orchestrator/services/CommunityReconciliationService.spec.mjs
-                  test/playwright/unit/ai/scripts/maintenance/reconcileGithubCommunity.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/SourceRegistryService.spec.mjs
-                  test/playwright/unit/src/fleet/contract/fleetContract.spec.mjs
-                  test/playwright/unit/ai/services/neural-link/ConnectionService.spec.mjs
-                  test/playwright/unit/ai/services/graph/SemanticGraphExtractor.spec.mjs
-                  test/playwright/unit/ai/services/graph/GraphMaintenanceService.spec.mjs
-                  test/playwright/unit/ai/services/graph/providerReadinessHelper.spec.mjs
-                  test/playwright/unit/ai/graph/SQLiteWalSizeLimit.spec.mjs
-                  test/playwright/unit/ai/graph/SQLiteWriteGuard.spec.mjs
-                  test/playwright/unit/ai/provider/OpenAiCompatibleStreamFailures.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/TextEmbeddingService.retry.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/VectorService.batchFailureIsolation.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/IngestionService.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/VectorService.WorkVolumeBranching.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/VectorService.tenantStamping.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/helpers/consumerFrictionHelper.spec.mjs
-                  test/playwright/unit/ai/services/shared/providerActivityLedger.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/MemoryCoreRecorderService.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/MailboxService.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/MailboxService.ListMessagesCompleteness.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/MailboxService.ListMessagesCost.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/MailboxService.UnreadProjection.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/MailboxService.ReceiptDurability.spec.mjs
-                  test/playwright/unit/ai/daemons/message/drainCycle.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/helpers/defectObservationFold.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/helpers/sandmanHandoffStore.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/helpers/deploymentStateBridgeStore.spec.mjs
-                  test/playwright/unit/ai/daemons/orchestrator/services/DeploymentRuntimeAccessService.spec.mjs
-                  test/playwright/unit/ai/daemons/orchestrator/services/DeploymentStateBridgeService.spec.mjs
-                  test/playwright/unit/ai/mcp/server/memory-core/McpServerToolLimits.spec.mjs
-                  test/playwright/unit/ai/mcp/server/knowledge-base/Server.spec.mjs
-                  test/playwright/unit/ai/scripts/maintenance/backup.spec.mjs
-                  test/playwright/unit/ai/scripts/maintenance/restore.spec.mjs
-                  test/playwright/unit/ai/scripts/maintenance/restoreReceipts.spec.mjs
-                  test/playwright/unit/ai/scripts/maintenance/rebuildMessageEdges.spec.mjs
-                  test/playwright/unit/ai/services/github-workflow/DiscussionReconciliationService.spec.mjs
-                  test/playwright/unit/ai/services/github-workflow/community/githubDiscussionObservations.spec.mjs
-                  test/playwright/unit/ai/services/github-workflow/community/githubDiscussionReconciliation.spec.mjs
-                  test/playwright/unit/src/evolution/RemDigestion.spec.mjs
-                  test/playwright/unit/ai/mcp/server/neural-link/Bridge.spec.mjs
-                  test/playwright/unit/playwrightConfigUnit.spec.mjs
-                  test/playwright/unit/chromaOwnership.spec.mjs
-                  test/playwright/unit/deploy/DeploySourceRepository.spec.mjs
-                  test/playwright/unit/ai/deploy/DeclaredHeapCeilings.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/source/ConversationCorpusSource.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/source/ReleaseNotesCorpusSource.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/source/SourceRegistry.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/source/SourcePathsConfig.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/extractorCatalogue.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/QueryService.queryDocuments.spec.mjs
-                  test/playwright/unit/ai/deploy/KbTenantBootstrapContract.spec.mjs
-                  test/playwright/unit/ai/configBase.spec.mjs
-                  test/playwright/unit/ai/services/fleet/fleetPrLaneActivityAdapter.spec.mjs
-                  test/playwright/unit/ai/services/fleet/wireFleetActivityReadSource.spec.mjs
-                  test/playwright/unit/ai/services/fleet/wireDeploymentStateReadSource.spec.mjs
-                  test/playwright/unit/ai/services/fleet/planeDeploymentStateReader.spec.mjs
-                  test/playwright/unit/ai/services/fleet/planePrLaneActivityReader.spec.mjs
-                  test/playwright/unit/ai/services/graph/readSyncedPullRecords.spec.mjs
-                  test/playwright/unit/ai/services/graph/readWorkGraphIssueRecords.spec.mjs
-                  test/playwright/unit/ai/daemons/orchestrator/scheduling/heavyMaintenanceStarvationWatchdog.spec.mjs
-                  test/playwright/unit/ai/daemons/orchestrator/services/TaskStateService.spec.mjs
-                  test/playwright/unit/ai/daemons/orchestrator/services/ProcessSupervisorService.spec.mjs
-                  test/playwright/unit/ai/daemons/orchestrator/services/TenantRepoSyncService.spec.mjs
-                  test/playwright/unit/ai/mcp/server/knowledge-base/manageKnowledgeBaseWipeRefusal.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/DatabaseService.sync.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/coreCorpusProfileRunner.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/imageRevisionReader.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/repositoryClassHierarchyResolver.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/source/ApiSource.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/source/coreCorpusSources.spec.mjs
-                  test/playwright/unit/ai/services/knowledge-base/SearchService.spec.mjs
-                  test/playwright/unit/ai/scripts/maintenance/syncKnowledgeBase.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/HealthService.starvationFold.spec.mjs
-                  test/playwright/unit/ai/daemons/orchestrator/HostEdgePosture.spec.mjs
-                  test/playwright/unit/ai/deploy/HostLaunchAgentPath.spec.mjs
-                  test/playwright/unit/ai/deploy/ParityPlaneVolumeScoping.spec.mjs
-                  test/playwright/unit/ai/deploy/PlaneDataRootMount.spec.mjs
-                  test/playwright/unit/ai/deploy/WakeReceiverRecordsMount.spec.mjs
-                  test/playwright/unit/ai/scripts/setup/prepare.spec.mjs
-                  test/playwright/unit/ai/services/fleet/fleetGoldenPathSource.spec.mjs
-                  test/playwright/unit/ai/services/fleet/fleetGraphSceneSource.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/GraphService.readSceneGraph.spec.mjs
-                  test/playwright/unit/ai/services/fleet/dispatchFleetRequest.spec.mjs
-                  test/playwright/unit/ai/services/ConceptService.spec.mjs
-                  test/playwright/unit/ai/services/ingestion/ConceptIngestor.spec.mjs
-                  test/playwright/unit/ai/services/ingestion/IssueIngestor.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/FileSystemIngestor.spec.mjs
-                  test/playwright/unit/ai/services/fleet/fleetServer.spec.mjs
-                  test/playwright/unit/ai/services/fleet/FleetRegistryService.spec.mjs
-                  test/playwright/unit/ai/services/fleet/FleetManager.spec.mjs
-                  test/playwright/unit/ai/services/fleet/FleetControlBridge.spec.mjs
-                  test/playwright/unit/ai/services/fleet/opencodeWakeEnvelopePlugin.spec.mjs
-                  test/playwright/unit/ai/services/fleet/generateOpenCodeSeatConfig.spec.mjs
-                  test/playwright/unit/ai/daemons/wake/localWakeAdapters.spec.mjs
-                  test/playwright/unit/ai/daemons/wake/opencodeSeatEnvelopeParity.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/helpers/computedRouteStore.spec.mjs
-                  test/playwright/unit/ai/services/memory-core/helpers/prLaneActivityStore.spec.mjs
-                  test/playwright/unit/ai/FleetLifecycleService.spec.mjs
-                  test/playwright/unit/ai/services/fleet/prepareManagedAgentWorkspace.spec.mjs
-                  test/playwright/unit/ai/services/fleet/projectSeatInstructions.spec.mjs
-                  test/playwright/unit/ai/scripts/diagnostics/captureParityLatencyPair.spec.mjs
-                  test/playwright/unit/ai/deriveAgentRepoPath.spec.mjs
-                  test/playwright/unit/ai/services/fleet/deriveAgentInstanceHome.spec.mjs
-                  test/playwright/unit/ai/planeConfig.spec.mjs
-                  test/playwright/unit/ai/FleetRegistryService.spec.mjs
-                  test/playwright/unit/ai/startAgentProvisioned.spec.mjs
-                  test/playwright/unit/ai/provisionAgentRepo.spec.mjs
-                  test/playwright/unit/ai/provisionAgentRepoGit.spec.mjs
-                  test/playwright/unit/ai/ensureAgentRepo.spec.mjs
+            - name: Keep the report
+              if: ${{ !cancelled() }}
+              uses: actions/upload-artifact@v7
+              with:
+                  name: unit-report-${{ matrix.side }}
+                  path: test/playwright/test-results/unit/test-results.json
+                  if-no-files-found: warn
+                  retention-days: 7
 
-            - name: Verify community host authority boundary
+    unit:
+        needs: suite
+        if: ${{ !cancelled() }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - uses: actions/checkout@v7
+
+            - uses: actions/setup-node@v7
+              with:
+                  node-version: 24
+
+            # A side whose report is missing is refused by name in the next step.
+            - name: Collect both reports
+              continue-on-error: true
+              uses: actions/download-artifact@v7
+              with:
+                  pattern: unit-report-*
+                  path: reports
+
+            - name: Compare the change's failures with its base's
               run: >-
-                  npm run test-unit --
-                  test/playwright/unit/ai/daemons/orchestrator/Orchestrator.spec.mjs
-                  --grep 'community reconciliation is plane-owned'
+                  node test/playwright/compareUnitFailures.mjs
+                  --head reports/unit-report-head/test-results.json
+                  --base reports/unit-report-base/test-results.json

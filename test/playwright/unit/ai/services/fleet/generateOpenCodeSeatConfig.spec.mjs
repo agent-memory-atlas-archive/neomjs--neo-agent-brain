@@ -116,8 +116,7 @@ test.describe('generateOpenCodeSeatConfig (OpenCode seat scaffold emission)', ()
         // not pass, so on a real Fleet seat the branch always skipped; the plant is now its own emitted
         // file at a caller-resolved path. Sole differing artifact: `/seat/write-wake-envelope.mjs`.
         // Verified against `origin/dev` at `bea77518…` before rebasing, so this bump is attributable to
-        // the hook and not to inherited drift. This spec is now on the `brain-unit.yml` run list, which
-        // is the only reason the earlier bumps were ever checked.
+        // the hook and not to inherited drift.
         expect(digest).toBe('73cfb2a6599bcab0c4b5d02954517ee9021fc206cb6114a2d42303e003490f57')
     });
 
