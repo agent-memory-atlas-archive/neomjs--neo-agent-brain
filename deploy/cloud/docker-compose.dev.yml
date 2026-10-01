@@ -254,7 +254,8 @@ services:
              "--url", "http://127.0.0.1:3000",
              "--client-name", "neo-kb-parity-healthcheck",
              "--expected-plane-id", *plane-id,
-             "--expected-plane-data-root", "/app/.neo-ai-data-parity"]
+             "--expected-plane-data-root", "/app/.neo-ai-data-parity",
+             "--timeout-ms", "9000"]
       interval: 15s
       timeout: 10s
       retries: 10
@@ -325,7 +326,8 @@ services:
              "--client-name", "neo-mc-parity-healthcheck",
              "--expected-plane-id", *plane-id,
              "--expected-plane-data-root", "/app/.neo-ai-data-parity",
-             "--expected-status", "healthy,degraded"]
+             "--expected-status", "healthy,degraded",
+             "--timeout-ms", "9000"]
       interval: 15s
       timeout: 10s
       retries: 10
