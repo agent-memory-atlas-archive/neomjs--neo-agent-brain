@@ -1,6 +1,6 @@
-import {expect, test}              from '@playwright/test';
-import {createFleetOpenWorkSource} from '../../../../../../ai/services/fleet/fleetOpenWorkSource.mjs';
-import {normalizePullRequest}      from '../../../../../../ai/services/fleet/openWorkReducer.mjs';
+import {expect, test}                                 from '@playwright/test';
+import {createFleetOpenWorkSource, openWorkFreshness} from '../../../../../../ai/services/fleet/fleetOpenWorkSource.mjs';
+import {normalizePullRequest}                         from '../../../../../../ai/services/fleet/openWorkReducer.mjs';
 
 const
     OBSERVED = '2026-10-02T10:00:00.000Z',
@@ -18,7 +18,7 @@ test.describe('fleetOpenWorkSource — each seat\'s open work under the producer
         const {state: freshness, seats, unobserved, awaitingMerge} = source(state()).readOpenWork();
 
         const summary = {repo: 'acme/app', number: 7, title: 'fix: the head goes green', head: 'a1', ci: 'red', verdict: 'CHANGES_REQUESTED', mergeable: 'MERGEABLE', draft: false, reviews: [review], observedAt: OBSERVED, stale: false,
-            holder: {role: 'author', ids: ['@neo-opus-ada']}};
+            holder: {role: 'author', kind: 'repair-ci', ids: ['@neo-opus-ada']}};
 
         expect(freshness).toBe('ok');
         expect(unobserved).toBe(0);
@@ -27,6 +27,22 @@ test.describe('fleetOpenWorkSource — each seat\'s open work under the producer
             '@neo-gpt'     : {authored: [], reviewing: [summary]}
         });
         expect(awaitingMerge).toEqual([])
+    });
+
+    test('routing and rebase actions propagate unchanged into each public seat view inside a partial pulse', () => {
+        const
+            approval = {reviewer: '@neo-gpt', state: 'APPROVED', onHead: true},
+            routing  = {...row(1), ci: 'green', verdict: null, requested: [], reviews: [], opinions: [], partial: false},
+            rebase   = {...row(2), ci: 'green', verdict: 'APPROVED', mergeable: 'CONFLICTING', requested: ['@neo-gpt'], reviews: [approval], opinions: [approval], partial: false},
+            read     = source(state({coverage: 'partial'}, [routing, rebase])).readOpenWork();
+
+        expect(read.coverage).toBe('partial');
+        expect(read.seats['@neo-opus-ada'].authored.map(({number, holder}) => ({number, holder}))).toEqual([
+            {number: 1, holder: {role: 'author', kind: 'route-review', ids: ['@neo-opus-ada']}},
+            {number: 2, holder: {role: 'author', kind: 'rebase', ids: ['@neo-opus-ada']}}
+        ]);
+        expect(read.seats['@neo-gpt'].reviewing[0].holder).toEqual({role: 'author', kind: 'rebase', ids: ['@neo-opus-ada']});
+        expect(read.awaitingMerge).toEqual([])
     });
 
     test('a row stored before the snapshot carried titles answers with a null title', () => {
@@ -71,8 +87,8 @@ test.describe('fleetOpenWorkSource — each seat\'s open work under the producer
             approval   = {author: {login: 'neo-gpt'}, state: 'APPROVED', commit: {oid: 'h9'}},
             // the reviewer's latest review and latest opinion of the head; `more…` says a list went unread past its page
             node       = ({latest=approval, opinion=approval, moreReviews=false, moreOpinions=false}={}) => ({
-                number: 9, headRefOid: 'h9', reviewDecision: 'APPROVED', mergeable: 'MERGEABLE', isDraft: false,
-                body: 'Authored by Ada (Claude Opus 5.5, Claude Code).', author: {login: 'neo-opus-ada'}, repository: {nameWithOwner: 'acme/app'},
+                number                  : 9, headRefOid: 'h9', reviewDecision: 'APPROVED', mergeable: 'MERGEABLE', isDraft: false,
+                body                    : 'Authored by Ada (Claude Opus 5.5, Claude Code).', author: {login: 'neo-opus-ada'}, repository: {nameWithOwner: 'acme/app'},
                 reviewRequests          : {pageInfo: {hasNextPage: false}, nodes: []},
                 latestReviews           : {pageInfo: {hasNextPage: moreReviews}, nodes: [latest]},
                 latestOpinionatedReviews: {pageInfo: {hasNextPage: moreOpinions}, nodes: [opinion]},
@@ -86,7 +102,7 @@ test.describe('fleetOpenWorkSource — each seat\'s open work under the producer
         // more reviews or opinions went unread: the approval cannot be shown to stand alone
         expect(awaiting({moreReviews: true})).toEqual([]);
         expect(awaiting({moreOpinions: true})).toEqual([]);
-        expect(read({moreReviews: true}).seats['@neo-opus-ada'].authored.map(({holder}) => holder)).toEqual([{role: 'unknown', ids: []}]);
+        expect(read({moreReviews: true}).seats['@neo-opus-ada'].authored.map(({holder}) => holder)).toEqual([{role: 'unknown', kind: null, ids: []}]);
         // the reviewer approved, then commented on the same head: the latest review is the comment
         expect(awaiting({latest: commented})).toEqual([[9, 'operator']]);
         // a change request survives a later comment the same way, and keeps the PR out of the queue
@@ -117,6 +133,29 @@ test.describe('fleetOpenWorkSource — each seat\'s open work under the producer
         const carried = source(state({observedAt: '2026-10-02T10:10:00.000Z', coverage: 'partial'}, [row(8)]), 11).readOpenWork();
 
         expect(carried.seats['@neo-opus-ada'].authored.map(({number, stale}) => [number, stale])).toEqual([[8, true]])
+    });
+
+    test('the shared freshness classifier preserves the exact stale and unavailable boundaries', () => {
+        expect(openWorkFreshness(OBSERVED, {now: Date.parse(OBSERVED) + 5 * 60000})).toBe('ok');
+        expect(openWorkFreshness(OBSERVED, {now: Date.parse(OBSERVED) + 5 * 60000 + 1})).toBe('stale');
+        expect(openWorkFreshness(OBSERVED, {now: Date.parse(OBSERVED) + 60 * 60000})).toBe('stale');
+        expect(openWorkFreshness(OBSERVED, {now: Date.parse(OBSERVED) + 60 * 60000 + 1})).toBe('unavailable');
+        expect(openWorkFreshness(OBSERVED, {now: Date.parse(OBSERVED) + 11, staleAfterMs: 10, unavailableAfterMs: 20})).toBe('stale')
+    });
+
+    test('missing, invalid and future observation timestamps never become fresh evidence', () => {
+        for (const observedAt of [null, undefined, 'invalid', '2026-10-02T10:02:00.000Z']) {
+            expect(openWorkFreshness(observedAt, {now: at(1)()})).toBe('unavailable');
+            expect(source(state({observedAt})).readOpenWork()).toMatchObject({state: 'unavailable', seats: {}})
+        }
+    });
+
+    test('an invalid row timestamp is counted as unobserved without spoiling other fresh rows', () => {
+        const read = source(state({}, [row(7), row(8, 'invalid')])).readOpenWork();
+
+        expect(read.state).toBe('ok');
+        expect(read.unobserved).toBe(1);
+        expect(read.seats['@neo-opus-ada'].authored.map(({number}) => number)).toEqual([7])
     });
 
     test('a partial pulse is still answered, and says so', () => {
