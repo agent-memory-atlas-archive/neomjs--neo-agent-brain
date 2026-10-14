@@ -13,7 +13,9 @@ import {pathToFileURL} from 'node:url';
  *
  * - `prompt` (UserPromptSubmit) reads the session's current model from the app's session record and
  *   blocks while its family differs from the seat's last-run family. A prompt starting with `model-ok`
- *   runs anyway, and `stop` then records that model, so the block does not repeat.
+ *   runs anyway, and `stop` then records that model, so the block does not repeat. It only blocks when
+ *   another seat shares the account: on an account no other seat uses, the remembered pick is always the
+ *   seat's own, so a family change is a deliberate switch.
  * - `stop` (Stop) records the family the seat actually ran, read from the transcript.
  *
  * The record is found without any projected path: Desktop starts its bundled CLI from
@@ -106,13 +108,15 @@ export function decideSeatModelGuard({currentModel, expectedModel, prompt}) {
 }
 
 /**
- * @summary Reads the session's current model from the app's record, joined on the hook's `session_id`.
+ * @summary Reads the session's current model and account folder from the app's record, joined on the
+ * hook's `session_id`.
  * @param {String} userDataDir
  * @param {*}      hostSessionId `CLAUDE_CODE_HOST_SESSION_ID`.
  * @param {*}      sessionId     The hook input's `session_id`.
- * @returns {String|null} `null` when the record is missing, unreadable or belongs to another session.
+ * @returns {{model: String, account: String}|null} `null` when the record is missing, unreadable or
+ * belongs to another session.
  */
-export function readSessionModel(userDataDir, hostSessionId, sessionId) {
+export function readSessionRecord(userDataDir, hostSessionId, sessionId) {
     if (!HOST_SESSION_ID.test(hostSessionId ?? '') || typeof sessionId !== 'string') return null;
 
     const
@@ -127,11 +131,46 @@ export function readSessionModel(userDataDir, hostSessionId, sessionId) {
 
             const record = parseJson(safeRead(candidate));
 
-            return record?.cliSessionId === sessionId && typeof record.model === 'string' ? record.model : null
+            return record?.cliSessionId === sessionId && typeof record.model === 'string' ? {model: record.model, account} : null
         }
     }
 
     return null
+}
+
+/**
+ * @summary Whether another seat under the same agents root has sessions under this account. Only a real
+ * directory entry in a readable listing counts: a file, a symbolic link or a listing that fails is no
+ * evidence of sharing, so the guard fails open. Reads directory listings only, never a file.
+ * @param {String} userDataDir The seat's `<agentsRoot>/<agentId>/harness/claude-desktop`.
+ * @param {String} account     The account folder of this session's record.
+ * @returns {Boolean} `false` for an unrecognized layout, so the guard fails open.
+ */
+export function accountSharedWithAnotherSeat(userDataDir, account) {
+    const harnessDir = path.dirname(userDataDir);
+
+    if (path.basename(userDataDir) !== 'claude-desktop' || path.basename(harnessDir) !== 'harness') return false;
+
+    const
+        seatDir    = path.dirname(harnessDir),
+        agentsRoot = path.dirname(seatDir);
+
+    return realDirectories(agentsRoot).some(seat => seat !== path.basename(seatDir) &&
+        realDirectories(path.join(agentsRoot, seat, 'harness', 'claude-desktop', 'claude-code-sessions')).includes(account))
+}
+
+/**
+ * @summary The names of a directory's real subdirectories; `Dirent.isDirectory()` is false for a symbolic
+ * link, and an unreadable listing yields none.
+ * @param {String} dir
+ * @returns {String[]}
+ */
+function realDirectories(dir) {
+    try {
+        return fs.readdirSync(dir, {withFileTypes: true}).filter(entry => entry.isDirectory()).map(entry => entry.name)
+    } catch {
+        return []
+    }
 }
 
 /**
@@ -234,8 +273,12 @@ export function runSeatModelGuard(event, payload, env = process.env) {
 
     if (event !== 'prompt') return 0;
 
+    const record = readSessionRecord(userDataDir, env.CLAUDE_CODE_HOST_SESSION_ID, payload?.session_id);
+
+    if (!record || !accountSharedWithAnotherSeat(userDataDir, record.account)) return 0;
+
     const decision = decideSeatModelGuard({
-        currentModel : readSessionModel(userDataDir, env.CLAUDE_CODE_HOST_SESSION_ID, payload?.session_id),
+        currentModel : record.model,
         expectedModel: parseJson(safeRead(stateFile))?.lastRunModel ?? null,
         prompt       : payload?.prompt
     });
