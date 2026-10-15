@@ -18,21 +18,46 @@ import {createMcpExpressApp}                         from '@modelcontextprotocol
 import {McpServer}                                   from '@modelcontextprotocol/sdk/server/mcp.js';
 import {StreamableHTTPServerTransport}               from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import crypto                                        from 'node:crypto';
+import fs                                            from 'fs-extra';
 import http                                          from 'node:http';
+import os                                            from 'node:os';
 import path                                          from 'node:path';
+import {holdRuntimeGenerationReferences}             from '../../../../../../ai/services/fleet/runtimeGenerationLease.mjs';
+
 import {fileURLToPath}                               from 'node:url';
 import Neo                                           from 'neo.mjs/src/Neo.mjs';
 import * as core                                     from 'neo.mjs/src/core/_export.mjs';
 
-import McpLaunchAdmissionService         from '../../../../../../ai/services/fleet/McpLaunchAdmissionService.mjs';
-import FleetTenantService                from '../../../../../../ai/services/fleet/FleetTenantService.mjs';
-import {createManagedAgentWorkspacePlan} from '../../../../../../ai/services/fleet/managedAgentWorkspacePlan.mjs';
+import McpLaunchAdmissionService                         from '../../../../../../ai/services/fleet/McpLaunchAdmissionService.mjs';
+import FleetTenantService                                from '../../../../../../ai/services/fleet/FleetTenantService.mjs';
+import {writeFileAtomicSync}                             from '../../../../../../ai/services/shared/atomicFileWrite.mjs';
+import {createSeatPatOwner, createResidentMcpInputOwner} from '../../../../../../ai/services/fleet/launchCredentialOwners.mjs';
+import {createManagedAgentWorkspacePlan}                 from '../../../../../../ai/services/fleet/managedAgentWorkspacePlan.mjs';
+import {createSeatRuntimeRecord}                         from '../../../../../../ai/services/fleet/seatRuntimeRecord.mjs';
+import {createDesktopLaunchBinding}                      from '../../../../../../ai/services/fleet/launchProfileCustody.mjs';
 import {
     LAUNCH_ADMISSION_PATH,
     createLaunchRequest,
     parseLaunchCapability,
     verifyLaunchResponse
 } from '../../../../../../ai/services/fleet/mcpLaunchAdmission.mjs';
+
+/** @summary Holds actual file exclusion until a reference-producing fixture operation settles. */
+function withTestRuntimeReferences(runtime, invoke) {
+    const guard = holdRuntimeGenerationReferences({directory: path.dirname(runtime.directory)});
+    try { return Promise.resolve(invoke(guard)).finally(() => guard.release()); }
+    catch (error) { guard.release(); throw error; }
+}
+/** @summary Exercises the production reservation under an independently held real guard. */
+function reserveWithRuntimeReferences(options) {
+    return withTestRuntimeReferences(options.runtimeGeneration, runtimeReferenceGuard =>
+        service.reserve({...options, runtimeReferenceGuard}));
+}
+/** @summary Exercises direct recovery with the fixture's original runtime parent. */
+function recoverWithRuntimeReferences(options) {
+    return withTestRuntimeReferences(options.runtime, runtimeReferenceGuard =>
+        service.recover({...options, runtimeReferenceGuard}));
+}
 
 const
     REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../../..'),
@@ -115,10 +140,10 @@ function makeRegistry() {
 }
 
 /** @summary Reserve and activate a seat whose process the probe reports. */
-async function activeSeat({definition = seatDefinition(), registry = null, probe = () => 'live', plan = boundPlan(), env = START_ENV, owners = makeOwners().owners} = {}) {
+async function activeSeat({definition = seatDefinition(), registry = null, probe = () => 'live', plan = boundPlan(), env = START_ENV, owners = makeOwners().owners, residentInputs = {}} = {}) {
     const reservation = await service.reserve({agent: definition, registry});
 
-    service.activate({generation: reservation.generation, agentId: definition.id, plan, env, owners, probe});
+    service.activate({generation: reservation.generation, agentId: definition.id, plan, env, owners, residentInputs, probe});
 
     return reservation
 }
@@ -129,7 +154,443 @@ test.beforeEach(() => {
     service.revocations.clear();
     service.unattributed.length = 0;
     service.pendingTimeoutMs = 30000;
-    service.proofTimeoutMs   = 10000
+    service.proofTimeoutMs   = 10000;
+    service.continuityPhase = 'ready';
+    service.handoffPromise = null;
+});
+
+test.describe('McpLaunchAdmissionService — original generation recovery', () => {
+    let directory;
+    /** @summary Simulates the predecessor releasing its actual listener before a journal transition. */
+    async function closeListener() {
+        if (service.httpServer) await new Promise(resolve => service.httpServer.close(resolve));
+        service.httpServer = service.listening = service.issuerOrigin = null;
+    }
+    test.beforeEach(async () => {
+        await closeListener();
+        directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'admission-recovery-')));
+    });
+    test.afterEach(async () => {
+        await closeListener();
+        service.journal?.close();
+        service.journal = null;
+        service.journalFailed = false;
+        service.continuityPhase = 'ready';
+        service.readSeatStarts = null;
+        fs.removeSync(directory);
+    });
+
+    /** @summary Produces original records through reserve/activate, then opens a real fenced successor journal. */
+    async function predecessor({clean = true, revoke = false} = {}) {
+        const matrix           = {'memory-core': false, 'knowledge-base': false, 'neural-link': false, 'github-workflow': true, 'gitlab-workflow': false};
+        const agent            = seatDefinition({mcpServers: matrix});
+        const state            = {agent, credential: PAT, observed: 'live', seats: []};
+        const registry         = {getDataDir: () => directory, getDefinition: () => state.agent, resolveCredential: () => state.credential};
+        const owner            = createSeatPatOwner({registry, agent, proveForgeAccount: async () => ({verdict: 'proved'})});
+        const runtimeDirectory = path.join(directory, 'a'.repeat(64));
+        const runtime          = {id: 'a'.repeat(64), directory: runtimeDirectory, payloadDigest: 'b'.repeat(64),
+            runtimeRoot: `${runtimeDirectory}/host.runtime/organism`, executable: `${runtimeDirectory}/host.runtime/node`};
+        const plan    = boundPlan({root: runtime.runtimeRoot, matrix}).map(row => ({...row, command: runtime.executable}));
+        const custody = path.join(directory, 'custody');
+        service.openJournal({directory: custody, readSeatStarts: () => state.seats});
+        const reservation = await reserveWithRuntimeReferences({agent, registry, runtimeGeneration: runtime});
+        const profile     = createDesktopLaunchBinding({identity: LOGIN, issuer: reservation.issuer, rows: {
+            'neo-mjs-github-workflow': {env: {NEO_AGENT_IDENTITY: LOGIN, NEO_FLEET_LAUNCH_ISSUER: reservation.issuer,
+                NEO_FLEET_LAUNCH_GRANT: reservation.grants['github-workflow']}}
+        }});
+        const start = createSeatRuntimeRecord({record: {id: 'seat', harnessType: 'claude-desktop', pid: 42,
+            pidStartedAt       : 'Wed Oct 14 10:00:00 2026', startedAt: '2026-10-14T10:00:00Z', cwd: '/managed/repo',
+            instanceHome       : '/managed/seat', launchCommand: '/vendor/Claude', profileArg: '--user-data-dir=/managed/seat',
+            admissionGeneration: reservation.generation, runtimeGeneration: runtime,
+            bridgeAuthority    : {version: 1, source: 'registry-file', registryRoot: directory, publicKeySha256: 'c'.repeat(64)}},
+            identity           : LOGIN, plan, profile, leaseRequired: true, owners: {GH_TOKEN: owner}, env: START_ENV});
+        state.seats = [{start, state: 'running', ownershipUnresolved: false, cleanupUnresolved: false}];
+        service.activate({generation: reservation.generation, agentId: 'seat', plan, env: START_ENV,
+            owners: {GH_TOKEN: owner}, probe: () => state.observed});
+        if (revoke) service.revoke('seat', 'stop-requested');
+        if (clean) await service.handoff({verifySeats: async () => {}});
+        else { await closeListener(); service.journal.close(); }
+        service.httpServer = service.listening = service.issuerOrigin = null;
+        service.journal = null;
+        service.generations.clear(); service.grants.clear();
+        service.continuityPhase = 'ready'; service.handoffPromise = null;
+        const previous    = service.openJournal({directory: custody, readSeatStarts: () => state.seats});
+        const restoreSeat = async () => ({capabilities: reservation.grants, owners: {GH_TOKEN: owner}, residentInputs: {}, probe: () => state.observed});
+        return {state, registry, reservation, previous, restoreSeat, custody, runtime};
+    }
+
+    test('a clean successor rebinds the original origin and redeems the same capability with current owner bytes', async () => {
+        const f = await predecessor();
+        f.state.credential = 'rotated-fixture-pat';
+        await expect(service.recover(f)).rejects.toThrow(/not guarded/);
+        expect(service.generations.size).toBe(0);
+        expect(await recoverWithRuntimeReferences(f)).toEqual([{agentId: 'seat', state: 'active', reason: null}]);
+        expect(service.issuerOrigin).toBe(f.reservation.issuer);
+        expect(await redeem(f.reservation.grants['github-workflow'], {server: 'github-workflow'}))
+            .toMatchObject({outcome: 'admitted', env: {GH_TOKEN: 'rotated-fixture-pat'}, generationRoot: f.state.seats[0].start.runtime.runtimeRoot});
+        const raw = fs.readFileSync(path.join(f.custody, 'issuer.json'), 'utf8');
+        expect(raw).not.toContain('rotated-fixture-pat');
+        expect(raw).not.toContain(f.reservation.grants['github-workflow']);
+    });
+
+    test('an unclean predecessor preserves hashes and pins but restores no capability or endpoint', async () => {
+        const f     = await predecessor({clean: false});
+        let   calls = 0;
+        expect(await recoverWithRuntimeReferences({...f, restoreSeat: async () => { calls++; return f.restoreSeat(); }}))
+            .toEqual([{agentId: 'seat', state: 'stale', reason: 'recovery-unverified'}]);
+        expect(calls).toBe(0);
+        expect(service.httpServer).toBeNull();
+        expect(service.grants.size).toBe(0);
+        expect(service.admissionSnapshot().seats).toEqual(f.state.seats);
+        expect(service.admissionSnapshot().generations[0].servers[0].capabilityHash)
+            .toBe(f.previous.snapshot.generations[0].servers[0].capabilityHash);
+    });
+
+    test('a bind conflict refuses the original origin without moving to another port', async () => {
+        const f       = await predecessor();
+        const blocker = http.createServer();
+        await new Promise(resolve => blocker.listen(Number(f.reservation.issuer.split(':').at(-1)), '127.0.0.1', resolve));
+        try {
+            await expect(recoverWithRuntimeReferences(f)).rejects.toThrow('no alternate port selected');
+            expect(service.grants.size).toBe(0);
+            expect(service.httpServer).toBeNull();
+            expect(service.continuityPhase).toBe('unavailable');
+            await expect(service.reserve({agent: f.state.agent})).rejects.toThrow('continuity is not ready');
+        } finally { await new Promise(resolve => blocker.close(resolve)); }
+    });
+
+    test('revocation before handoff and Stop during asynchronous custody checks cannot be recovered', async () => {
+        const f        = await predecessor();
+        const entered  = deferred(), finish = deferred();
+        const recovery = recoverWithRuntimeReferences({...f, restoreSeat: async () => { entered.resolve(); await finish.promise; return f.restoreSeat(); }});
+        await entered.promise;
+        service.revoke('seat', 'stop-requested');
+        finish.resolve();
+        expect(await recovery).toEqual([{agentId: 'seat', state: 'revoked', reason: 'stop-requested'}]);
+        expect(service.grants.size).toBe(0);
+        expect(service.admissionSnapshot().generations[0].state).toBe('revoked');
+    });
+
+    test('a predecessor tombstone is preserved without reading a profile', async () => {
+        const f    = await predecessor({revoke: true});
+        let   read = false;
+        expect(await recoverWithRuntimeReferences({...f, restoreSeat: async () => { read = true; return f.restoreSeat(); }}))
+            .toEqual([{agentId: 'seat', state: 'revoked', reason: 'stop-requested'}]);
+        expect(read).toBe(false);
+    });
+
+    test('a failed recovery write releases its newly bound listener and leaves no admitted grants', async () => {
+        const f = await predecessor();
+        service.journal.write = () => { throw Error('fixture lost recovery write'); };
+        await expect(recoverWithRuntimeReferences(f)).rejects.toThrow('fixture lost recovery write');
+        expect(service.journalFailed).toBe(true);
+        expect(service.grants.size).toBe(0);
+        expect(service.httpServer).toBeNull();
+        const probe = http.createServer();
+        await new Promise((resolve, reject) => {
+            probe.once('error', reject);
+            probe.listen(Number(f.reservation.issuer.split(':').at(-1)), '127.0.0.1', resolve);
+        });
+        await new Promise(resolve => probe.close(resolve));
+    });
+
+    test('off then on during recovery cannot resurrect an individual grant', async () => {
+        const f           = await predecessor();
+        const restoreSeat = async () => {
+            const original = f.state.agent;
+            f.state.agent = {...original, mcpServers: {...original.mcpServers, 'github-workflow': false}};
+            service.onDefinitionChange({id: 'seat', next: f.state.agent});
+            f.state.agent = original;
+            service.onDefinitionChange({id: 'seat', next: original});
+            return f.restoreSeat();
+        };
+        expect((await recoverWithRuntimeReferences({...f, restoreSeat}))[0].state).toBe('active');
+        expect(await redeem(f.reservation.grants['github-workflow'], {server: 'github-workflow'}))
+            .toMatchObject({outcome: 'refused', code: 'revoked', reason: 'server-disabled'});
+    });
+
+    for (const failure of ['capability', 'owner', 'process', 'definition']) {
+        test(`recovery refuses changed ${failure} evidence without minting grants`, async () => {
+            const f           = await predecessor();
+            const restoreSeat = async () => {
+                const result = await f.restoreSeat();
+                if (failure === 'capability') result.capabilities = {'github-workflow': 'a'.repeat(22) + '.' + 'b'.repeat(43)};
+                if (failure === 'owner') result.owners = {};
+                if (failure === 'process') f.state.observed = 'unknown';
+                if (failure === 'definition') f.state.agent = {...f.state.agent, launchOwner: 'external'};
+                return result;
+            };
+            expect(await recoverWithRuntimeReferences({...f, restoreSeat})).toEqual([{agentId: 'seat', state: 'stale', reason: 'recovery-unverified'}]);
+            expect(service.grants.size).toBe(0);
+        });
+    }
+});
+
+test.describe('McpLaunchAdmissionService — durable phase transitions', () => {
+    let directory;
+    test.beforeEach(() => {
+        directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'admission-phase-')));
+        fs.chmodSync(directory, 0o700);
+    });
+    test.afterEach(() => {
+        service.journal?.close();
+        service.journal = null;
+        service.journalFailed = false;
+        fs.removeSync(directory);
+    });
+
+    test('clean handoff awaits in-flight proofs and endpoint release; the draining request receives no env', async () => {
+        service.openJournal({directory});
+        const started = deferred(), finish = deferred(), owners = makeOwners();
+        owners.owners.GH_TOKEN.prove = () => { started.resolve(); return finish.promise; };
+        const reservation = await activeSeat({owners: owners.owners});
+        const grant       = parseLaunchCapability(reservation.grants['github-workflow']);
+        const request     = createLaunchRequest({grant, server: 'github-workflow', identity: LOGIN});
+        const response    = fetch(reservation.issuer + LAUNCH_ADMISSION_PATH, {method: 'POST',
+            headers: {'Content-Type': 'application/json'}, body: JSON.stringify(request)}).then(result => result.json());
+        await started.promise;
+        const handoff = service.handoff({verifySeats: async () => {}});
+        expect(service.handoff({verifySeats: () => { throw Error('must not run twice'); }})).toBe(handoff);
+        await new Promise(resolve => setImmediate(resolve));
+        expect(fs.readJsonSync(path.join(directory, 'issuer.json')).phase).toBe('active');
+        finish.resolve({verdict: 'proved'});
+        expect(verifyLaunchResponse(grant.secret, request, await response)).toMatchObject({outcome: 'refused', code: 'issuer-unavailable'});
+        expect(await handoff).toEqual({state: 'handed-off'});
+        expect(service.httpServer).toBeNull();
+        expect(fs.readJsonSync(path.join(directory, 'issuer.json')).phase).toBe('handoff');
+    });
+
+    test('an empty issuer hands off without inventing an endpoint or any grant', async () => {
+        if (service.httpServer) await new Promise(resolve => service.httpServer.close(resolve));
+        service.httpServer = service.listening = service.issuerOrigin = null;
+        service.openJournal({directory});
+        await service.handoff({verifySeats: async () => {}});
+        expect(fs.readJsonSync(path.join(directory, 'issuer.json'))).toMatchObject({phase: 'handoff', origin: null});
+        service.journal = null; service.continuityPhase = 'ready'; service.handoffPromise = null;
+        service.openJournal({directory});
+        expect(await service.recover({registry: {}, restoreSeat: () => { throw Error('no seat exists'); }})).toEqual([]);
+        expect(service.httpServer).toBeNull();
+        expect(service.grants.size).toBe(0);
+    });
+
+    test('a lost terminal handoff write never publishes a clean transition', async () => {
+        service.openJournal({directory, writeAtomic(file, content, options) {
+            if (path.basename(file) === 'issuer.json' && JSON.parse(content).phase === 'handoff') throw Error('lost terminal write');
+            return writeFileAtomicSync(file, content, options);
+        }});
+        await activeSeat();
+        await expect(service.handoff({verifySeats: async () => {}})).rejects.toThrow('durable-handoff');
+        expect(fs.readJsonSync(path.join(directory, 'issuer.json')).phase).toBe('active');
+        expect(service.httpServer).toBeNull();
+        await service.closeUnclean();
+    });
+
+    for (const failure of ['pending', 'input-owner', 'deadline']) {
+        test(`failed handoff preserves unclean evidence and remains quittable: ${failure}`, async () => {
+            service.openJournal({directory});
+            if (failure === 'pending') await service.reserve({agent: seatDefinition()});
+            else await activeSeat();
+            service.proofTimeoutMs = 30;
+            const verifySeats = failure === 'deadline' ? () => new Promise(() => {}) : async () => { throw Error('fixture owner unavailable'); };
+            await expect(service.handoff({verifySeats})).rejects.toThrow('Fleet continuity refused');
+            expect(service.continuityPhase).toBe('unavailable');
+            expect(service.httpServer).toBeNull();
+            expect(fs.readJsonSync(path.join(directory, 'issuer.json')).phase).toBe('active');
+            await expect(service.closeUnclean()).resolves.toBeUndefined();
+        });
+    }
+
+    test('reservation, activation and revocation are durable before they return, with hashes instead of secrets', async () => {
+        service.openJournal({directory});
+        const reservation = await service.reserve({agent: seatDefinition()});
+        const file        = path.join(directory, 'issuer.json');
+        expect(fs.readJsonSync(file).snapshot.generations[0].state).toBe('reserved');
+        service.activate({generation: reservation.generation, agentId: 'seat', plan: boundPlan(), env: START_ENV, owners: makeOwners().owners, probe: () => 'live'});
+        expect(fs.readJsonSync(file).snapshot.generations[0].state).toBe('active');
+        service.revoke('seat', 'stop-requested');
+        expect(fs.readJsonSync(file).snapshot.generations[0]).toMatchObject({state: 'revoked', reason: 'stop-requested'});
+        const raw = fs.readFileSync(file, 'utf8');
+        for (const secret of [PAT, BEARER, START_ENV.NEO_FLEET_BRIDGE_TOKEN, ...Object.values(reservation.grants)]) {
+            expect(raw).not.toContain(secret);
+        }
+        expect(raw).not.toContain('"env"');
+        expect(raw).not.toContain('"owners"');
+        const snapshot = service.admissionSnapshot();
+        expect(() => service.journal.write({...snapshot, env: {GH_TOKEN: PAT}})).toThrow(/snapshot-invalid/);
+        expect(() => service.journal.write({...snapshot, generations: [...snapshot.generations, snapshot.generations[0]]}))
+            .toThrow(/snapshot-invalid/);
+    });
+
+    test('resident redemption follows original config selection, current values and original absence without a held fallback', async () => {
+        service.openJournal({directory});
+        const binding = {version: 1, kind: 'resident-config', server: 'memory-core',
+            plane    : {id: 'original-plane', dataRoot: directory},
+            providers: {model: 'openAiCompatible', embedding: 'openAiCompatible', ask: null}};
+        const current = {binding: structuredClone(binding), env: {NEO_OPENAI_COMPATIBLE_API_KEY: 'current-fixture-key'}};
+        const input   = createResidentMcpInputOwner({binding, names: Object.keys(current.env), read: () => current});
+        const plan    = boundPlan().map(row => row.key === 'memory-core' ? {...row, target: 'resident', transport: 'stdio',
+            args              : [path.join(row.sourceRoot, row.entrypoint)],
+            requiredRuntimeEnv: [...row.requiredRuntimeEnv, 'NEO_OPENAI_COMPATIBLE_API_KEY']} : row);
+        const reservation = await activeSeat({plan, env: {...START_ENV, NEO_OPENAI_COMPATIBLE_API_KEY: 'old-fixture-key'},
+            residentInputs: {'memory-core': input}});
+        current.env.NEO_OPENAI_COMPATIBLE_API_KEY = 'rotated-fixture-key';
+        current.env.GEMINI_API_KEY = 'newly-present-fixture-key';
+        const answer = await redeem(reservation.grants['memory-core'], {server: 'memory-core'});
+        expect(answer).toMatchObject({outcome: 'admitted', env: {NEO_OPENAI_COMPATIBLE_API_KEY: 'rotated-fixture-key'}});
+        expect(answer.env).not.toHaveProperty('GEMINI_API_KEY');
+        expect(service.generations.get('seat').servers.get('memory-core').env).not.toHaveProperty('NEO_OPENAI_COMPATIBLE_API_KEY');
+        const file = path.join(directory, 'issuer.json'), snapshot = fs.readJsonSync(file).snapshot;
+        expect(snapshot.generations[0].residentBindings['memory-core']).toEqual({binding, names: ['NEO_OPENAI_COMPATIBLE_API_KEY']});
+        expect(fs.readFileSync(file, 'utf8')).not.toContain('fixture-key');
+        delete current.env.NEO_OPENAI_COMPATIBLE_API_KEY;
+        expect(await redeem(reservation.grants['memory-core'], {server: 'memory-core'})).toMatchObject({code: 'credential-missing'});
+        current.env.NEO_OPENAI_COMPATIBLE_API_KEY = 'restored-fixture-key';
+        const pending = redeem(reservation.grants['memory-core'], {server: 'memory-core'});
+        current.binding.providers.model = 'gemini';
+        expect(await pending).toMatchObject({code: 'credential-unproven'});
+        service.revoke('seat', 'stop-requested');
+        expect(service.generations.get('seat').residentInputs).toEqual({});
+        expect(fs.readJsonSync(file).snapshot.generations[0].residentBindings).toEqual(snapshot.generations[0].residentBindings);
+        snapshot.generations[0].residentBindings['memory-core'].binding.env = {GEMINI_API_KEY: 'secret'};
+        expect(() => service.journal.write(snapshot)).toThrow(/snapshot-invalid/);
+    });
+
+    test('concurrent Bridge redemptions prove their own captured port and never share a proof across ports', async () => {
+        const binding = {version: 1, kind: 'resident-config', server: 'neural-link',
+            plane: {id: 'original-plane', dataRoot: directory}, providers: {model: null, embedding: null, ask: null}};
+        const current  = {binding, env: {NEO_NL_PORT: '12345'}};
+        const input    = createResidentMcpInputOwner({binding, names: ['NEO_NL_PORT'], read: () => current});
+        const enteredA = deferred(), enteredB = deferred(), finishA = deferred(), finishB = deferred(), ports = [];
+        const bridge   = {credential: 'bridge-token', resolve: () => 'same-fresh-token', prove: (value, {port}) => {
+            ports.push(port);
+            if (port === 12345) { enteredA.resolve(); return finishA.promise; }
+            enteredB.resolve(); return finishB.promise;
+        }};
+        const reservation = await activeSeat({env: {...START_ENV, NEO_NL_PORT: '12345'},
+            owners: {NEO_FLEET_BRIDGE_TOKEN: bridge}, residentInputs: {'neural-link': input}});
+        const a = redeem(reservation.grants['neural-link'], {server: 'neural-link'});
+        await enteredA.promise;
+        current.env.NEO_NL_PORT = '23456';
+        const b = redeem(reservation.grants['neural-link'], {server: 'neural-link'});
+        await enteredB.promise;
+        finishA.resolve({verdict: 'proved'});
+        finishB.resolve({verdict: 'refused'});
+        expect(await a).toMatchObject({outcome: 'admitted', env: {NEO_NL_PORT: '12345', NEO_FLEET_BRIDGE_TOKEN: 'same-fresh-token'}});
+        expect(await b).toMatchObject({outcome: 'refused', code: 'credential-unproven', reason: 'bridge-token'});
+        expect(ports).toEqual([12345, 23456]);
+        expect(service.generations.get('seat').servers.get('neural-link').env).not.toHaveProperty('NEO_FLEET_BRIDGE_TOKEN');
+    });
+
+    test('original credential ownership survives revocation without persisting credential values', async () => {
+        service.openJournal({directory});
+        const agent = seatDefinition(), registry = {getDataDir: () => directory,
+            getDefinition: () => agent, resolveCredential: () => PAT};
+        const owner       = createSeatPatOwner({registry, agent, proveForgeAccount: async () => ({verdict: 'proved'})});
+        const reservation = await activeSeat({owners: {...makeOwners().owners, GH_TOKEN: owner}});
+        const file        = path.join(directory, 'issuer.json');
+        expect(fs.readJsonSync(file).snapshot.generations[0].credentialBindings).toEqual({GH_TOKEN: owner.binding});
+        service.revoke('seat', 'stop-requested');
+        const snapshot = fs.readJsonSync(file).snapshot;
+        expect(snapshot.generations[0]).toMatchObject({state: 'revoked', credentialBindings: {GH_TOKEN: owner.binding}});
+        expect(service.generations.get('seat').owners).toEqual({});
+        for (const secret of [PAT, BEARER, ...Object.values(reservation.grants)]) {
+            expect(fs.readFileSync(file, 'utf8')).not.toContain(secret);
+        }
+        for (const change of [{credential: PAT}, {agentId: 'another-seat'}, {identity: 'another-login'}]) {
+            const invalid = structuredClone(snapshot);
+            Object.assign(invalid.generations[0].credentialBindings.GH_TOKEN, change);
+            expect(() => service.journal.write(invalid)).toThrow(/snapshot-invalid/);
+        }
+    });
+
+    test('old and new Starts keep distinct durable runtimes and signed admission roots', async () => {
+        service.openJournal({directory});
+        for (const letter of ['a', 'b']) {
+            const id      = letter.repeat(64), runtimeDirectory = path.join(directory, id);
+            const runtime = {id, directory: runtimeDirectory, payloadDigest: 'c'.repeat(64),
+                runtimeRoot: path.join(runtimeDirectory, 'host.runtime/organism'),
+                executable : path.join(runtimeDirectory, 'host.runtime/node')};
+            const before = service.generations.size;
+            await expect(service.reserve({agent: seatDefinition({id: letter}), runtimeGeneration: runtime})).rejects.toThrow(/not guarded/);
+            expect(service.generations.size).toBe(before);
+            const reservation = await reserveWithRuntimeReferences({agent: seatDefinition({id: letter}), runtimeGeneration: runtime});
+            const plan        = boundPlan({root: runtime.runtimeRoot}).map(row => ({...row, command: runtime.executable}));
+            expect(() => service.activate({generation: reservation.generation, agentId: letter,
+                plan: plan.map(row => ({...row, command: process.execPath})), env: START_ENV, owners: makeOwners().owners, probe: () => 'live'}))
+                .toThrow(/do not bind the reserved runtime/);
+            service.activate({generation: reservation.generation, agentId: letter, plan,
+                env: START_ENV, owners: makeOwners().owners, probe: () => 'live'});
+            const answer = await redeem(reservation.grants['memory-core'], {server: 'memory-core'});
+            expect(answer).toMatchObject({outcome: 'admitted', generationRoot: runtime.runtimeRoot});
+            expect(service.statusOf(letter).recent.at(-1).generationRoot).toBe(runtime.runtimeRoot);
+        }
+        const snapshot = fs.readJsonSync(path.join(directory, 'issuer.json')).snapshot;
+        expect(snapshot.version).toBe(7);
+        expect(snapshot.generations.map(row => row.runtime.id)).toEqual(['a'.repeat(64), 'b'.repeat(64)]);
+        expect(snapshot.generations.every(row => row.state === 'active')).toBe(true);
+        const extraSecret = structuredClone(snapshot);
+        extraSecret.generations[0].runtime.env = {GH_TOKEN: PAT};
+        expect(() => service.journal.write(extraSecret)).toThrow(/snapshot-invalid/);
+    });
+
+    test('a lost revocation write freezes admission and makes clean handoff impossible', async () => {
+        let fail = false;
+        service.openJournal({directory, writeAtomic: (file, source, options) => {
+            if (fail) throw Error('fixture lost write');
+            return writeFileAtomicSync(file, source, options);
+        }});
+        const reservation = await activeSeat();
+        fail = true;
+        expect(() => service.revoke('seat', 'stop-requested')).toThrow(/durability-failed/);
+        expect(await redeem(reservation.grants['memory-core'], {server: 'memory-core'}))
+            .toMatchObject({outcome: 'refused', code: 'issuer-unavailable', reason: 'durability-failed'});
+        expect(() => service.journal.handoff(service.admissionSnapshot(), reservation.issuer)).toThrow(/durability-failed/);
+        expect(fs.readJsonSync(path.join(directory, 'issuer.json')).snapshot.generations[0].state).toBe('active');
+    });
+
+    test('a failed activation cannot publish a successful Start or admit a waiting child', async () => {
+        let fail = false;
+        service.openJournal({directory, writeAtomic: (file, source, options) => {
+            if (fail) throw Error('fixture activation failure');
+            return writeFileAtomicSync(file, source, options);
+        }});
+        const reservation = await service.reserve({agent: seatDefinition()});
+        const pending     = redeem(reservation.grants['memory-core'], {server: 'memory-core'});
+        await expect.poll(() => service.generations.get('seat').waiters.size).toBe(1);
+        fail = true;
+        expect(() => service.activate({generation: reservation.generation, agentId: 'seat', plan: boundPlan(), env: START_ENV, owners: makeOwners().owners, probe: () => 'live'}))
+            .toThrow(/durability-failed/);
+        expect(await pending).toMatchObject({outcome: 'refused'});
+        expect(service.statusOf('seat')).toMatchObject({state: 'stale', reason: 'durability-failed'});
+        expect(fs.readJsonSync(path.join(directory, 'issuer.json')).snapshot.generations[0].state).toBe('reserved');
+    });
+
+    test('a durability loss during credential proof cannot be overtaken by the proof completing', async () => {
+        let fail = false;
+        service.openJournal({directory, writeAtomic: (file, source, options) => {
+            if (fail) throw Error('fixture proof race');
+            return writeFileAtomicSync(file, source, options);
+        }});
+        const entered     = deferred(), finish = deferred();
+        const owners      = makeOwners({proves: () => { entered.resolve(); return finish.promise; }});
+        const reservation = await activeSeat({owners: owners.owners});
+        const pending     = redeem(reservation.grants['memory-core'], {server: 'memory-core'});
+        await entered.promise;
+        fail = true;
+        expect(() => service.revoke('seat', 'stop-requested')).toThrow(/durability-failed/);
+        finish.resolve(true);
+        expect(await pending).toMatchObject({outcome: 'refused', code: 'issuer-unavailable'});
+    });
+
+    test('loss of journal ownership refuses before the final signed admission', async () => {
+        service.openJournal({directory});
+        const reservation = await activeSeat();
+        const file        = path.join(directory, 'issuer.lock'), lock = fs.readJsonSync(file);
+        fs.writeJsonSync(file, {...lock, ownerToken: crypto.randomUUID()});
+        expect(await redeem(reservation.grants['memory-core'], {server: 'memory-core'}))
+            .toMatchObject({outcome: 'refused', code: 'issuer-unavailable'});
+        expect(service.statusOf('seat')).toMatchObject({state: 'stale', reason: 'durability-failed'});
+    });
 });
 
 test.describe('McpLaunchAdmissionService — a generation\'s grants', () => {
@@ -154,19 +615,22 @@ test.describe('McpLaunchAdmissionService — a generation\'s grants', () => {
         const mc = await redeem(reservation.grants['memory-core'], {server: 'memory-core'});
 
         expect(mc).toEqual({
-            outcome: 'admitted',
-            env    : {NEO_MCP_REMOTE_TOKEN: BEARER},
-            args   : ['/installed/neo/ai/mcp/client/stdioToStreamableHttp.mjs', '--url', 'https://plane.example.test/mc/mcp', '--token-env', 'NEO_MCP_REMOTE_TOKEN']
+            outcome       : 'admitted',
+            generationRoot: '/installed/neo',
+            env           : {NEO_MCP_REMOTE_TOKEN: BEARER},
+            args          : ['/installed/neo/ai/mcp/client/stdioToStreamableHttp.mjs', '--url', 'https://plane.example.test/mc/mcp', '--token-env', 'NEO_MCP_REMOTE_TOKEN']
         });
         expect(await redeem(reservation.grants['github-workflow'], {server: 'github-workflow'})).toEqual({
-            outcome: 'admitted',
-            env    : {GH_TOKEN: PAT},
-            args   : ['/installed/neo/ai/mcp/server/github-workflow/mcp-server.mjs']
+            outcome       : 'admitted',
+            generationRoot: '/installed/neo',
+            env           : {GH_TOKEN: PAT},
+            args          : ['/installed/neo/ai/mcp/server/github-workflow/mcp-server.mjs']
         });
         expect(await redeem(reservation.grants['neural-link'], {server: 'neural-link'})).toEqual({
-            outcome: 'admitted',
-            env    : {NEO_FLEET_BRIDGE_TOKEN: 'bridge-fixture-token'},
-            args   : ['/installed/neo/ai/mcp/server/neural-link/mcp-server.mjs', '--cwd', '/installed/neo']
+            outcome       : 'admitted',
+            generationRoot: '/installed/neo',
+            env           : {NEO_FLEET_BRIDGE_TOKEN: 'bridge-fixture-token'},
+            args          : ['/installed/neo/ai/mcp/server/neural-link/mcp-server.mjs', '--cwd', '/installed/neo']
         })
     });
 
@@ -199,7 +663,7 @@ test.describe('McpLaunchAdmissionService — a generation\'s grants', () => {
 
         expect(recent).toHaveLength(service.auditLimit);
         expect(recent.every(entry => entry.server === 'neural-link')).toBe(true);
-        expect(Object.keys(recent[0]).sort()).toEqual(['at', 'code', 'outcome', 'reason', 'server']);
+        expect(Object.keys(recent[0]).sort()).toEqual(['at', 'code', 'generationRoot', 'outcome', 'reason', 'server']);
         expect(JSON.stringify(recent)).not.toContain('bridge-fixture-token')
     });
 

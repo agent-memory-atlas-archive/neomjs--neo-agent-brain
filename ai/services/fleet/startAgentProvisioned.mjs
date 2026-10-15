@@ -1,22 +1,25 @@
-import {REMOTE_MCP_CREDENTIAL_ENV_VAR}                          from './mcpServers.mjs';
-import {ensureAgentRepo, ensureAgentRepos}                      from './ensureAgentRepo.mjs';
-import {installSeatDependencies}                                from './installAgentRepoDependencies.mjs';
-import {LAUNCH_ADMISSION_CREDENTIALS, LAUNCH_ADMISSION_REASONS} from '../../../src/fleet/contract/launchAdmission.mjs';
-import {launchRefusalOf}                                        from '../../../src/fleet/contract/launchAuthority.mjs';
-import {prepareManagedAgentWorkspace}                           from './prepareManagedAgentWorkspace.mjs';
-import {resolveSeatPlaneTarget}                                 from './resolveSeatPlaneTarget.mjs';
-import {importSeatMemory, MEMORY_IMPORT_NONE}                   from './seatMemoryImport.mjs';
+import {REMOTE_MCP_CREDENTIAL_ENV_VAR}     from './mcpServers.mjs';
+import {ensureAgentRepo, ensureAgentRepos} from './ensureAgentRepo.mjs';
+import {installSeatDependencies}           from './installAgentRepoDependencies.mjs';
+import {LAUNCH_ADMISSION_REASONS}          from '../../../src/fleet/contract/launchAdmission.mjs';
+import {createSeatPatOwner, createSeatPlaneOwner, createTenantBearerOwner, servedPlaneBinding, tenantProvesSeat}
+    from './launchCredentialOwners.mjs';
+import {launchRefusalOf}                      from '../../../src/fleet/contract/launchAuthority.mjs';
+import {prepareManagedAgentWorkspace}         from './prepareManagedAgentWorkspace.mjs';
+import {resolveSeatPlaneTarget}               from './resolveSeatPlaneTarget.mjs';
+import {importSeatMemory, MEMORY_IMPORT_NONE} from './seatMemoryImport.mjs';
 import {
     convergeSeatGitIdentity,
     proveSeatForgeAccount,
     resolveSeatGitIdentity
 }                                                        from './seatGitIdentity.mjs';
-import {readSeatModelCatalog, unofferedDeclaration} from './seatModelCatalog.mjs';
-import {bindAntigravityProject} from './antigravityProjectBinding.mjs';
-import {probeAntigravityRuntime, verifyAntigravityProfileListener} from './probeAntigravityRuntime.mjs';
-import {excludeManagedWorkspaceFiles} from './excludeManagedWorkspaceFiles.mjs';
-import path                                         from 'node:path';
-import {fileURLToPath}                              from 'node:url';
+import {readSeatModelCatalog, unofferedDeclaration}                            from './seatModelCatalog.mjs';
+import {bindAntigravityProject}                                                from './antigravityProjectBinding.mjs';
+import {probeAntigravityRuntime, verifyAntigravityProfileListener}             from './probeAntigravityRuntime.mjs';
+import {excludeManagedWorkspaceFiles}                                          from './excludeManagedWorkspaceFiles.mjs';
+import {assertRuntimeGenerationReferences, waitForRuntimeGenerationReferences} from './runtimeGenerationLease.mjs';
+import path                                                                    from 'node:path';
+import {fileURLToPath}                                                         from 'node:url';
 
 const DEFAULT_AGENTOS_RUNTIME_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -41,21 +44,7 @@ function expectedAgentIdentity(agent) {
 }
 
 /**
- * @summary Whether a tenant's readiness proves the seat's plane credential: both of its resources answer, and
- * the Memory Core names the seat.
- * @param {Object|null} readiness What `FleetTenantService.probeSeatCredential` answered.
- * @param {String} expectedIdentity The seat's canonical `@login`.
- * @returns {Boolean}
- * @private
- */
-function tenantProvesSeat(readiness, expectedIdentity) {
-    return Boolean(readiness?.ok &&
-        readiness.resources?.['memory-core']?.ok &&
-        readiness.resources['memory-core'].identity === expectedIdentity &&
-        readiness.resources?.['knowledge-base']?.ok)
-}
-
-/** @summary Admit only the exact selected Antigravity profile/runtime context returned by the lifecycle. @private */
+ * @summary Admit only the exact selected Antigravity profile/runtime context returned by the lifecycle. @private */
 function validAntigravityStartContext(context) {
     const capability = context?.capability;
 
@@ -206,6 +195,7 @@ async function spawnPermitted({lifecycleService, registry, agentId, startOptions
  *                                                 spawn checks the registry alone.
  * @param {Function} [options.excludeWorkspaceFiles] Local Git exclusion writer for Antigravity artifacts; test seam.
  * @param {Function} [options.bindProject] Curated Antigravity project binder; test seam.
+ * @param {Function} [options.acquireRuntimeReferences] Existing runtime-parent lease acquisition; test seam.
  * @param {Function} [options.probeAntigravityRuntimeFn] Re-probe seam for the selected Antigravity binary.
  * @param {Object}   [options.tenantService]     Remote tenant authority. Lazily imports the real
  *                                              singleton only for an opted-in remote seat.
@@ -218,7 +208,8 @@ async function spawnPermitted({lifecycleService, registry, agentId, startOptions
  *                                              service's config-resolved `getInstanceRoot()` value.
  * @param {String}   [options.agentosRuntimeRoot] Installed AgentOS runtime root; defaults to the
  *                                                package root containing this composer.
- * @param {String}   [options.nodePath]         Node executable override for generated MCP definitions.
+ * @param {String}   [options.nodePath]         Node executable override in checkout mode. Packaged
+ *     preparation uses the verified Fleet boot runtime; disagreeing root or executable overrides refuse.
  * @returns {Promise<Object>} the agent's lifecycle status (see `FleetLifecycleService.status`). A prepared
  *   seat's status also carries `seatInstructions`, the preparer's decision about its instructions file,
  *   so whoever starts the seat sees why it got, kept or lost one, and an adopted seat `memoryImport`
@@ -286,13 +277,14 @@ async function provisionAgent({
     readModelCatalog = readSeatModelCatalog,
     excludeWorkspaceFiles = excludeManagedWorkspaceFiles,
     bindProject = bindAntigravityProject,
+    acquireRuntimeReferences = waitForRuntimeGenerationReferences,
     probeAntigravityRuntimeFn = probeAntigravityRuntime,
     readParticipation = null,
     tenantService = null,
     admissionMark = null,
     startSignal,
     instanceRoot,
-    agentosRuntimeRoot = DEFAULT_AGENTOS_RUNTIME_ROOT,
+    agentosRuntimeRoot,
     nodePath
 } = {}) {
     if (!lifecycleService) throw new Error("startAgentProvisioned: 'lifecycleService' is required.");
@@ -302,6 +294,18 @@ async function provisionAgent({
     // idempotent while running, but provisioning ahead of it would be a pointless git inspection on an
     // agent that is already up.
     if (lifecycleService.isRunning(agentId)) return lifecycleService.status(agentId);
+
+    const installedRuntime = lifecycleService.installedRuntime;
+    if (installedRuntime) {
+        if ((agentosRuntimeRoot !== undefined && agentosRuntimeRoot !== installedRuntime.runtimeRoot) ||
+            (nodePath !== undefined && nodePath !== installedRuntime.executable)) {
+            throw new Error('startAgentProvisioned: packaged runtime overrides disagree with the verified Fleet boot runtime.')
+        }
+        agentosRuntimeRoot = installedRuntime.runtimeRoot;
+        nodePath           = installedRuntime.executable;
+    } else {
+        if (agentosRuntimeRoot === undefined) agentosRuntimeRoot = DEFAULT_AGENTOS_RUNTIME_ROOT;
+    }
 
     const registry = lifecycleService.getRegistry(),
           agent    = registry.getDefinition?.(agentId) ?? registry.getAgent(agentId);
@@ -393,7 +397,9 @@ async function provisionAgent({
 
     // Resolve the resident child envelope and seat PAT before any checkout/config mutation.
     // The same resolved envelope names the rendered slots and supplies the eventual spawn.
-    const resolvedResidentMcpEnv = lifecycleService.resolveResidentMcpEnvironment(agent, {remote});
+    const residentInputs         = installedRuntime && desktopRows ? lifecycleService.captureResidentMcpInputs(agent, {remote}) : null;
+    const resolvedResidentMcpEnv = residentInputs?.environment ?? lifecycleService.resolveResidentMcpEnvironment(agent, {remote});
+    const patOwner               = desktopRows ? createSeatPatOwner({registry, agent, proveForgeAccount}) : null;
     const resolvedCredential     = registry.resolveCredential(agentId);
 
     // the creation test, applied to what is stored: a blank value written before the requirement
@@ -508,7 +514,8 @@ async function provisionAgent({
         const readiness        = await activeTenantService.probeSeatCredential({
             tenantId  : target.tenantId,
             credential: resolvedMcpCredential,
-            expectedIdentity
+            expectedIdentity,
+            ...(installedRuntime && desktopRows ? {servedPlane: true} : {})
         });
         startSignal.throwIfAborted();
 
@@ -516,17 +523,10 @@ async function provisionAgent({
             throw new Error(`startAgentProvisioned: remote MCP credential readiness failed for agent '${agentId}'.`)
         }
 
-        planeOwner = {
-            credential: LAUNCH_ADMISSION_CREDENTIALS.PLANE_BEARER,
-            resolve   : () => activeTenantService.resolveMcpCredential(target.tenantId),
-            prove     : async (credential, {signal} = {}) => {
-                const proof = await activeTenantService.probeSeatCredential({tenantId: target.tenantId, credential, expectedIdentity, signal});
-                return {
-                    verdict: proof?.verdict === 'unanswered' ? 'unanswered'
-                        : tenantProvesSeat(proof, expectedIdentity) ? 'proved' : 'refused'
-                }
-            }
-        }
+        const provenPlane = servedPlaneBinding(readiness);
+        if (installedRuntime && desktopRows && !provenPlane) throw new Error('startAgentProvisioned: the tenant did not prove one original plane for runtime recovery.');
+        if (desktopRows) planeOwner = createTenantBearerOwner({tenantService: activeTenantService, agentId, tenantId: target.tenantId,
+            endpoint: remotePlan.endpoint, expectedIdentity, provenPlane});
     } else if (placement?.kind === 'plane') {
         const
             expectedIdentity = expectedAgentIdentity(agent),
@@ -578,11 +578,8 @@ async function provisionAgent({
         // proved against the plane this Start met, so a binding moved to another plane does not carry over
         const provenPlane = stored.plane;
 
-        planeOwner = {
-            credential: LAUNCH_ADMISSION_CREDENTIALS.PLANE_BEARER,
-            resolve   : () => activeTenantService.resolveSeatPlaneCredential(storedArgs)?.credential ?? null,
-            prove     : (credential, {signal} = {}) => activeTenantService.probeSeatPlaneCredential({planeBase: placement.endpoint, credential, expectedIdentity, expectedPlane: provenPlane, signal})
-        }
+        if (desktopRows) planeOwner = createSeatPlaneOwner({tenantService: activeTenantService, agentId,
+            planeBase: placement.endpoint, expectedIdentity, provenPlane});
     }
 
     // Ensure the checkout exists (clone-or-reuse, never clobber). A throw here propagates: the harness
@@ -668,12 +665,17 @@ async function provisionAgent({
     // A Claude Desktop seat's profile rows carry one launch grant per enabled server, reserved before the rows
     // are written. The lifecycle activates them once the seat runs and is leased; a Start that fails before
     // that revokes them, so a row written here never admits a child of a seat this Start did not launch.
-    const reservation = admission && await admission.reserve({agent, registry, since: admissionSince, startSignal});
+    const runtimeReferenceGuard = installedRuntime
+        ? await acquireRuntimeReferences({directory: path.dirname(installedRuntime.generation.directory), signal: startSignal})
+        : null;
 
-    let prepared, memory, status;
+    let reservation, prepared, memory, status;
 
     try {
         startSignal.throwIfAborted();
+        if (installedRuntime) assertRuntimeGenerationReferences(runtimeReferenceGuard, path.dirname(installedRuntime.generation.directory));
+        reservation = admission && await admission.reserve({agent, registry, since: admissionSince, startSignal,
+            runtimeGeneration: installedRuntime?.generation ?? null, runtimeReferenceGuard});
         // Import before create-only birth files: the adopted seat's own notes take precedence.
         memory = await importMemory({agent, instanceRoot: seatInstanceRoot});
         startSignal.throwIfAborted();
@@ -689,10 +691,10 @@ async function provisionAgent({
             residentMcpEnv     : resolvedResidentMcpEnv,
             remoteMcpCapability: remoteCapability,
             ...(antigravityStartContext ? {antigravityStart: {
-                capability: antigravityStartContext.capability,
+                capability        : antigravityStartContext.capability,
                 processEnvironment: antigravityStartContext.processEnvironment,
-                registryDirectory: antigravityStartContext.registryDirectory,
-                exclusion: antigravityExclusion
+                registryDirectory : antigravityStartContext.registryDirectory,
+                exclusion         : antigravityExclusion
             }} : {}),
             // the plan's remote kind, whether a connected tenant or the Fleet's plane serves MC and KB
             mcpTarget          : remotePlan && {
@@ -709,6 +711,10 @@ async function provisionAgent({
             prepared.targetRepoRoot !== targetRepoRoot ||
             prepared.agentosRuntimeRoot !== path.resolve(agentosRuntimeRoot)) {
             throw new Error(`startAgentProvisioned: preparation did not return the exact AgentOS runtime and target repo roots for agent '${agentId}'.`);
+        }
+        if (installedRuntime && (!Array.isArray(prepared.mcpPlan) || prepared.mcpPlan.some(row =>
+            row.command !== nodePath || row.sourceRoot !== agentosRuntimeRoot))) {
+            throw new Error('startAgentProvisioned: prepared MCP commands do not bind the verified Fleet boot runtime.')
         }
 
         if (antigravityStartContext && (prepared.antigravityProject?.name !== agent.id ||
@@ -742,15 +748,15 @@ async function provisionAgent({
             }
 
             const capability = antigravityStartContext.capability,
-                  project = prepared.antigravityProject;
+                  project    = prepared.antigravityProject;
 
             return bindProject({
-                profileDirectory: descriptor.instanceHome,
-                expectedProcess: {pid: descriptor.pid, startedAt: descriptor.pidStartedAt},
+                profileDirectory      : descriptor.instanceHome,
+                expectedProcess       : {pid: descriptor.pid, startedAt: descriptor.pidStartedAt},
                 project,
-                registryDirectory: antigravityStartContext.registryDirectory,
-                signal: startSignal,
-                verifyProfileListener: verifyAntigravityProfileListener,
+                registryDirectory     : antigravityStartContext.registryDirectory,
+                signal                : startSignal,
+                verifyProfileListener : verifyAntigravityProfileListener,
                 verifyNativeCapability: async ({profileDirectory, project: selected, registeredProjectProof, browserProduct}) => {
                     const current = await probeAntigravityRuntimeFn({selectedBinaryPath: capability.binaryPath});
 
@@ -769,10 +775,10 @@ async function provisionAgent({
                     }
 
                     return {
-                        verified: true,
-                        projectId: project.id,
-                        projectName: project.name,
-                        projectRoot: project.root,
+                        verified         : true,
+                        projectId        : project.id,
+                        projectName      : project.name,
+                        projectRoot      : project.root,
                         browserProduct,
                         capabilityVersion: `${current.fingerprints.shortVersion}:${current.fingerprints.appAsarSha256}`
                     }
@@ -791,6 +797,7 @@ async function provisionAgent({
                 resolvedCredential,
                 resolvedResidentMcpEnv,
                 gitIdentity: commitIdentity,
+                ...(installedRuntime ? {runtimeGeneration: installedRuntime.generation, runtimePlan: prepared.mcpPlan, runtimeReferenceGuard} : {}),
                 ...(remote
                     ? {resolvedMcpCredential, resolvedMcpEndpoint: remotePlan.endpoint, remoteMcpCapability: remoteCapability}
                     : antigravityStartContext ? {remoteMcpCapability: remoteCapability} : {}),
@@ -799,12 +806,10 @@ async function provisionAgent({
                 ...(reservation ? {launchAdmission: {
                     generation: reservation.generation,
                     plan      : prepared.mcpPlan,
+                    ...(prepared.launchAdmissionBinding ? {profile: prepared.launchAdmissionBinding} : {}),
+                    ...(residentInputs ? {residentInputs: residentInputs.owners} : {}),
                     owners    : {
-                        pat: {
-                            credential: LAUNCH_ADMISSION_CREDENTIALS.SEAT_PAT,
-                            resolve   : () => registry.resolveCredential(agentId),
-                            prove     : (credential, {signal} = {}) => proveForgeAccount({agent, credential, signal})
-                        },
+                        pat: patOwner,
                         ...(planeOwner ? {plane: planeOwner} : {})
                     }
                 }} : {})
@@ -813,6 +818,8 @@ async function provisionAgent({
     } catch (error) {
         reservation && admission.revoke(agentId, startSignal.aborted ? LAUNCH_ADMISSION_REASONS.STOP_REQUESTED : LAUNCH_ADMISSION_REASONS.START_FAILED, {generation: reservation.generation});
         throw error
+    } finally {
+        runtimeReferenceGuard?.release();
     }
 
     // the answer reaches whoever pressed Start; the launch record keeps it for every later read

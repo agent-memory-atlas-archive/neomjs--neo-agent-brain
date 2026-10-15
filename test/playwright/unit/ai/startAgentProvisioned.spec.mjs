@@ -1,22 +1,36 @@
-import {test, expect}                              from '@playwright/test';
-import fs                                          from 'node:fs/promises';
-import os                                          from 'node:os';
-import path                                        from 'node:path';
-import {importSeatMemory}                          from '../../../../ai/services/fleet/seatMemoryImport.mjs';
-import {CREDENTIAL_FAMILIES}                       from '../../../../ai/services/fleet/redactCredentials.mjs';
-import {LAUNCHABLE_HARNESS_TYPES, deriveCodexHome} from '../../../../ai/services/fleet/deriveHarnessLaunchSpec.mjs';
-import {deriveAgentInstanceHome}                   from '../../../../ai/services/fleet/deriveAgentInstanceHome.mjs';
-import {readCodexModelCatalog}                     from '../../../../ai/services/fleet/codexModelCatalog.mjs';
-import {createManagedAgentWorkspacePlan}           from '../../../../ai/services/fleet/managedAgentWorkspacePlan.mjs';
-import {startAgentProvisioned as startProvisioned} from '../../../../ai/services/fleet/startAgentProvisioned.mjs';
-import {resolveSeatGitIdentity}                    from '../../../../ai/services/fleet/seatGitIdentity.mjs';
-import {supportsTenantMcpTarget}                   from '../../../../src/fleet/contract/harnessTypes.mjs';
+import {test, expect}                                                        from '@playwright/test';
+import fs                                                                    from 'node:fs/promises';
+import os                                                                    from 'node:os';
+import path                                                                  from 'node:path';
+import {importSeatMemory}                                                    from '../../../../ai/services/fleet/seatMemoryImport.mjs';
+import {CREDENTIAL_FAMILIES}                                                 from '../../../../ai/services/fleet/redactCredentials.mjs';
+import {LAUNCHABLE_HARNESS_TYPES, deriveCodexHome}                           from '../../../../ai/services/fleet/deriveHarnessLaunchSpec.mjs';
+import {deriveAgentInstanceHome}                                             from '../../../../ai/services/fleet/deriveAgentInstanceHome.mjs';
+import {readCodexModelCatalog}                                               from '../../../../ai/services/fleet/codexModelCatalog.mjs';
+import {createManagedAgentWorkspacePlan}                                     from '../../../../ai/services/fleet/managedAgentWorkspacePlan.mjs';
+import {startAgentProvisioned as startProvisioned}                           from '../../../../ai/services/fleet/startAgentProvisioned.mjs';
+import {resolveSeatGitIdentity}                                              from '../../../../ai/services/fleet/seatGitIdentity.mjs';
+import {supportsTenantMcpTarget}                                             from '../../../../src/fleet/contract/harnessTypes.mjs';
+import {holdRuntimeGenerationReferences, waitForRuntimeGenerationReferences} from '../../../../ai/services/fleet/runtimeGenerationLease.mjs';
+
+const runtimeRoots = new Set();
+/** @summary Supplies real disposable lease custody while runtime execution itself remains stubbed. */
+async function runtimeFixture() {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'provisioned-runtime-')));
+    runtimeRoots.add(root);
+    const directory = path.join(root, 'generation');
+    return {directory, runtimeRoot: path.join(directory, 'organism'), executable: path.join(directory, 'host')};
+}
+test.afterEach(async () => {
+    for (const root of runtimeRoots) await fs.rm(root, {recursive: true, force: true});
+    runtimeRoots.clear();
+});
 
 /** The Git identity a fixture seat resolves to unless a case says otherwise. */
-const SEAT_GIT_IDENTITY = {state: 'derived', source: 'verified-primary', name: 'Seat Agent', email: 'seat@example.test'};
+const SEAT_GIT_IDENTITY           = {state: 'derived', source: 'verified-primary', name: 'Seat Agent', email: 'seat@example.test'};
 const ANTIGRAVITY_RUNTIME_FIXTURE = Object.freeze({
-    platform: 'darwin', architecture: 'arm64', bundleId: 'com.google.antigravity',
-    shortVersion: '2.24.1', buildVersion: '2.24.1',
+    platform     : 'darwin', architecture: 'arm64', bundleId: 'com.google.antigravity',
+    shortVersion : '2.24.1', buildVersion: '2.24.1',
     appAsarSha256: 'a'.repeat(64), languageServerSha256: 'b'.repeat(64)
 });
 
@@ -27,10 +41,10 @@ const ANTIGRAVITY_RUNTIME_FIXTURE = Object.freeze({
  */
 function startAgentProvisioned(options) {
     return startProvisioned({
-        resolveGitIdentity : async () => SEAT_GIT_IDENTITY,
-        convergeGitIdentity: async () => ({state: 'converged', scope: 'local', action: 'kept'}),
-        installDependencies: async ({checkouts}) => checkouts.map(({repoSlug}) => ({repoSlug, state: 'present'})),
-        importMemory       : async () => ({state: 'none'}),
+        resolveGitIdentity   : async () => SEAT_GIT_IDENTITY,
+        convergeGitIdentity  : async () => ({state: 'converged', scope: 'local', action: 'kept'}),
+        installDependencies  : async ({checkouts}) => checkouts.map(({repoSlug}) => ({repoSlug, state: 'present'})),
+        importMemory         : async () => ({state: 'none'}),
         excludeWorkspaceFiles: ({targetRepoRoot}) => ({repoRoot: targetRepoRoot, paths: [], verified: true}),
         ...options
     })
@@ -91,6 +105,7 @@ function makeLifecycle({
         isRunning          : id => !!running[id],
         status             : id => { calls.status.push(id); return {id, running: !!running[id], state: running[id] ? 'running' : 'stopped'}; },
         getRegistry        : () => ({
+            getDataDir       : () => os.tmpdir(),
             getAgent         : id => agents[id] || null,
             getDefinition    : id => definitions[id] || null,
             resolveCredential: id => {
@@ -106,13 +121,13 @@ function makeLifecycle({
             calls.antigravityContext.push(agent.id);
             return antigravityContext ?? {
                 capability: {
-                    harnessType: 'antigravity',
-                    binaryPath: '/Applications/Antigravity.app/Contents/MacOS/Antigravity',
+                    harnessType     : 'antigravity',
+                    binaryPath      : '/Applications/Antigravity.app/Contents/MacOS/Antigravity',
                     launchBinaryPath: '/Applications/Antigravity.app/Contents/MacOS/Antigravity',
-                    nativeRuntime: {available: true, binaryPath: '/Applications/Antigravity.app/Contents/MacOS/Antigravity', fingerprints: ANTIGRAVITY_RUNTIME_FIXTURE}
+                    nativeRuntime   : {available: true, binaryPath: '/Applications/Antigravity.app/Contents/MacOS/Antigravity', fingerprints: ANTIGRAVITY_RUNTIME_FIXTURE}
                 },
                 processEnvironment: {HOME: '/instances/seat', PATH: '/usr/bin'},
-                registryDirectory: '/native/config/projects'
+                registryDirectory : '/native/config/projects'
             }
         },
         getInstanceRoot          : () => '/instances',
@@ -140,10 +155,11 @@ function makeLifecycle({
             return {harnessType: args.agent.harnessType, inspected: true}
         },
         resolveResidentMcpEnvironment: () => ({}),
-        setRepoOutcomes              : (id, repos, launch) => { calls.repoOutcomes.push({id, repos, launch}); return true },
-        setPendingDependencies       : (id, signal, rows) => { calls.pendingDependencies.push({id, signal, rows}); return true },
-        setGitIdentity               : (id, gitIdentity) => { calls.gitIdentity.push({id, gitIdentity}); return true },
-        start                        : (id, opts) => {
+        captureResidentMcpInputs(agent, options) { return {environment: this.resolveResidentMcpEnvironment(agent, options), owners: {}}; },
+        setRepoOutcomes       : (id, repos, launch) => { calls.repoOutcomes.push({id, repos, launch}); return true },
+        setPendingDependencies: (id, signal, rows) => { calls.pendingDependencies.push({id, signal, rows}); return true },
+        setGitIdentity        : (id, gitIdentity) => { calls.gitIdentity.push({id, gitIdentity}); return true },
+        start                 : (id, opts) => {
             events?.push('start');
             calls.start.push({id, opts});
             return startHandler ? startHandler(id, opts) : {id, running: true, state: 'running', cwd: opts?.cwd, pid: 4242, startedAt: '2026-10-01T20:00:00.000Z'}
@@ -171,7 +187,7 @@ function buildPreparedMcpPlan(args, mcpMatrix) {
             transport       : resource ? 'streamable-http' : 'stdio',
             url             : resource?.url || null,
             credentialEnvVar: resource ? 'NEO_MCP_REMOTE_TOKEN' : null,
-            command         : '/usr/bin/node',
+            command         : args.nodePath ?? '/usr/bin/node',
             sourceRoot      : args.agentosRuntimeRoot,
             args            : [
                 `${args.agentosRuntimeRoot}/ai/mcp/server/${key}/mcp-server.mjs`,
@@ -253,6 +269,7 @@ function makeTenantService({
 
     return {
         calls,
+        getDataDir: () => os.tmpdir(),
         resolveMcpResources(tenantId) {
             events?.push('resolve-tenant');
             calls.resolve.push(tenantId);
@@ -286,6 +303,67 @@ function makeTenantService({
 }
 
 test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning)', () => {
+    test('Stop while waiting for runtime exclusion prevents later preparation and spawn', async () => {
+        const lifecycle  = makeLifecycle({agents: repoAgent('a')}), prepare = makePrepareWorkspace();
+        const generation = await runtimeFixture(), abort = new AbortController();
+        lifecycle.installedRuntime = {...generation, generation};
+        const held = holdRuntimeGenerationReferences({directory: path.dirname(generation.directory)});
+        let observed;
+        const waiting = new Promise(resolve => { observed = resolve; });
+        try {
+            const pending = startAgentProvisioned({lifecycleService: lifecycle, agentId: 'a', managedRoot: '/managed',
+                ensureRepo: makeEnsureRepo(), prepareWorkspace: prepare, startSignal: abort.signal,
+                acquireRuntimeReferences(options) { observed(); return waitForRuntimeGenerationReferences(options); }});
+            await waiting;
+            abort.abort();
+            expect(await pending).toMatchObject({canceled: true, reason: 'stop-requested'});
+            expect(prepare.calls).toHaveLength(0);
+            expect(lifecycle.calls.start).toHaveLength(0);
+            expect(lifecycle.calls.reserve).toHaveLength(0);
+            held.assertCurrent();
+        } finally { held.release(); }
+    });
+
+    test('runtime exclusion remains held through preparation and process publication', async () => {
+        const generation = await runtimeFixture(), prepare = makePrepareWorkspace(), directory = path.dirname(generation.directory);
+        const lifecycle  = makeLifecycle({agents: repoAgent('a'), startHandler: () => {
+            expect(() => holdRuntimeGenerationReferences({directory})).toThrow(/held/);
+            return {id: 'a', state: 'running', pid: 42};
+        }});
+        lifecycle.installedRuntime = {...generation, generation};
+        await startAgentProvisioned({lifecycleService: lifecycle, agentId: 'a', managedRoot: '/managed', ensureRepo: makeEnsureRepo(),
+            prepareWorkspace: async options => {
+                expect(() => holdRuntimeGenerationReferences({directory})).toThrow(/held/);
+                return prepare(options);
+            }});
+        const after = holdRuntimeGenerationReferences({directory});
+        expect(after.release()).toBe(true);
+    });
+
+    test('packaged preparation uses the verified executable and records only a prepared runtime', async () => {
+        const lifecycle  = makeLifecycle({agents: repoAgent('a')}), prepare = makePrepareWorkspace();
+        const generation = await runtimeFixture();
+        lifecycle.installedRuntime = {...generation, generation};
+        const options = {lifecycleService: lifecycle, agentId: 'a', managedRoot: '/managed',
+            ensureRepo: makeEnsureRepo(), prepareWorkspace: prepare};
+        await startAgentProvisioned(options);
+        expect(prepare.calls[0]).toMatchObject({agentosRuntimeRoot: generation.runtimeRoot, nodePath: generation.executable});
+        expect(lifecycle.calls.start[0].opts.runtimeGeneration).toBe(generation);
+
+        for (const override of [{agentosRuntimeRoot: '/other/runtime'}, {nodePath: '/usr/bin/node'}]) {
+            await expect(startAgentProvisioned({...options, ...override})).rejects.toThrow(/packaged runtime overrides disagree/);
+        }
+        expect(prepare.calls).toHaveLength(1);
+        expect(lifecycle.calls.start).toHaveLength(1);
+
+        await expect(startAgentProvisioned({...options, prepareWorkspace: async args => {
+            const prepared = await prepare(args);
+            prepared.mcpPlan[0].command = '/other/node';
+            return prepared;
+        }})).rejects.toThrow(/prepared MCP commands do not bind/);
+        expect(lifecycle.calls.start).toHaveLength(1);
+    });
+
     test('provisions the target, binds AgentOS runtime, then launches from the target root', async () => {
         const events           = [],
               lifecycle        = makeLifecycle({agents: repoAgent('a'), events}),
@@ -1043,13 +1121,13 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
 
     test('Antigravity resolves its context first, excludes before prepare, and binds the supplied project against the selected runtime', async () => {
         const
-            events = [], agents = repoAgent('seat'), targetRepoRoot = '/managed/seat/neomjs-neo',
-            project = {id: '154e7ad7-ab8c-4445-bd6b-9ac6bdddcd0f', name: 'seat', root: targetRepoRoot},
-            binaryPath = '/Applications/Antigravity.app/Contents/MacOS/Antigravity',
+            events             = [], agents = repoAgent('seat'), targetRepoRoot = '/managed/seat/neomjs-neo',
+            project            = {id: '154e7ad7-ab8c-4445-bd6b-9ac6bdddcd0f', name: 'seat', root: targetRepoRoot},
+            binaryPath         = '/Applications/Antigravity.app/Contents/MacOS/Antigravity',
             processEnvironment = {HOME: '/instances/seat', PATH: '/usr/bin'},
-            context = {
+            context            = {
                 capability: {
-                    harnessType: 'antigravity', binaryPath, launchBinaryPath: binaryPath,
+                    harnessType  : 'antigravity', binaryPath, launchBinaryPath: binaryPath,
                     nativeRuntime: {available: true, binaryPath, fingerprints: ANTIGRAVITY_RUNTIME_FIXTURE}
                 },
                 processEnvironment,
@@ -1061,7 +1139,7 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
                 agents,
                 events,
                 antigravityContext: context,
-                startHandler: async (id, opts) => {
+                startHandler      : async (id, opts) => {
                     const binding = await opts.bindAntigravityProject({
                         id, pid: 4242, pidStartedAt: 'pid-birth-4242', instanceHome: '/instances/seat',
                         cwd: targetRepoRoot, signal: opts.startSignal
@@ -1073,21 +1151,21 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
         agents.seat.harnessType = 'antigravity';
 
         const ensureRepo = makeEnsureRepo(targetRepoRoot, events), prepareWorkspace = makePrepareWorkspace(events, {antigravityProject: project}),
-              status = await startAgentProvisioned({
-                  lifecycleService: lifecycle,
-                  agentId: 'seat',
-                  managedRoot: '/managed',
+              status     = await startAgentProvisioned({
+                  lifecycleService     : lifecycle,
+                  agentId              : 'seat',
+                  managedRoot          : '/managed',
                   ensureRepo,
                   prepareWorkspace,
-                  agentosRuntimeRoot: '/installed/neo',
+                  agentosRuntimeRoot   : '/installed/neo',
                   excludeWorkspaceFiles: input => {events.push('exclude'); expect(input).toEqual({targetRepoRoot}); return exclusion},
-                  bindProject: async args => {
+                  bindProject          : async args => {
                       bindCalls.push(args);
                       return args.verifyNativeCapability({
-                          profileDirectory: '/instances/seat',
-                          project: args.project,
+                          profileDirectory      : '/instances/seat',
+                          project               : args.project,
                           registeredProjectProof: {verified: true, profileDirectory: '/instances/seat', projectId: project.id, projectName: project.name, projectRoot: project.root},
-                          browserProduct: 'Chrome/128.0.0.0'
+                          browserProduct        : 'Chrome/128.0.0.0'
                       })
                   },
                   probeAntigravityRuntimeFn: async args => {
@@ -1107,16 +1185,16 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
         });
         expect(status.binding).toMatchObject({verified: true, projectId: project.id, projectName: project.name, projectRoot: project.root});
         expect(lifecycle.calls.start[0].opts).toMatchObject({
-            cwd: targetRepoRoot,
-            remoteMcpCapability: context.capability,
+            cwd                       : targetRepoRoot,
+            remoteMcpCapability       : context.capability,
             resolvedProcessEnvironment: processEnvironment,
-            launchAdmission: {generation: 'generation-seat'}
+            launchAdmission           : {generation: 'generation-seat'}
         });
         expect(typeof lifecycle.calls.start[0].opts.bindAntigravityProject).toBe('function');
         expect(bindCalls).toHaveLength(1);
         expect(bindCalls[0]).toMatchObject({
-            profileDirectory: '/instances/seat',
-            expectedProcess: {pid: 4242, startedAt: 'pid-birth-4242'},
+            profileDirectory : '/instances/seat',
+            expectedProcess  : {pid: 4242, startedAt: 'pid-birth-4242'},
             project,
             registryDirectory: context.registryDirectory
         });
@@ -1126,22 +1204,22 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
 
     test('Antigravity refuses project binding when the selected runtime fingerprint changes during the same Start', async () => {
         const
-            agents = repoAgent('seat'), targetRepoRoot = '/managed/seat/neomjs-neo',
-            project = {id: '154e7ad7-ab8c-4445-bd6b-9ac6bdddcd0f', name: 'seat', root: targetRepoRoot},
+            agents     = repoAgent('seat'), targetRepoRoot = '/managed/seat/neomjs-neo',
+            project    = {id: '154e7ad7-ab8c-4445-bd6b-9ac6bdddcd0f', name: 'seat', root: targetRepoRoot},
             binaryPath = '/Applications/Antigravity.app/Contents/MacOS/Antigravity',
-            context = {
+            context    = {
                 capability: {
-                    harnessType: 'antigravity', binaryPath, launchBinaryPath: binaryPath,
+                    harnessType  : 'antigravity', binaryPath, launchBinaryPath: binaryPath,
                     nativeRuntime: {available: true, binaryPath, fingerprints: ANTIGRAVITY_RUNTIME_FIXTURE}
                 },
                 processEnvironment: {HOME: '/instances/seat', PATH: '/usr/bin'},
-                registryDirectory: '/native/config/projects'
+                registryDirectory : '/native/config/projects'
             },
             changedFingerprint = {...ANTIGRAVITY_RUNTIME_FIXTURE, appAsarSha256: 'c'.repeat(64)},
             bindCalls = [], lifecycle = makeLifecycle({
                 agents,
                 antigravityContext: context,
-                startHandler: async (id, opts) => ({
+                startHandler      : async (id, opts) => ({
                     id, running: true, state: 'running', cwd: opts.cwd, pid: 4242,
                     binding: await opts.bindAntigravityProject({
                         id, pid: 4242, pidStartedAt: 'pid-birth-4242', instanceHome: '/instances/seat',
@@ -1153,20 +1231,20 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
         agents.seat.harnessType = 'antigravity';
 
         const status = await startAgentProvisioned({
-            lifecycleService: lifecycle,
-            agentId: 'seat',
-            managedRoot: '/managed',
-            ensureRepo: makeEnsureRepo(targetRepoRoot),
-            prepareWorkspace: makePrepareWorkspace([], {antigravityProject: project}),
-            agentosRuntimeRoot: '/installed/neo',
+            lifecycleService     : lifecycle,
+            agentId              : 'seat',
+            managedRoot          : '/managed',
+            ensureRepo           : makeEnsureRepo(targetRepoRoot),
+            prepareWorkspace     : makePrepareWorkspace([], {antigravityProject: project}),
+            agentosRuntimeRoot   : '/installed/neo',
             excludeWorkspaceFiles: () => ({repoRoot: targetRepoRoot, verified: true}),
-            bindProject: async args => {
+            bindProject          : async args => {
                 bindCalls.push(args);
                 return args.verifyNativeCapability({
-                    profileDirectory: '/instances/seat',
-                    project: args.project,
+                    profileDirectory      : '/instances/seat',
+                    project               : args.project,
                     registeredProjectProof: {
-                        verified: true, profileDirectory: '/instances/seat',
+                        verified : true, profileDirectory: '/instances/seat',
                         projectId: project.id, projectName: project.name, projectRoot: project.root
                     },
                     browserProduct: 'Chrome/128.0.0.0'
@@ -1182,19 +1260,19 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
 
     test('Antigravity Stop during preparation revokes its reservation without invoking project binding or Start', async () => {
         const controller = new AbortController(), events = [], agents = repoAgent('seat'),
-              project = {id: '154e7ad7-ab8c-4445-bd6b-9ac6bdddcd0f', name: 'seat', root: '/managed/seat/neomjs-neo'},
-              lifecycle = makeLifecycle({agents, events}), basePrepare = makePrepareWorkspace(events, {antigravityProject: project}),
-              bindings = [];
+              project    = {id: '154e7ad7-ab8c-4445-bd6b-9ac6bdddcd0f', name: 'seat', root: '/managed/seat/neomjs-neo'},
+              lifecycle  = makeLifecycle({agents, events}), basePrepare = makePrepareWorkspace(events, {antigravityProject: project}),
+              bindings   = [];
         agents.seat.harnessType = 'antigravity';
 
         const status = await startAgentProvisioned({
-            lifecycleService: lifecycle,
-            agentId: 'seat',
-            managedRoot: '/managed',
-            startSignal: controller.signal,
-            ensureRepo: makeEnsureRepo(project.root, events),
+            lifecycleService     : lifecycle,
+            agentId              : 'seat',
+            managedRoot          : '/managed',
+            startSignal          : controller.signal,
+            ensureRepo           : makeEnsureRepo(project.root, events),
             excludeWorkspaceFiles: () => ({repoRoot: project.root, verified: true}),
-            prepareWorkspace: async args => {
+            prepareWorkspace     : async args => {
                 const prepared = await basePrepare(args);
                 controller.abort();
                 return prepared
@@ -1271,6 +1349,36 @@ test.describe('startAgentProvisioned (Fleet Manager spawn-time repo provisioning
         ]) {
             tenantService.probeSeatCredential = async () => ({ok: true, resources});
             expect(await plane.prove('tenant_plane_credential')).toEqual({verdict: 'refused'})
+        }
+    });
+
+    test('a packaged tenant Start requires matching served-plane facts before preparation and binds their owner', async () => {
+        const plane = {id: 'original-plane', dataRoot: '/tenant/data'};
+        for (const kbPlane of [null, {...plane, id: 'other-plane'}, {...plane}]) {
+            const agents = remoteRepoAgent('seat');
+            agents.seat.harnessType = 'claude-desktop';
+            const lifecycle  = makeLifecycle({agents}), ensure = makeEnsureRepo(), prepare = makePrepareWorkspace();
+            const generation = await runtimeFixture();
+            lifecycle.installedRuntime = {...generation, generation};
+            const inputOwners = {'neural-link': {binding: {kind: 'fixture'}, read: () => ({})}};
+            lifecycle.captureResidentMcpInputs = () => ({environment: {}, owners: inputOwners});
+            const tenantService = makeTenantService({readiness: {ok: true, resources: {
+                'memory-core': {ok: true, identity: '@seat', plane}, 'knowledge-base': {ok: true, plane: kbPlane}
+            }}});
+            const start = startAgentProvisioned({lifecycleService: lifecycle, tenantService, agentId: 'seat',
+                managedRoot: '/managed', ensureRepo: ensure, prepareWorkspace: prepare});
+            if (kbPlane?.id === plane.id) {
+                await start;
+                expect(lifecycle.calls.start[0].opts.launchAdmission.residentInputs).toBe(inputOwners);
+                expect(lifecycle.calls.start[0].opts.launchAdmission.owners.plane.binding).toMatchObject({
+                    kind    : 'tenant-bearer', agentId: 'seat', identity: 'seat', tenantId: 'tenant-a',
+                    endpoint: 'https://tenant.example.com', plane
+                });
+            } else {
+                await expect(start).rejects.toThrow(/did not prove one original plane/);
+                expect([ensure.calls.length, prepare.calls.length, lifecycle.calls.start.length]).toEqual([0, 0, 0]);
+            }
+            expect(tenantService.calls.probe[0].servedPlane).toBe(true);
         }
     });
 
@@ -1844,6 +1952,7 @@ test.describe('startAgentProvisioned — a seat\'s Memory Core is the plane the 
 
         return {
             calls,
+            getDataDir: () => os.tmpdir(),
             resolveSeatPlaneCredential(args) {
                 events?.push('plane-credential');
                 calls.resolve.push(args);
@@ -2094,10 +2203,10 @@ test.describe('startAgentProvisioned — a seat\'s Memory Core is the plane the 
 
                 return {
                     agentosRuntimeRoot: args.agentosRuntimeRoot,
-                    targetRepoRoot: args.targetRepoRoot,
-                    instanceHome: `/instances/${args.agent.id}`,
-                    mcpMatrix: ON,
-                    mcpPlan: buildPreparedMcpPlan(args, ON),
+                    targetRepoRoot    : args.targetRepoRoot,
+                    instanceHome      : `/instances/${args.agent.id}`,
+                    mcpMatrix         : ON,
+                    mcpPlan           : buildPreparedMcpPlan(args, ON),
                     ...(args.agent.harnessType === 'antigravity' ? {antigravityProject: {id: 'fixture-project', name: args.agent.id, root: args.targetRepoRoot}} : {})
                 }
             };
@@ -2108,7 +2217,7 @@ test.describe('startAgentProvisioned — a seat\'s Memory Core is the plane the 
             agents.a.harnessType = harnessType;
 
             const lifecycle = makePlaneLifecycle({agents}),
-                  run = start({lifecycle, planeService: makePlaneService(), prepareWorkspace: plan});
+                  run       = start({lifecycle, planeService: makePlaneService(), prepareWorkspace: plan});
 
             if (!supportsTenantMcpTarget(harnessType)) {
                 await expect(run, harnessType).rejects.toThrow(`agent 'a' cannot start: ${harnessType} cannot reach a remote Memory Core`);

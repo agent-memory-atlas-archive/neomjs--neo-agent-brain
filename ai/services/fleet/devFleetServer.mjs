@@ -87,8 +87,9 @@ import {wireFleetRecentTurnsSource}                                      from '.
 import {wireFleetSessionMemoriesSource}                                  from './wireFleetSessionMemoriesSource.mjs';
 import {wireFleetWakeRoutesSource}                                       from './wireFleetWakeRoutesSource.mjs';
 import {wireOperatorComposeWriter}                                       from './wireOperatorComposeWriter.mjs';
+import {bindCurrentRuntime}                                              from './runtimeGeneration.mjs';
 import path                                                              from 'node:path';
-import {pathToFileURL}                                                   from 'node:url';
+import {fileURLToPath, pathToFileURL}                                    from 'node:url';
 
 /**
  * @summary Composes the launch contract and starts the authenticated Fleet transport.
@@ -96,6 +97,14 @@ import {pathToFileURL}                                                   from 'n
  * @private
  */
 async function boot() {
+    const runtime = await bindCurrentRuntime({
+        args       : process.argv.slice(2),
+        runtimeRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'),
+        executable : process.execPath
+    });
+    const lifecycle = FleetManager.getLifecycleService();
+    lifecycle.installedRuntime = runtime.generation ? runtime : null;
+
     // Resolved HERE, at the use site, not captured at module scope: an overlay applied after
     // import must still be honoured. `cockpitOrigins` is csv-typed, so the split/trim the caller
     // used to do belongs to the leaf machinery instead.
@@ -167,6 +176,11 @@ async function boot() {
     // the try below spans the whole post-admission life (wiring + serve + occupied-port handling),
     // so the ALL-exits close guarantee is structural, not prose.
     try {
+
+    if (runtime.generation) {
+        lifecycle.openRuntimeCustody({directory: lifecycle.getRegistry().admissionDirectory()});
+        await lifecycle.recoverRuntimeCustody({tenantService: await FleetManager.getTenantService()});
+    }
 
     // Wire the cross-process boot-identity reader BEFORE serving: getBootIdentity() then serves the
     // orchestrator's advisory fact from the shared runtime-state dir (read at this use site), instead of
@@ -580,11 +594,25 @@ async function boot() {
 
         // AWAITED plane teardown before every exit: an un-awaited close races process death, which
         // leaks the proven plane session (the server reaps it only on its own timeline).
-        const cleanShutdown = async signal => {
+        let shutdown;
+        const cleanShutdown = signal => shutdown ??= (async () => {
             console.log(`[fleet] received ${signal}; stopping.`);
-            await closeObservedWorkAndPlane();
-            server.close(() => process.exit(0))
-        };
+            try {
+                await server.drainFleetRequests(lifecycle.getLaunchAdmission().proofTimeoutMs);
+                if (runtime.generation) {
+                    await lifecycle.handoffRuntimeCustody({tenantService: await FleetManager.getTenantService()});
+                }
+            } catch {
+                console.error('[fleet] continuity handoff was not completed; a package update must refuse surviving-seat continuity.');
+            } finally {
+                try {
+                    await lifecycle.getLaunchAdmission().closeUnclean();
+                    await closeObservedWorkAndPlane();
+                } finally {
+                    process.exit(0);
+                }
+            }
+        })();
 
         process.on('SIGTERM', () => cleanShutdown('SIGTERM'));
         process.on('SIGINT',  () => cleanShutdown('SIGINT'));
@@ -624,6 +652,7 @@ async function boot() {
         // wake-stream consumer stops on the same paths: its reconnect loop must not outlive boot.
         const ownedServer = server;
         try {
+            await lifecycle.getLaunchAdmission().closeUnclean();
             await closeObservedWorkAndPlane();
         } finally {
             ownedServer?.close();

@@ -1,8 +1,8 @@
-import {execFileSync} from 'node:child_process';
-import {createHash} from 'node:crypto';
+import {execFileSync}  from 'node:child_process';
+import {createHash}    from 'node:crypto';
 import {createRequire} from 'node:module';
-import fs from 'node:fs';
-import path from 'node:path';
+import fs              from 'node:fs';
+import path            from 'node:path';
 
 const
     // Electron virtualizes app.asar as a directory; this probe needs the physical bundle bytes.
@@ -89,9 +89,9 @@ export async function probeAntigravityRuntime({
     }
 
     const
-        appBundle = path.dirname(contents),
-        infoPlist = path.join(contents, 'Info.plist'),
-        appAsar = path.join(contents, 'Resources', 'app.asar'),
+        appBundle      = path.dirname(contents),
+        infoPlist      = path.join(contents, 'Info.plist'),
+        appAsar        = path.join(contents, 'Resources', 'app.asar'),
         languageServer = path.join(contents, 'Resources', 'bin', 'language_server');
 
     let metadata, appAsarSha256, languageServerSha256;
@@ -112,7 +112,7 @@ export async function probeAntigravityRuntime({
     const fingerprints = {
         platform,
         architecture,
-        bundleId: metadata?.bundleId,
+        bundleId    : metadata?.bundleId,
         shortVersion: metadata?.shortVersion,
         buildVersion: metadata?.buildVersion,
         appAsarSha256,
@@ -157,17 +157,17 @@ export function verifyAntigravityProfileListener({
     execFileImpl = execFileSync
 } = {}) {
     const
-        profile = typeof profileDirectory === 'string' && path.isAbsolute(profileDirectory) ? path.resolve(profileDirectory) : '',
-        pid = expectedProcess?.pid,
+        profile   = typeof profileDirectory === 'string' && path.isAbsolute(profileDirectory) ? path.resolve(profileDirectory) : '',
+        pid       = expectedProcess?.pid,
         startedAt = expectedProcess?.startedAt,
-        proof = {
-            verified: false,
+        proof     = {
+            verified           : false,
             processTreeVerified: false,
-            profileDirectory: profile,
+            profileDirectory   : profile,
             port,
             browserPath,
-            pid: Number.isSafeInteger(pid) ? pid : null,
-            startedAt: typeof startedAt === 'string' ? startedAt : null
+            pid                : Number.isSafeInteger(pid) ? pid : null,
+            startedAt          : typeof startedAt === 'string' ? startedAt : null
         };
 
     if (!profile || !Number.isSafeInteger(port) || port < 1 || port > 65535 ||
@@ -206,7 +206,7 @@ export function verifyAntigravityProfileListener({
 /** @summary Read the exact profile's small endpoint file without following links or accepting extra content. */
 function readProfileEndpoint(fileSystem, profile) {
     const
-        profileStat = fileSystem.lstatSync(profile),
+        profileStat  = fileSystem.lstatSync(profile),
         endpointPath = path.join(profile, ACTIVE_PORT_FILE),
         endpointStat = fileSystem.lstatSync(endpointPath);
 
@@ -241,8 +241,8 @@ function readListenerPids(port, execFileImpl) {
     const lines = String(output).split(/\r?\n/).filter(Boolean);
     if (!lines.length) return [];
 
-    const pids = [];
-    let currentPid = null, descriptorCount = 0;
+    const pids       = [];
+    let   currentPid = null, descriptorCount = 0;
 
     for (const line of lines) {
         if (/^p[1-9]\d*$/.test(line)) {
@@ -266,7 +266,7 @@ function readListenerPids(port, execFileImpl) {
 /** @summary Walk only the listener's bounded ancestor chain to the exact Start PID/birth. */
 function readProcessChain(listenerPid, expected, execFileImpl) {
     const chain = [];
-    let pid = listenerPid;
+    let   pid   = listenerPid;
 
     for (let depth = 0; depth < PROCESS_CHAIN_LIMIT; depth++) {
         const process = readProcessIdentity(pid, execFileImpl);
@@ -292,13 +292,13 @@ function readProcessIdentity(pid, execFileImpl) {
     }
 
     const [parentPid, state, ...birthTokens] = output.split(/\s+/);
-    const startedAt = birthTokens.join(' ');
+    const startedAt                          = birthTokens.join(' ');
     if (!/^\d+$/.test(parentPid || '') || !state || !startedAt) return null;
 
     return {
         pid,
         parentPid: Number(parentPid),
-        exited: state.startsWith('Z'),
+        exited   : state.startsWith('Z'),
         startedAt
     }
 }
@@ -315,23 +315,23 @@ function sameProcessChain(first, second) {
 /** @summary Keep process inspection independent of inherited credentials and locale. */
 function processQueryOptions() {
     return {
-        encoding: 'utf8',
-        timeout: PROCESS_QUERY_TIMEOUT_MS,
+        encoding : 'utf8',
+        timeout  : PROCESS_QUERY_TIMEOUT_MS,
         maxBuffer: 4096,
-        env: {PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LC_ALL: 'C', TZ: 'UTC'}
+        env      : {PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LC_ALL: 'C', TZ: 'UTC'}
     }
 }
 
 /** @summary Read only the three bundle identity fields used by this probe, without invoking a shell. */
 function readPlistMetadata(infoPlist) {
     const read = key => execFileSync(PLIST_BUDDY, ['-c', `Print :${key}`, infoPlist], {
-        encoding: 'utf8',
+        encoding : 'utf8',
         maxBuffer: 4096,
-        timeout: 2000
+        timeout  : 2000
     }).trim();
 
     return {
-        bundleId: read('CFBundleIdentifier'),
+        bundleId    : read('CFBundleIdentifier'),
         shortVersion: read('CFBundleShortVersionString'),
         buildVersion: read('CFBundleVersion')
     }
@@ -339,8 +339,8 @@ function readPlistMetadata(infoPlist) {
 
 /** @summary Stream a physical file into SHA-256 without buffering its contents in memory. */
 async function hashFileSha256(filePath, fsImpl) {
-    const hash = createHash('sha256');
-    let bytes = 0;
+    const hash  = createHash('sha256');
+    let   bytes = 0;
 
     for await (const chunk of fsImpl.createReadStream(filePath)) {
         bytes += chunk.length;

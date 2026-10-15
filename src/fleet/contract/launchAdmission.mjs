@@ -56,6 +56,10 @@ export const LAUNCH_ADMISSION_REASONS = Object.freeze({
     REPLACED          : 'replaced',
     /** This Fleet did not start the running seat, so it holds no generation for it. */
     ISSUER_REPLACED   : 'issuer-replaced',
+    /** Original Start or clean issuer succession could not be proved; existing children may still work. */
+    RECOVERY_UNVERIFIED: 'recovery-unverified',
+    /** A required durable transition failed; this issuer can neither admit nor hand off authority. */
+    DURABILITY_FAILED : 'durability-failed',
     /** The Start held no value for one of the server's required inputs. */
     CREDENTIAL_MISSING: 'credential-missing'
 });
@@ -74,11 +78,13 @@ export const LAUNCH_ADMISSION_OUTCOMES = Object.freeze({
  * Each is resolved from its own owner at every redemption and proved there, never replaced by the other.
  * - `seat-pat`: the seat's forge PAT, held by the registry. It must answer for the seat's own login.
  * - `plane-bearer`: the seat's plane credential, held by its explicit tenant or its plane binding.
- * @type {Readonly<{SEAT_PAT: String, PLANE_BEARER: String}>}
+ * - `bridge-token`: a fresh token under the original signer, checked against the running Bridge verifier.
+ * @type {Readonly<{SEAT_PAT: String, PLANE_BEARER: String, BRIDGE_TOKEN: String}>}
  */
 export const LAUNCH_ADMISSION_CREDENTIALS = Object.freeze({
     SEAT_PAT    : 'seat-pat',
-    PLANE_BEARER: 'plane-bearer'
+    PLANE_BEARER: 'plane-bearer',
+    BRIDGE_TOKEN: 'bridge-token'
 });
 
 /**

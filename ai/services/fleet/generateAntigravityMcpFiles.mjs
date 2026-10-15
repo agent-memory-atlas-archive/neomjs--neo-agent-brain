@@ -1,5 +1,5 @@
-import path from 'node:path';
-import {MCP_SERVERS} from '../../../src/fleet/contract/mcpServers.mjs';
+import path                                                                                   from 'node:path';
+import {MCP_SERVERS}                                                                          from '../../../src/fleet/contract/mcpServers.mjs';
 import {LAUNCH_GRANT_ENV_VAR, LAUNCH_ISSUER_ENV_VAR, isLaunchIdentity, parseLaunchCapability} from './mcpLaunchAdmission.mjs';
 
 /** @type {String} Profile-local carrier; the workspace declaration contains no seat path. */
@@ -10,10 +10,10 @@ export const ANTIGRAVITY_MCP_WORKSPACE_FILE = '.agents/mcp_config.json';
 export const ANTIGRAVITY_MEMORY_FILE = 'GEMINI.md';
 
 const
-    HEADER = '# Neo Fleet Antigravity MCP invoker v1',
+    HEADER      = '# Neo Fleet Antigravity MCP invoker v1',
     SERVER_KEYS = new Set(MCP_SERVERS.map(({key}) => key)),
     PROCESS_ENV = new Set(['HOME', 'PATH', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'LC_ALL', 'SHELL', 'TERM']),
-    REFUSAL = 'Neo MCP is unavailable for this Antigravity profile; start the seat from Fleet Manager.';
+    REFUSAL     = 'Neo MCP is unavailable for this Antigravity profile; start the seat from Fleet Manager.';
 
 /**
  * @summary Compile resolved admission rows into owner-only profile invokers and neutral workspace MCP rows.
@@ -58,8 +58,8 @@ export function generateAntigravityMcpFiles({profileHome, rows, processEnvironme
 
         const environment = {...processEnvironment, ...row.env};
         files.push({
-            path: path.join(profileHome, ANTIGRAVITY_MCP_DIRECTORY, `${key}.sh`),
-            mode: 0o600,
+            path   : path.join(profileHome, ANTIGRAVITY_MCP_DIRECTORY, `${key}.sh`),
+            mode   : 0o600,
             content: `${HEADER}\n[ "\${AGY_BROWSER_ACTIVE_PORT_FILE-}" = ${quote(path.join(profileHome, 'DevToolsActivePort'))} ] || exit 78\nexec /usr/bin/env -i ${[
                 ...Object.keys(environment).sort().map(key => `${key}=${environment[key]}`),
                 row.command, ...row.args
@@ -67,7 +67,7 @@ export function generateAntigravityMcpFiles({profileHome, rows, processEnvironme
         });
         mcpServers[name] = {
             command: '/bin/sh',
-            args: ['-p', '-c', neutralCommand(key)]
+            args   : ['-p', '-c', neutralCommand(key)]
         }
     }
 
@@ -75,6 +75,53 @@ export function generateAntigravityMcpFiles({profileHome, rows, processEnvironme
         files,
         mcpServers,
         projectMcpAllowRules: MCP_SERVERS.map(({key}) => `mcp(neo-mjs-${key}/*)`)
+    }
+}
+
+/**
+ * @summary Reads only this writer's closed literal invoker format, without executing shell code.
+ * Canonical re-rendering checks the profile guard, empty environment, argument order and quoting.
+ * @param {Object} options
+ * @param {String} options.profileHome The original profile, selected by the lifecycle.
+ * @param {String} options.key Canonical MCP server key.
+ * @param {String} options.source Bounded, custody-verified invoker text.
+ * @returns {Object} Transient row including its existing admission capability.
+ */
+export function parseAntigravityMcpInvoker({profileHome, key, source}) {
+    try {
+        const prefix = `${HEADER}\n[ "\${AGY_BROWSER_ACTIVE_PORT_FILE-}" = ${quote(path.join(profileHome, 'DevToolsActivePort'))} ] || exit 78\nexec /usr/bin/env -i `;
+        if (!SERVER_KEYS.has(key) || typeof source !== 'string' || !source.startsWith(prefix) || !source.endsWith('\n')) throw Error();
+        const input  = source.slice(prefix.length, -1), words = [];
+        let   offset = 0;
+        while (offset < input.length) {
+            if (input[offset++] !== "'") throw Error();
+            let word = '';
+            for (;;) {
+                const end = input.indexOf("'", offset);
+                if (end < 0) throw Error();
+                word += input.slice(offset, end);
+                offset = end + 1;
+                if (input.slice(offset, offset + 3) !== "\\''") break;
+                word += "'";
+                offset += 3;
+            }
+            words.push(word);
+            if (offset < input.length && input[offset++] !== ' ') throw Error();
+        }
+        if (words.length < 4) throw Error();
+        const environment = {}, processEnvironment = {}, env = {};
+        for (const word of words.slice(0, -4)) {
+            const match = word.match(/^([A-Z][A-Z0-9_]*)=([\s\S]*)$/);
+            if (!match || Object.hasOwn(environment, match[1])) throw Error();
+            environment[match[1]] = match[2];
+            (PROCESS_ENV.has(match[1]) ? processEnvironment : env)[match[1]] = match[2];
+        }
+        const row       = {command: words.at(-4), args: words.slice(-3), env};
+        const canonical = generateAntigravityMcpFiles({profileHome, processEnvironment, rows: {[`neo-mjs-${key}`]: row}});
+        if (canonical.files[0].content !== source) throw Error();
+        return row;
+    } catch {
+        throw new TypeError('Antigravity MCP invoker does not match the closed literal format.');
     }
 }
 

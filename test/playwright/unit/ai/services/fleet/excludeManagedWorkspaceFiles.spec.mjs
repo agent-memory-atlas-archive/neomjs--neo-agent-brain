@@ -1,8 +1,8 @@
 import {test, expect} from '@playwright/test';
 import {execFileSync} from 'node:child_process';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
+import fs             from 'node:fs';
+import os             from 'node:os';
+import path           from 'node:path';
 import {
     excludeManagedWorkspaceFiles,
     MANAGED_WORKSPACE_EXCLUDE_TARGETS
@@ -46,9 +46,9 @@ test.describe('excludeManagedWorkspaceFiles', () => {
         const result = excludeManagedWorkspaceFiles({targetRepoRoot: repo});
 
         expect(result).toMatchObject({
-            repoRoot: repo,
-            paths: ['.agents/mcp_config.json', 'GEMINI.md'],
-            verified: true,
+            repoRoot   : repo,
+            paths      : ['.agents/mcp_config.json', 'GEMINI.md'],
+            verified   : true,
             excludeFile: path.join(repo, '.git/info/exclude'),
         });
         expect(MANAGED_WORKSPACE_EXCLUDE_TARGETS).toEqual(['.agents/mcp_config.json', 'GEMINI.md']);
@@ -73,7 +73,7 @@ test.describe('excludeManagedWorkspaceFiles', () => {
 
     test('refuses a tracked target before changing the local exclude file', () => {
         const
-            repo = initRepo(),
+            repo   = initRepo(),
             target = path.join(repo, '.agents/mcp_config.json');
         fs.mkdirSync(path.dirname(target), {recursive: true});
         fs.writeFileSync(target, '{}\n');
@@ -82,7 +82,7 @@ test.describe('excludeManagedWorkspaceFiles', () => {
 
         expect(() => excludeManagedWorkspaceFiles({targetRepoRoot: repo})).toThrow(/refusing tracked workspace artifact/);
         expect(fs.readFileSync(excludeFile, 'utf8')).toBe(before);
-        const memoryRepo = initRepo('tracked-memory-loader'), memoryFile = path.join(memoryRepo, 'GEMINI.md'),
+        const memoryRepo    = initRepo('tracked-memory-loader'), memoryFile = path.join(memoryRepo, 'GEMINI.md'),
               memoryExclude = path.join(memoryRepo, '.git/info/exclude'), memoryBefore = fs.readFileSync(memoryExclude, 'utf8');
         fs.writeFileSync(memoryFile, '# Authored loader\n');
         execFileSync('git', ['-C', memoryRepo, 'add', '--', 'GEMINI.md'], {env: GIT_ENV});
@@ -92,7 +92,7 @@ test.describe('excludeManagedWorkspaceFiles', () => {
 
     test('empty-template init creates missing info only after proving the workspace target untracked', () => {
         const
-            repo = initRepo('empty-template', {emptyTemplate: true}),
+            repo    = initRepo('empty-template', {emptyTemplate: true}),
             infoDir = path.join(repo, '.git/info');
         expect(fs.existsSync(infoDir)).toBe(false);
 
@@ -102,7 +102,7 @@ test.describe('excludeManagedWorkspaceFiles', () => {
         expect(git(repo, ['check-ignore', '--no-index', '--quiet', '--', '.agents/mcp_config.json'])).toBe('');
 
         const tracked = initRepo('empty-template-tracked', {emptyTemplate: true}),
-            target = path.join(tracked, '.agents/mcp_config.json');
+            target    = path.join(tracked, '.agents/mcp_config.json');
         fs.mkdirSync(path.dirname(target), {recursive: true});
         fs.writeFileSync(target, '{}\n');
         execFileSync('git', ['-C', tracked, 'add', '--', '.agents/mcp_config.json'], {env: GIT_ENV});
@@ -113,8 +113,8 @@ test.describe('excludeManagedWorkspaceFiles', () => {
 
     test('refuses symlinked Git metadata and leaves its target untouched', () => {
         const
-            repo = initRepo('repo'),
-            other = initRepo('other'),
+            repo    = initRepo('repo'),
+            other   = initRepo('other'),
             outside = path.join(root, 'outside-exclude');
         fs.writeFileSync(outside, 'operator bytes\n');
         fs.rmSync(path.join(repo, '.git'), {recursive: true});
@@ -126,10 +126,10 @@ test.describe('excludeManagedWorkspaceFiles', () => {
 
     test('refuses an exclude symlink and malformed owned block without overwriting bytes', () => {
         const
-            repo = initRepo('repo'),
-            other = initRepo('other'),
+            repo        = initRepo('repo'),
+            other       = initRepo('other'),
             excludeFile = path.join(repo, '.git/info/exclude'),
-            outside = path.join(root, 'outside-exclude');
+            outside     = path.join(root, 'outside-exclude');
 
         fs.writeFileSync(outside, 'operator bytes\n');
         fs.rmSync(excludeFile);

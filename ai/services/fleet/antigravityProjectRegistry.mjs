@@ -1,13 +1,13 @@
-import fs from 'node:fs/promises';
-import {constants as fsConstants} from 'node:fs';
-import {randomUUID} from 'node:crypto';
-import path from 'node:path';
+import fs                             from 'node:fs/promises';
+import {constants as fsConstants}     from 'node:fs';
+import {randomUUID}                   from 'node:crypto';
+import path                           from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
-import {writeFileAtomic} from '../shared/atomicFileWrite.mjs';
-import {MCP_SERVERS} from '../../../src/fleet/contract/mcpServers.mjs';
+import {writeFileAtomic}              from '../shared/atomicFileWrite.mjs';
+import {MCP_SERVERS}                  from '../../../src/fleet/contract/mcpServers.mjs';
 
 const MAX_PROJECT_FILE = 256 * 1024,
-      MAX_TIMEOUT = 8000;
+      MAX_TIMEOUT      = 8000;
 
 /** @summary A closed refusal from Antigravity project registry operations. */
 export class AntigravityProjectRegistryRefusal extends Error {
@@ -42,7 +42,7 @@ export async function registerAntigravityProject({
     timeoutMs = 2000
 } = {}) {
     const directory = absoluteDirectory(registryDirectory), profile = absoluteDirectory(profileDirectory),
-          root = absoluteDirectory(projectRoot), deadline = Date.now() + boundedTimeout(timeoutMs);
+          root      = absoluteDirectory(projectRoot), deadline = Date.now() + boundedTimeout(timeoutMs);
 
     validateProjectName(name);
     validateMcpAllowRules(projectMcpAllowRules);
@@ -60,7 +60,7 @@ export async function registerAntigravityProject({
         !rootStat.isDirectory() || rootStat.isSymbolicLink() || rootRealPath !== root) throw refuse('project-path-unproven');
 
     const receiptPath = path.join(profile, '.neo-fleet-project-binding.json');
-    let receipt = await readSmallJsonFile(receiptPath, {fileSystem, deadline, signal, missingOk: true, requirePrivate: true}),
+    let   receipt     = await readSmallJsonFile(receiptPath, {fileSystem, deadline, signal, missingOk: true, requirePrivate: true}),
         created = false;
 
     if (receipt === null) {
@@ -73,9 +73,9 @@ export async function registerAntigravityProject({
         throw refuse('project-receipt-mismatch')
     }
 
-    const projectId = receipt.projectId,
+    const projectId   = receipt.projectId,
           projectPath = path.join(directory, `${projectId}.json`),
-          current = await readSmallJsonFile(projectPath, {fileSystem, deadline, signal, missingOk: true});
+          current     = await readSmallJsonFile(projectPath, {fileSystem, deadline, signal, missingOk: true});
     let document;
 
     if (current === null) {
@@ -180,12 +180,12 @@ async function readJsonFile(filePath, {fileSystem, deadline, signal, requirePriv
 /** @summary Create the native JSON using only project-scoped authorization and no seat identity. @private */
 function newProjectRecord({projectId, name, root, projectMcpAllowRules}) {
     return {
-        id: projectId,
+        id              : projectId,
         name,
         projectResources: {resources: [{folderUri: pathToFileURL(root).href}]},
         permissionGrants: {permissionGrants: {allow: [...projectMcpAllowRules]}, v2Migrated: true},
-        settings: {},
-        isWorkspaceOnly: false
+        settings        : {},
+        isWorkspaceOnly : false
     }
 }
 
@@ -265,7 +265,7 @@ export async function proveRegisteredAntigravityProject({
 } = {}) {
     const profile = absoluteDirectory(profileDirectory), root = absoluteDirectory(projectRoot),
           project = {id: projectId, name: projectName, root}, deadline = Date.now() + boundedTimeout(timeoutMs),
-          reader = resolveReader({readRegisteredProject, registryDirectory, fileSystem});
+          reader  = resolveReader({readRegisteredProject, registryDirectory, fileSystem});
 
     if (typeof project.id !== 'string' || !project.id.trim() || typeof project.name !== 'string' || !project.name.trim() ||
         typeof fileSystem?.lstat !== 'function' || typeof fileSystem?.realpath !== 'function') throw refuse('project-invalid');
@@ -341,7 +341,7 @@ function normalizeNativeProjectRecord(document, expectedId) {
         throw refuse('project-resource-unsupported')
     }
 
-    const nested = resource.gitFolder;
+    const nested    = resource.gitFolder;
     const folderUri = typeof resource.folderUri === 'string' ? resource.folderUri
         : nested && typeof nested === 'object' && !Array.isArray(nested) && Object.keys(nested).length === 1 &&
           typeof nested.folderUri === 'string' ? nested.folderUri : null;

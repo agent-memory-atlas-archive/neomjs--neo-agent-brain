@@ -1,13 +1,13 @@
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import {expect, test} from '@playwright/test';
-import {writeFileAtomic} from '../../../../../../ai/services/shared/atomicFileWrite.mjs';
-import {MCP_SERVERS} from '../../../../../../src/fleet/contract/mcpServers.mjs';
+import fs                           from 'node:fs';
+import os                           from 'node:os';
+import path                         from 'node:path';
+import {expect, test}               from '@playwright/test';
+import {writeFileAtomic}            from '../../../../../../ai/services/shared/atomicFileWrite.mjs';
+import {MCP_SERVERS}                from '../../../../../../src/fleet/contract/mcpServers.mjs';
 import {registerAntigravityProject} from '../../../../../../ai/services/fleet/antigravityProjectRegistry.mjs';
 
 const
-    RULES = MCP_SERVERS.map(({key}) => `mcp(neo-mjs-${key}/*)`),
+    RULES   = MCP_SERVERS.map(({key}) => `mcp(neo-mjs-${key}/*)`),
     RECEIPT = '.neo-fleet-project-binding.json';
 
 /** @summary Prove registration is create-only and project-scoped across a seat-local profile receipt. */
@@ -30,35 +30,35 @@ test.describe('registerAntigravityProject', () => {
         registryDirectory,
         profileDirectory,
         projectRoot,
-        name: 'Neo Brain',
+        name                : 'Neo Brain',
         projectMcpAllowRules: RULES,
-        idFactory: () => '154e7ad7-ab8c-4445-bd6b-9ac6bdddcd0f',
+        idFactory           : () => '154e7ad7-ab8c-4445-bd6b-9ac6bdddcd0f',
         ...overrides
     });
 
     test('creates one native project record and a private profile-only UUID receipt', async () => {
-        const result = await register(),
+        const result      = await register(),
               receiptPath = path.join(profileDirectory, RECEIPT),
               projectPath = path.join(registryDirectory, `${result.projectId}.json`),
-              receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8')),
-              record = JSON.parse(fs.readFileSync(projectPath, 'utf8'));
+              receipt     = JSON.parse(fs.readFileSync(receiptPath, 'utf8')),
+              record      = JSON.parse(fs.readFileSync(projectPath, 'utf8'));
 
         expect(result).toMatchObject({verified: true, created: true, projectId: receipt.projectId, projectRoot});
         expect(receipt).toEqual({version: 1, projectId: result.projectId, projectName: 'Neo Brain', projectRoot});
         expect(fs.statSync(receiptPath).mode & 0o777).toBe(0o600);
         expect(record).toMatchObject({
-            id: result.projectId,
-            name: 'Neo Brain',
+            id              : result.projectId,
+            name            : 'Neo Brain',
             projectResources: {resources: [{folderUri: expect.stringMatching(/^file:/)}]},
             permissionGrants: {permissionGrants: {allow: RULES}},
-            settings: {},
-            isWorkspaceOnly: false
+            settings        : {},
+            isWorkspaceOnly : false
         });
         expect(JSON.stringify(record)).not.toMatch(/identity|credential|token|mcp\(\*\)/i)
     });
 
     test('reuses its receipt and preserves project settings and existing grants while merging only canonical rules', async () => {
-        const first = await register(), projectPath = path.join(registryDirectory, `${first.projectId}.json`),
+        const first    = await register(), projectPath = path.join(registryDirectory, `${first.projectId}.json`),
               original = JSON.parse(fs.readFileSync(projectPath, 'utf8'));
         original.permissionGrants.permissionGrants.allow.push('mcp(operator-approved-local-tool/*)');
         original.settings = {theme: 'dark', retained: true};
@@ -90,7 +90,7 @@ test.describe('registerAntigravityProject', () => {
     });
 
     test('refuses a receipt-owned native project whose registered root diverged', async () => {
-        const first = await register(), projectPath = path.join(registryDirectory, `${first.projectId}.json`),
+        const first  = await register(), projectPath = path.join(registryDirectory, `${first.projectId}.json`),
               record = JSON.parse(fs.readFileSync(projectPath, 'utf8'));
         record.projectResources.resources = [{folderUri: 'file:///private/tmp/foreign'}];
         fs.writeFileSync(projectPath, JSON.stringify(record));
@@ -99,14 +99,14 @@ test.describe('registerAntigravityProject', () => {
     });
 
     test('refuses symlinked receipt and native project files instead of following or replacing them', async () => {
-        const receiptPath = path.join(profileDirectory, RECEIPT),
+        const receiptPath   = path.join(profileDirectory, RECEIPT),
               receiptTarget = path.join(tempRoot, 'receipt-target.json');
         fs.writeFileSync(receiptTarget, JSON.stringify({version: 1, projectId: '154e7ad7-ab8c-4445-bd6b-9ac6bdddcd0f', projectName: 'Neo Brain', projectRoot}), {mode: 0o600});
         fs.symlinkSync(receiptTarget, receiptPath);
         await expect(register()).rejects.toMatchObject({code: 'project-file-unproven'});
         fs.unlinkSync(receiptPath);
 
-        const first = await register(), projectPath = path.join(registryDirectory, `${first.projectId}.json`),
+        const first         = await register(), projectPath = path.join(registryDirectory, `${first.projectId}.json`),
               foreignTarget = path.join(tempRoot, 'foreign-project.json');
         fs.writeFileSync(foreignTarget, '{}');
         fs.unlinkSync(projectPath);
@@ -128,7 +128,7 @@ test.describe('registerAntigravityProject', () => {
 
         expect(failedNativeWrite).toBe(true);
         const receipt = JSON.parse(fs.readFileSync(path.join(profileDirectory, RECEIPT), 'utf8')),
-              retry = await register();
+              retry   = await register();
 
         expect(retry).toMatchObject({verified: true, created: true, projectId: receipt.projectId});
         expect(fs.existsSync(path.join(registryDirectory, `${receipt.projectId}.json`))).toBe(true)

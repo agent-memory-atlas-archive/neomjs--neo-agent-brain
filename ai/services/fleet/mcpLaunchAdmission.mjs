@@ -9,6 +9,9 @@ import {LAUNCH_ADMISSION_OUTCOMES} from '../../../src/fleet/contract/launchAdmis
  * the same secret. A process that binds a dead issuer's port can therefore neither learn the grant nor
  * hand the launcher an environment. Pure: only `node:crypto` and the Body-safe vocabulary, so the
  * launcher loads nothing else before its target starts.
+ * An admitted v1 answer contains `{outcome, generationRoot, args, env, mac}`. `generationRoot` is the
+ * original Start's fixed code root (an explicit checkout in dev); the launcher requires it to match
+ * its own root before executing the target. The native hop is separate from the MCP server APIs.
  */
 
 /**
@@ -30,6 +33,9 @@ export const LAUNCH_GRANT_ENV_VAR = 'NEO_FLEET_LAUNCH_GRANT';
  */
 export const LAUNCH_ADMISSION_PATH = '/fleet/mcp-launch/v1';
 
+/** @summary HMAC protocol identity advertised by a copied runtime's compatibility probe. */
+export const LAUNCH_ADMISSION_PROTOCOL = 'neo-fleet-mcp-launch/v1';
+
 /**
  * @summary Upper bound for a request or an answer body, in bytes.
  * @type {Number}
@@ -47,7 +53,7 @@ export function httpProofVerdict(ok, status) {
 }
 
 const
-    PROTOCOL       = 'neo-fleet-mcp-launch/v1',
+    PROTOCOL       = LAUNCH_ADMISSION_PROTOCOL,
     TOKEN_PATTERN  = /^[A-Za-z0-9_-]{22,128}$/,
     SERVER_PATTERN = /^[a-z][a-z0-9-]{0,63}$/,
     LOGIN_PATTERN  = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$/,
@@ -197,9 +203,8 @@ function safeEqual(expected, actual) {
  * left out, as `JSON.stringify` leaves it out of the body the other end parses.
  * @param {*} value
  * @returns {String}
- * @private
  */
-function canonicalJson(value) {
+export function canonicalJson(value) {
     if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
     if (value && typeof value === 'object') {
         return `{${Object.keys(value).filter(key => value[key] !== undefined).sort()

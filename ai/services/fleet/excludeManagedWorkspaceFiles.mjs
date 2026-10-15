@@ -1,7 +1,7 @@
-import {execFileSync} from 'node:child_process';
-import fs from 'node:fs';
-import path from 'node:path';
-import {writeLocalExclude} from '../../scripts/lifecycle/hooks/projectSeatHooks.mjs';
+import {execFileSync}                                            from 'node:child_process';
+import fs                                                        from 'node:fs';
+import path                                                      from 'node:path';
+import {writeLocalExclude}                                       from '../../scripts/lifecycle/hooks/projectSeatHooks.mjs';
 import {ANTIGRAVITY_MEMORY_FILE, ANTIGRAVITY_MCP_WORKSPACE_FILE} from './generateAntigravityMcpFiles.mjs';
 
 export const MANAGED_WORKSPACE_EXCLUDE_TARGETS = Object.freeze([ANTIGRAVITY_MCP_WORKSPACE_FILE, ANTIGRAVITY_MEMORY_FILE]);
@@ -9,7 +9,7 @@ export const MANAGED_WORKSPACE_EXCLUDE_TARGETS = Object.freeze([ANTIGRAVITY_MCP_
 const
     EXCLUDE_BLOCK_OWNER = 'fleetAntigravityWorkspace',
     EXCLUDE_BLOCK_LABEL = 'generated workspace files, do not edit inside this block',
-    GIT_NULL_CONFIG = process.platform === 'win32' ? 'NUL' : '/dev/null';
+    GIT_NULL_CONFIG     = process.platform === 'win32' ? 'NUL' : '/dev/null';
 
 /**
  * @summary Exclude the fixed generated Antigravity workspace file after proving a normal managed clone.
@@ -26,10 +26,10 @@ export function excludeManagedWorkspaceFiles({targetRepoRoot} = {}) {
     }
 
     const
-        rootPath = path.resolve(targetRepoRoot),
-        realRoot = fs.realpathSync(rootPath),
-        gitDir = path.join(realRoot, '.git'),
-        infoDir = path.join(gitDir, 'info'),
+        rootPath    = path.resolve(targetRepoRoot),
+        realRoot    = fs.realpathSync(rootPath),
+        gitDir      = path.join(realRoot, '.git'),
+        infoDir     = path.join(gitDir, 'info'),
         excludeFile = path.join(infoDir, 'exclude');
 
     if (realRoot !== rootPath) throw new Error('excludeManagedWorkspaceFiles: refusing a symlinked checkout path.');
@@ -39,7 +39,7 @@ export function excludeManagedWorkspaceFiles({targetRepoRoot} = {}) {
     assertRegularOrAbsent(excludeFile, 'checkout .git/info/exclude');
 
     const
-        gitEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))),
+        gitEnv         = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))),
         isolatedGitEnv = {...gitEnv, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: GIT_NULL_CONFIG,
             GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0'},
         topLevel = runGit(realRoot, ['rev-parse', '--show-toplevel'], isolatedGitEnv),
@@ -57,9 +57,9 @@ export function excludeManagedWorkspaceFiles({targetRepoRoot} = {}) {
 
     const writtenExclude = writeLocalExclude({
         targetRepoRoot: realRoot,
-        targets        : [...MANAGED_WORKSPACE_EXCLUDE_TARGETS],
-        blockOwner     : EXCLUDE_BLOCK_OWNER,
-        blockLabel     : EXCLUDE_BLOCK_LABEL,
+        targets       : [...MANAGED_WORKSPACE_EXCLUDE_TARGETS],
+        blockOwner    : EXCLUDE_BLOCK_OWNER,
+        blockLabel    : EXCLUDE_BLOCK_LABEL,
         resolvedGitDir
     });
 
@@ -73,9 +73,9 @@ export function excludeManagedWorkspaceFiles({targetRepoRoot} = {}) {
     }
 
     return {
-        repoRoot   : realRoot,
-        paths      : [...MANAGED_WORKSPACE_EXCLUDE_TARGETS],
-        verified   : true,
+        repoRoot: realRoot,
+        paths   : [...MANAGED_WORKSPACE_EXCLUDE_TARGETS],
+        verified: true,
         excludeFile
     }
 }

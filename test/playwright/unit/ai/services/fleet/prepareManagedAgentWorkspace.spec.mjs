@@ -24,7 +24,7 @@ import {isUnmodifiedGeneration, stampWakeEnvelopePlant} from '../../../../../../
 import {deriveNodeRuntimeEnv}                           from '../../../../../../ai/services/fleet/deriveNodeRuntimeEnv.mjs';
 import {importSeatMemory}                               from '../../../../../../ai/services/fleet/seatMemoryImport.mjs';
 import {startAgentProvisioned}                          from '../../../../../../ai/services/fleet/startAgentProvisioned.mjs';
-import {excludeManagedWorkspaceFiles}                  from '../../../../../../ai/services/fleet/excludeManagedWorkspaceFiles.mjs';
+import {excludeManagedWorkspaceFiles}                   from '../../../../../../ai/services/fleet/excludeManagedWorkspaceFiles.mjs';
 import {registerAntigravityProject}                     from '../../../../../../ai/services/fleet/antigravityProjectRegistry.mjs';
 
 // Temp-filesystem contract tests: the real artifact writer runs, while checkout hydration is an
@@ -32,11 +32,11 @@ import {registerAntigravityProject}                     from '../../../../../../
 // the new composer calls that existing primitive at the right boundary without invoking its CLI,
 // install, or build path.
 
-const NODE_PATH    = process.execPath;
-const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../../..');
+const NODE_PATH                   = process.execPath;
+const PROJECT_ROOT                = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../../..');
 const ANTIGRAVITY_RUNTIME_FIXTURE = Object.freeze({
-    platform: 'darwin', architecture: 'arm64', bundleId: 'com.google.antigravity',
-    shortVersion: '2.24.1', buildVersion: '2.24.1',
+    platform     : 'darwin', architecture: 'arm64', bundleId: 'com.google.antigravity',
+    shortVersion : '2.24.1', buildVersion: '2.24.1',
     appAsarSha256: 'a'.repeat(64), languageServerSha256: 'b'.repeat(64)
 });
 
@@ -2028,6 +2028,8 @@ test.describe('prepareManagedAgentWorkspace', () => {
             nl  = JSON.parse(raw).mcpServers['neo-mjs-neural-link'];
 
         expect(nl.args.slice(1)).toEqual(['--server', 'neural-link']);
+        expect(result.launchAdmissionBinding).toMatchObject({version: 1, identity: opts.launchAdmission.identity, issuer: opts.launchAdmission.issuer});
+        expect(JSON.stringify(result.launchAdmissionBinding)).not.toContain(nl.env.NEO_FLEET_LAUNCH_GRANT);
         expect(Object.keys(nl.env).sort()).toEqual(['NEO_AGENT_IDENTITY', 'NEO_FLEET_LAUNCH_GRANT', 'NEO_FLEET_LAUNCH_ISSUER', 'NEO_PLANE_DATA_ROOT']);
         expect(raw).not.toContain('secret-token-value');
         expect(raw).not.toContain('NEO_FLEET_BRIDGE_TOKEN');
@@ -2245,23 +2247,23 @@ test.describe('prepareManagedAgentWorkspace', () => {
     test('Antigravity profile invokers converge through receipts and refuse resident edits', async () => {
         const
             agent = makeAgent('antigravity'),
-            plan = MCP_SERVERS.map(({key}) => ({
+            plan  = MCP_SERVERS.map(({key}) => ({
                 key,
-                name      : `neo-mjs-${key}`,
-                enabled   : key === 'memory-core' || key === 'knowledge-base',
-                command   : NODE_PATH,
-                sourceRoot: agentosRuntimeRoot,
-                environment: {},
-                runtimeEnv: [],
+                name              : `neo-mjs-${key}`,
+                enabled           : key === 'memory-core' || key === 'knowledge-base',
+                command           : NODE_PATH,
+                sourceRoot        : agentosRuntimeRoot,
+                environment       : {},
+                runtimeEnv        : [],
                 requiredRuntimeEnv: [],
-                secretEnv: []
+                secretEnv         : []
             })),
             launchAdmission = {
-                issuer : 'http://127.0.0.1:12345',
+                issuer  : 'http://127.0.0.1:12345',
                 identity: 'shared-login',
-                grants : Object.fromEntries(['memory-core', 'knowledge-base'].map(key => [key, mintLaunchGrant().capability]))
+                grants  : Object.fromEntries(['memory-core', 'knowledge-base'].map(key => [key, mintLaunchGrant().capability]))
             },
-            options = {agent, instanceHome: path.join(instanceRoot, agent.id, 'harness', 'antigravity'), plan,
+            options = {agent, instanceHome: path.join(instanceRoot, agent.id, 'harness', 'antigravity'), targetRepoRoot: path.join(root, 'native-checkout'), plan,
                 residentMcpEnv: {}, launchAdmission, processEnvironment: {HOME: root, PATH: '/usr/bin:/bin'}, fileSystem: fs};
 
         await fs.mkdir(options.instanceHome, {recursive: true});
@@ -2307,8 +2309,8 @@ test.describe('prepareManagedAgentWorkspace', () => {
 
     test('Antigravity workspace merge preserves resident entries and refuses unreceipted Neo divergence', () => {
         const
-            desired = Object.fromEntries(MCP_SERVERS.map(({key}) => [`neo-mjs-${key}`, {command: '/usr/bin/false', disabled: true}])),
-            initial = JSON.parse(mergeAntigravityWorkspaceMcpConfig(null, desired)),
+            desired  = Object.fromEntries(MCP_SERVERS.map(({key}) => [`neo-mjs-${key}`, {command: '/usr/bin/false', disabled: true}])),
+            initial  = JSON.parse(mergeAntigravityWorkspaceMcpConfig(null, desired)),
             existing = {name: 'resident', mcpServers: {...initial.mcpServers, 'other-tool': {command: 'tool'},
                 'neo-mjs-local-helper': {command: 'custom'}}};
 
@@ -2327,10 +2329,10 @@ test.describe('prepareManagedAgentWorkspace', () => {
 
     test('Antigravity workspace publication requires exclusion before effects and preserves resident changes', async () => {
         const targetRepoRoot = path.join(root, 'antigravity-checkout'),
-              instanceHome = path.join(instanceRoot, 'antigravity-profile'),
-              file = path.join(targetRepoRoot, '.agents/mcp_config.json'),
-              servers = Object.fromEntries(MCP_SERVERS.map(({key}) => [`neo-mjs-${key}`, {command: '/usr/bin/false', disabled: true}])),
-              opts = {targetRepoRoot, instanceHome, mcpServers: servers};
+              instanceHome   = path.join(instanceRoot, 'antigravity-profile'),
+              file           = path.join(targetRepoRoot, '.agents/mcp_config.json'),
+              servers        = Object.fromEntries(MCP_SERVERS.map(({key}) => [`neo-mjs-${key}`, {command: '/usr/bin/false', disabled: true}])),
+              opts           = {targetRepoRoot, instanceHome, mcpServers: servers};
         await expect(convergeAntigravityWorkspaceMcp(opts)).rejects.toThrow(/exclusion proof/);
         await expect(fs.stat(targetRepoRoot)).rejects.toMatchObject({code: 'ENOENT'});
         await fs.mkdir(targetRepoRoot);
@@ -2349,7 +2351,7 @@ test.describe('prepareManagedAgentWorkspace', () => {
         expect(matched[0].status).toBe(WORKSPACE_ARTIFACT_STATES.MATCH);
         expect(await read(file)).toBe(residentText);
 
-        const next = {...servers, 'neo-mjs-memory-core': {command: '/bin/sh', args: ['-p', '-c', 'exit 78']}};
+        const next    = {...servers, 'neo-mjs-memory-core': {command: '/bin/sh', args: ['-p', '-c', 'exit 78']}};
         const updated = await convergeAntigravityWorkspaceMcp({...opts, exclusion, mcpServers: next});
         expect(updated[0].status).toBe(WORKSPACE_ARTIFACT_STATES.UPDATED);
         const actual = JSON.parse(await read(file));
@@ -2364,9 +2366,9 @@ test.describe('prepareManagedAgentWorkspace', () => {
 
     test('Antigravity workspace publication refuses symlinked receipt without touching its target', async () => {
         const targetRepoRoot = path.join(root, 'antigravity-checkout'),
-              instanceHome = path.join(instanceRoot, 'antigravity-profile'),
-              foreign = path.join(root, 'foreign.json'),
-              mcpServers = Object.fromEntries(MCP_SERVERS.map(({key}) => [`neo-mjs-${key}`, {disabled: true}]));
+              instanceHome   = path.join(instanceRoot, 'antigravity-profile'),
+              foreign        = path.join(root, 'foreign.json'),
+              mcpServers     = Object.fromEntries(MCP_SERVERS.map(({key}) => [`neo-mjs-${key}`, {disabled: true}]));
         await fs.mkdir(targetRepoRoot);
         await fs.mkdir(instanceHome, {recursive: true});
         await fs.writeFile(foreign, 'preserve');
@@ -2379,10 +2381,10 @@ test.describe('prepareManagedAgentWorkspace', () => {
     });
 
     test('Antigravity native preparation opens one receipt-owned project and preserves bearer Markdown', async () => {
-        const opts = options(makeAgent('antigravity')),
+        const opts              = options(makeAgent('antigravity')),
               registryDirectory = path.join(root, 'native-projects'),
-              memoryDir = path.join(instanceRoot, opts.agent.id, 'memory'),
-              binaryPath = '/Applications/Antigravity.app/Contents/MacOS/Antigravity';
+              memoryDir         = path.join(instanceRoot, opts.agent.id, 'memory'),
+              binaryPath        = '/Applications/Antigravity.app/Contents/MacOS/Antigravity';
         await trustCheckout({repoSlug: 'neomjs/neo', cloneUrl: 'https://github.com/neomjs/neo.git'}, opts.targetRepoRoot);
         await fs.mkdir(registryDirectory);
         await fs.mkdir(memoryDir, {recursive: true});
@@ -2392,8 +2394,11 @@ test.describe('prepareManagedAgentWorkspace', () => {
             nativeRuntime: {available: true, fingerprints: ANTIGRAVITY_RUNTIME_FIXTURE}};
         const antigravityStart = {capability, registryDirectory,
             processEnvironment: {HOME: root, PATH: '/usr/bin:/bin'},
-            exclusion: excludeManagedWorkspaceFiles({targetRepoRoot: opts.targetRepoRoot})};
+            exclusion         : excludeManagedWorkspaceFiles({targetRepoRoot: opts.targetRepoRoot})};
         const result = await prepareManagedAgentWorkspace({...opts, antigravityStart, launchAdmission: desktopAdmission()});
+        expect(result.launchAdmissionBinding).toMatchObject({version: 2, kind: 'antigravity', identity: 'shared-login',
+            instanceHome: result.instanceHome, workspaceRoot: opts.targetRepoRoot});
+        expect(Object.keys(result.launchAdmissionBinding.invokerSha256).sort()).toEqual(Object.keys(result.launchAdmissionBinding.grants).sort());
         expect(result.antigravityProject).toMatchObject({name: opts.agent.id, root: opts.targetRepoRoot});
         const loader = await read(path.join(opts.targetRepoRoot, 'GEMINI.md'));
         expect(loader).toContain(`@[Seat memory](${path.join(memoryDir, 'MEMORY.md')})`);

@@ -1,7 +1,7 @@
 import {expect, test} from '@playwright/test';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
+import fs             from 'node:fs';
+import os             from 'node:os';
+import path           from 'node:path';
 import {
     classifyAntigravityRuntimeFingerprint,
     probeAntigravityRuntime,
@@ -10,12 +10,12 @@ import {
 
 const
     RUNTIME_FIXTURE = Object.freeze({
-        platform: 'darwin',
-        architecture: 'arm64',
-        bundleId: 'com.google.antigravity',
-        shortVersion: '2.24.1',
-        buildVersion: '2.24.1',
-        appAsarSha256: 'a'.repeat(64),
+        platform            : 'darwin',
+        architecture        : 'arm64',
+        bundleId            : 'com.google.antigravity',
+        shortVersion        : '2.24.1',
+        buildVersion        : '2.24.1',
+        appAsarSha256       : 'a'.repeat(64),
         languageServerSha256: 'b'.repeat(64)
     }),
     OWNER = {pid:100, startedAt:'Wed Oct 14 14:00:00 2026'},
@@ -24,11 +24,11 @@ const
 
 function makeBundle(root) {
     const
-        appBundle = path.join(root, 'Antigravity.app'),
-        contents = path.join(appBundle, 'Contents'),
-        binary = path.join(contents, 'MacOS', 'Antigravity'),
-        infoPlist = path.join(contents, 'Info.plist'),
-        appAsar = path.join(contents, 'Resources', 'app.asar'),
+        appBundle      = path.join(root, 'Antigravity.app'),
+        contents       = path.join(appBundle, 'Contents'),
+        binary         = path.join(contents, 'MacOS', 'Antigravity'),
+        infoPlist      = path.join(contents, 'Info.plist'),
+        appAsar        = path.join(contents, 'Resources', 'app.asar'),
         languageServer = path.join(contents, 'Resources', 'bin', 'language_server');
 
     for (const file of [binary, infoPlist, appAsar, languageServer]) {
@@ -55,7 +55,7 @@ function makeProfile(root) {
 }
 
 function processInspector({listenerPid = 300, processRows, lsofRows = [`p${listenerPid}\nf30`], onPs} = {}) {
-    const lsofCalls = [], psCalls = [];
+    const lsofCalls    = [], psCalls = [];
     const execFileImpl = (file, args, options) => {
         if (file === '/usr/sbin/lsof') {
             lsofCalls.push({args, options});
@@ -81,7 +81,7 @@ test.describe('probeAntigravityRuntime', () => {
 
     test('measures the selected bundle files and admits a future runtime identity with well-formed hashes', async () => {
         const fixture = makeBundle(root), hashedPaths = [], metadataPaths = [];
-        const result = await probeAntigravityRuntime({
+        const result  = await probeAntigravityRuntime({
             selectedBinaryPath:fixture.binary,
             fsImpl:fs,
             platform:'darwin',
@@ -106,7 +106,7 @@ test.describe('probeAntigravityRuntime', () => {
 
     test('a newer version with changed app and language-server hashes remains eligible', async () => {
         const fixture = makeBundle(root);
-        const result = await probeAntigravityRuntime({
+        const result  = await probeAntigravityRuntime({
             selectedBinaryPath:fixture.binary,
             fsImpl:fs,
             platform:'darwin',
@@ -167,7 +167,7 @@ test.describe('probeAntigravityRuntime', () => {
     test('profile listener is proven only through a stable PID/birth chain to the original Start', () => {
         const
             profileDirectory = makeProfile(root),
-            processRows = new Map([
+            processRows      = new Map([
                 [300, {parentPid:200, startedAt:'Wed Oct 14 14:01:00 2026'}],
                 [200, {parentPid:100, startedAt:'Wed Oct 14 14:00:30 2026'}],
                 [100, {parentPid:1, startedAt:OWNER.startedAt}]
@@ -198,7 +198,7 @@ test.describe('probeAntigravityRuntime', () => {
         const
             profileDirectory = makeProfile(root),
             singleDigitOwner = {pid:100, startedAt:'Sun Sep 6 09:00:00 2026'},
-            processRows = new Map([
+            processRows      = new Map([
                 [300, {parentPid:200, startedAt:'Sun Sep  6 09:01:00 2026'}],
                 [200, {parentPid:100, startedAt:'Sun Sep  6 09:00:30 2026'}],
                 [100, {parentPid:1, startedAt:'Sun Sep  6 09:00:00 2026'}]
@@ -215,8 +215,8 @@ test.describe('probeAntigravityRuntime', () => {
     test('accepts native lsof PID records followed by their numeric descriptor field', () => {
         const
             profileDirectory = makeProfile(root),
-            owner = {pid:94667, startedAt:'Wed Oct 14 12:46:13 2026'},
-            inspector = processInspector({
+            owner            = {pid:94667, startedAt:'Wed Oct 14 12:46:13 2026'},
+            inspector        = processInspector({
                 listenerPid:94667,
                 lsofRows:['p94667\nf30\n', 'p94667\nf30\n'],
                 processRows:new Map([[94667, {parentPid:1, startedAt:owner.startedAt}]])

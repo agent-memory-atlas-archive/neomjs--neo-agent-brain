@@ -10,14 +10,21 @@ import {
     LAUNCH_ADMISSION_STATES   as STATES,
     isLaunchAdmissionProofReason
 }                                 from '../../../src/fleet/contract/launchAdmission.mjs';
-import {mcpCatalogFor, resolveMcpMatrix} from '../../../src/fleet/contract/mcpServers.mjs';
-import {launchRowEnvNames}               from './managedAgentWorkspacePlan.mjs';
+import {mcpCatalogFor, resolveMcpMatrix}                                                     from '../../../src/fleet/contract/mcpServers.mjs';
+import {launchRowEnvNames}                                                                   from './managedAgentWorkspacePlan.mjs';
+import {isAdmissionSnapshot, openLaunchAdmissionJournal, RUNTIME_REFERENCE_SNAPSHOT_VERSION} from './launchAdmissionJournal.mjs';
+import {runtimeGenerationPin}                                                                from './runtimeGeneration.mjs';
+import {assertRuntimeGenerationReferences}                                                   from './runtimeGenerationLease.mjs';
+import {isLaunchCredentialBinding, isResidentMcpBinding}                                     from './launchCredentialOwners.mjs';
 import {
     LAUNCH_ADMISSION_MAX_BYTES,
     LAUNCH_ADMISSION_PATH,
+    canonicalJson,
+    isAdmissibleEnvName,
     isLaunchIdentity,
     launchRefusal,
     mintLaunchGrant,
+    parseLaunchCapability,
     parseLaunchRequest,
     signLaunchResponse,
     verifyLaunchRequest
@@ -50,16 +57,16 @@ const BRIDGE_ENTRYPOINT = 'ai/mcp/client/stdioToStreamableHttp.mjs';
  * **Revocation is sticky.** Stop intent, a failed Start or lease, the process's exit and a newer Start
  * end the generation. The registry's `definitionChange` ends it when the seat's harness, MCP target, launch
  * owner or launch override changes, and ends one server's grant when that server is switched off.
- * Nothing re-enables a grant: a server switched back on waits for a managed restart. A new Fleet process
- * holds no generation, so a seat it adopts reads `stale` until it is restarted.
+ * Nothing re-enables a grant: a server switched back on waits for a managed restart. A successor restores
+ * only the positively proved original Start after a consumed clean handoff; every other survivor is stale.
  *
  * **Custody.** A seat credential stays with its owner: the registry holds the PAT; the explicit tenant
  * or the plane binding holds the plane credential. Each redemption resolves it from the owner Start
  * selected, proves that value, and hands over exactly the proved bytes. A missing or unproved value
  * refuses the child and never falls back to another credential class, so a changed registry PAT never
- * stands in for a plane credential. The issuer holds only what Start itself or the Fleet's configuration
- * produced, such as the Bridge token, for the generation's lifetime, and drops it at revocation. No new
- * credential is persisted.
+ * stands in for a plane credential. Packaged generations renew Bridge tokens under the original signer
+ * and read resident inputs from their original config owners. Unclassified Start-held values cannot be
+ * recovered. No new credential is persisted.
  *
  * **Audit.** Each redemption whose proof holds is recorded against its seat, server and generation. A
  * request that proves nothing is recorded without attribution, whatever it claims.
@@ -151,6 +158,301 @@ class McpLaunchAdmissionService extends Base {
      */
     listening = null
 
+    /** @member {Object|null} journal Durable custody, attached by the lifecycle before managed Starts. @private */
+    journal = null
+
+    /** @member {Boolean} journalFailed A failed transition permanently freezes this issuer. @private */
+    journalFailed = false
+
+    /** @member {String|null} issuerOrigin The origin actually bound by this issuer. @private */
+    issuerOrigin = null
+
+    /** @member {String} continuityPhase Boot recovery excludes new Starts until its evidence is settled. @private */
+    continuityPhase = 'ready'
+
+    /** @member {Promise|null} handoffPromise One terminal handoff attempt per issuer. @private */
+    handoffPromise = null
+
+    /** @member {Function|null} readSeatStarts Projection supplied by the existing lifecycle owner. @private */
+    readSeatStarts = null
+
+    /**
+     * @summary Attaches exclusive durable custody before this issuer has minted any generations.
+     * Previous records are evidence only; the lifecycle must separately validate clean succession.
+     * @param {Object} options Explicit custody directory and injectable filesystem/durable primitives.
+     * @param {Function} [options.readSeatStarts] Existing lifecycle's closed Start/retention projection.
+     * @returns {Object|null} Previous snapshot with its clean-handoff disposition.
+     */
+    openJournal({readSeatStarts = () => [], ...options}) {
+        if (this.journal || this.generations.size) throw new Error('Launch admission custody must be attached before Start.');
+        if (typeof readSeatStarts !== 'function') throw new TypeError('Seat Start projection must be a function.');
+        this.readSeatStarts = readSeatStarts;
+        this.journal = openLaunchAdmissionJournal({
+            ...options, validateSnapshot: isAdmissionSnapshot, emptySnapshot: {version: RUNTIME_REFERENCE_SNAPSHOT_VERSION, generations: [], seats: []}
+        });
+        return this.journal.previous
+    }
+
+    /**
+     * @summary Restore only original active generations after the lifecycle proves their surviving seats.
+     * Every previous generation is retained as non-authoritative evidence first. The callback owns process,
+     * runtime and profile custody; this issuer checks the original bindings, tombstones and capabilities.
+     * A failed seat stays stale. A conflict on the original endpoint blocks the issuer without a fallback.
+     * @param {Object} options
+     * @param {Object} options.registry Existing definition owner.
+     * @param {Function} options.restoreSeat `(start, saved) => {capabilities, owners, residentInputs, probe}`.
+     * @param {Object} options.runtimeReferenceGuard Live exclusion for every retained generation parent.
+     * @returns {Promise<Object[]>} Per-seat admission disposition, without capabilities or owner values.
+     */
+    async recover({registry, restoreSeat, runtimeReferenceGuard}) {
+        if (!this.journal || this.generations.size || this.listening || this.continuityPhase !== 'ready' ||
+            typeof restoreSeat !== 'function') throw new Error('Launch recovery must precede admission and Start.');
+        const previous = this.journal.previous;
+        if (!previous) return [];
+        const retainedRuntimes = [...previous.snapshot.generations.map(row => row.runtime),
+            ...previous.snapshot.seats.map(row => row.start.runtime)].filter(Boolean);
+        /** @summary Revalidates the same parent exclusion before publishing recovered authority. */
+        const assertReferences = () => retainedRuntimes.forEach(runtime =>
+            assertRuntimeGenerationReferences(runtimeReferenceGuard, path.dirname(runtime.directory)));
+        assertReferences();
+        this.continuityPhase = 'recovering';
+        this.observeRegistry(registry);
+        for (const saved of previous.snapshot.generations) {
+            const agent      = registry.getDefinition(saved.agentId), current = agent ? projectDefinition(agent) : null;
+            const definition = current && crypto.createHash('sha256').update(canonicalJson(current)).digest('hex') === saved.definitionHash
+                ? current : null;
+            this.generations.set(saved.agentId, {
+                ...structuredClone(saved), definition, generationRoot: saved.runtime?.runtimeRoot ?? null,
+                state  : saved.state === STATES.REVOKED ? STATES.REVOKED : STATES.STALE,
+                reason : saved.state === STATES.REVOKED ? saved.reason : REASONS.RECOVERY_UNVERIFIED,
+                servers: new Map(saved.servers.map(row => [row.key, {...row, secret: null,
+                    state : row.state === STATES.REVOKED ? STATES.REVOKED : STATES.STALE,
+                    reason: row.state === STATES.REVOKED ? row.reason : REASONS.RECOVERY_UNVERIFIED,
+                    args  : null, env: null, owned: [], resident: [], required: []}])),
+                owners: {}, residentInputs: {}, proofs: new Map(), probe: null, waiters: new Set(), audit: []
+            });
+        }
+        try {
+            if (previous.handoffProved) {
+                if (previous.origin === null && previous.snapshot.generations.some(row => row.state === STATES.ACTIVE)) {
+                    throw new Error('Active launch authority has no original issuer origin.');
+                }
+                for (const saved of previous.snapshot.generations) {
+                    const generation = this.generations.get(saved.agentId);
+                    if (saved.state !== STATES.ACTIVE) continue;
+                    const seat = previous.snapshot.seats.find(row => row.start.agentId === saved.agentId);
+                    try {
+                        if (!seat || seat.state !== 'running' || seat.ownershipUnresolved || seat.cleanupUnresolved ||
+                            seat.start.admissionGeneration !== saved.id || seat.start.identity !== saved.identity ||
+                            seat.start.profile?.issuer !== previous.origin || !isDeepStrictEqual(seat.start.runtime, saved.runtime)) throw Error();
+                        const recovered = await restoreSeat(seat.start, saved);
+                        if (generation.state === STATES.REVOKED) continue;
+                        const agent      = registry.getDefinition(saved.agentId);
+                        const definition = agent && projectDefinition(agent);
+                        if (!definition || loginOf(agent) !== saved.identity ||
+                            crypto.createHash('sha256').update(canonicalJson(definition)).digest('hex') !== saved.definitionHash ||
+                            observeProcess(recovered.probe) !== 'live') throw Error();
+                        const effective = {...saved, servers: saved.servers.map(row => generation.servers.get(row.key).state === STATES.REVOKED
+                            ? {...row, state: STATES.REVOKED, reason: generation.servers.get(row.key).reason} : row)};
+                        const servers = this.recoverServers({saved: effective, start: seat.start, recovered});
+                        Object.assign(generation, {definition, servers, state: STATES.ACTIVE, reason: null,
+                            owners: recovered.owners, residentInputs: recovered.residentInputs, probe: recovered.probe});
+                    } catch {
+                        // One unproved survivor cannot authorize itself or discard another seat's evidence.
+                    }
+                }
+                if (previous.origin !== null) await this.listen({origin: previous.origin});
+            }
+            assertReferences();
+            this.journal.assertOwner();
+            for (const generation of this.generations.values()) {
+                if (generation.state !== STATES.ACTIVE) continue;
+                if (observeProcess(generation.probe) !== 'live') {
+                    Object.assign(generation, {state: STATES.STALE, reason: REASONS.RECOVERY_UNVERIFIED,
+                        owners: {}, residentInputs: {}, probe: null});
+                    generation.servers.forEach(server => { server.secret = null; });
+                    continue;
+                }
+                generation.servers.forEach(server => this.grants.set(server.grantId, {generation, key: server.key}));
+            }
+            this.persistAdmission();
+            this.continuityPhase = 'ready';
+            return [...this.generations.values()].map(row => ({agentId: row.agentId, state: row.state, reason: row.reason}));
+        } catch (error) {
+            this.continuityPhase = 'unavailable';
+            this.grants.clear();
+            for (const generation of this.generations.values()) {
+                if (generation.state === STATES.REVOKED) continue;
+                Object.assign(generation, {state: STATES.STALE, reason: REASONS.RECOVERY_UNVERIFIED, owners: {}, residentInputs: {}, probe: null});
+                generation.servers.forEach(server => { server.secret = null; });
+            }
+            try {
+                this.persistAdmission();
+            } finally {
+                if (this.httpServer) {
+                    const server = this.httpServer;
+                    this.httpServer = this.listening = this.issuerOrigin = null;
+                    await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
+                }
+            }
+            throw error;
+        }
+    }
+
+    /**
+     * @summary Rebuild fixed server targets from original classified metadata, never a fresh plan or ambient env.
+     * @param {Object} options Original journal row, Start record and the lifecycle's custody-checked inputs.
+     * @returns {Map} Recovered server states; disabled grants stay revoked.
+     * @protected
+     */
+    recoverServers({saved, start, recovered}) {
+        const {capabilities, owners, residentInputs} = recovered;
+        if (canonicalJson(Object.keys(capabilities).sort()) !== canonicalJson(saved.servers.map(row => row.key).sort()) ||
+            canonicalJson(Object.keys(start.profile.grants).sort()) !== canonicalJson(saved.servers.map(row => row.key).sort()) ||
+            canonicalJson(start.targets.map(row => row.key).sort()) !== canonicalJson(saved.servers.map(row => row.key).sort())) throw Error();
+        for (const [name, owner] of Object.entries(owners)) {
+            if (!isDeepStrictEqual(owner.binding, saved.credentialBindings[name]) || !owner.matches()) throw Error();
+        }
+        for (const [key, input] of Object.entries(residentInputs)) {
+            if (!isDeepStrictEqual({binding: input.binding, names: input.names}, saved.residentBindings[key]) || !input.matches()) throw Error();
+        }
+        return new Map(saved.servers.map(row => {
+            const capability = capabilities[row.key], grant = parseLaunchCapability(capability), expected = start.profile.grants[row.key];
+            if (!grant || grant.id !== row.grantId || expected.id !== row.grantId || expected.sha256 !== row.capabilityHash ||
+                crypto.createHash('sha256').update(capability).digest('hex') !== row.capabilityHash) throw Error();
+            const target = start.targets.find(target => target.key === row.key);
+            const owned  = [], resident = [], required = target.slots.filter(slot => slot.required).map(slot => slot.name);
+            if (row.state !== STATES.REVOKED) {
+                if (row.state !== STATES.ACTIVE) throw Error();
+                for (const slot of target.slots) {
+                    if (slot.state === 'owner' && owners[slot.name]) owned.push(slot.name);
+                    else if (slot.state === 'held' && residentInputs[row.key]?.names.includes(slot.name)) resident.push(slot.name);
+                    else if (slot.state !== 'absent' || slot.required) throw Error();
+                }
+            }
+            return [row.key, {...row, secret: grant.secret, args: [...target.args], env: {}, owned, resident, required}];
+        }));
+    }
+
+    /**
+     * @summary Seal clean succession only after survivor/input checks, in-flight proofs and endpoint release.
+     * The process owner must stop accepting control mutations before calling. A failed attempt closes
+     * custody without a handoff; ordinary process Quit remains the caller's choice, never blocked here.
+     * @param {Object} options
+     * @param {Function} options.verifySeats Validates every surviving seat against its original Start.
+     * @returns {Promise<Object>} Coalesced terminal disposition, without grants or input values.
+     */
+    handoff({verifySeats}) {
+        return this.handoffPromise ??= this.performHandoff(verifySeats);
+    }
+
+    /** @summary One bounded terminal transition; only the owner-facing handoff method starts it. @private */
+    async performHandoff(verifySeats) {
+        if (!this.journal || this.journalFailed || this.continuityPhase !== 'ready' || typeof verifySeats !== 'function') {
+            throw new Error('Fleet continuity refused: custody-unavailable.');
+        }
+        this.continuityPhase = 'draining';
+        let timer, stage = 'survivor-validation';
+        const deadline = new Promise((resolve, reject) => {
+            timer = setTimeout(() => reject(new Error('Fleet continuity refused: deadline.')), this.proofTimeoutMs);
+        });
+        const bounded = work => Promise.race([work, deadline]);
+        const release = () => new Promise((resolve, reject) => {
+            if (!this.httpServer) return resolve();
+            const server = this.httpServer;
+            server.close(error => {
+                if (error) return reject(error);
+                this.httpServer = this.listening = null;
+                resolve();
+            });
+            server.closeIdleConnections();
+        });
+        try {
+            if ([...this.generations.values()].some(row => row.state === STATES.RESERVED)) {
+                stage = 'pending-start';
+                throw new Error('Fleet continuity refused: pending-start.');
+            }
+            if ([...this.generations.values()].some(row => row.state === STATES.ACTIVE) &&
+                (!this.httpServer?.address() || this.issuerOrigin !== `http://127.0.0.1:${this.httpServer.address().port}`)) {
+                stage = 'endpoint-binding';
+                throw new Error('Fleet continuity refused: endpoint-binding.');
+            }
+            await bounded(Promise.resolve().then(verifySeats));
+            stage = 'proof-drain';
+            await bounded(Promise.all([...this.generations.values()].flatMap(row => [...row.proofs.values()])));
+            this.persistAdmission();
+            stage = 'endpoint-release';
+            await bounded(release());
+            stage = 'durable-handoff';
+            this.journal.handoff(this.admissionSnapshot(), this.issuerOrigin);
+            this.continuityPhase = 'handed-off';
+            return {state: 'handed-off'};
+        } catch {
+            this.continuityPhase = 'unavailable';
+            this.grants.clear();
+            this.journal.close();
+            if (this.httpServer) {
+                const server = this.httpServer;
+                this.httpServer = this.listening = null;
+                server.closeAllConnections();
+                await new Promise(resolve => server.close(resolve));
+            }
+            throw new Error(`Fleet continuity refused: ${stage}.`);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    /**
+     * @summary Projects lifecycle facts and capability hashes, never held environments or owner callbacks.
+     * This initial record cannot authorize recovery until the original-Start bindings are attached.
+     * @returns {Object} Closed, non-secret journal snapshot.
+     * @protected
+     */
+    admissionSnapshot() {
+        return {
+            version    : RUNTIME_REFERENCE_SNAPSHOT_VERSION,
+            seats      : this.readSeatStarts ? this.readSeatStarts() : [],
+            generations: [...this.generations.values()].map(generation => ({
+                id                : generation.id, agentId: generation.agentId, identity: generation.identity,
+                state             : generation.state, reason: generation.reason,
+                reservedAt        : generation.reservedAt, activatedAt: generation.activatedAt, revokedAt: generation.revokedAt,
+                definitionHash    : generation.definition ? crypto.createHash('sha256').update(canonicalJson(generation.definition)).digest('hex') : generation.definitionHash,
+                runtime           : generation.runtime ? {...generation.runtime} : null,
+                credentialBindings: structuredClone(generation.credentialBindings),
+                residentBindings  : structuredClone(generation.residentBindings),
+                servers           : [...generation.servers.values()].map(server => ({
+                    key           : server.key, grantId: server.grantId, state: server.state, reason: server.reason,
+                    capabilityHash: server.capabilityHash
+                }))
+            }))
+        }
+    }
+
+    /** @summary Publishes before a successful phase transition can escape to its caller. @protected */
+    persistAdmission() {
+        if (!this.journal) return;
+        try {
+            this.journal.write(this.admissionSnapshot(), this.issuerOrigin)
+        } catch (error) {
+            this.freezeAdmission();
+            throw error
+        }
+    }
+
+    /** @summary Fails every pending or active admission closed after a durability or ownership loss. @protected */
+    freezeAdmission() {
+        this.journalFailed = true;
+        for (const generation of this.generations.values()) {
+            if (generation.state !== STATES.REVOKED) {
+                generation.state = STATES.STALE;
+                generation.reason = REASONS.DURABILITY_FAILED;
+            }
+            this.releaseStartSignal(generation);
+            this.settle(generation);
+        }
+    }
+
     /**
      * @summary Mint one grant per enabled server for a seat's next Start, ending the seat's previous
      * generation. The registry the definition came from is followed from here on.
@@ -165,11 +467,15 @@ class McpLaunchAdmissionService extends Base {
      *     raw definitions through `getDefinition`.
      * @param {Number} [options.since] The {@link revocationMark} the Start read as it began.
      * @param {AbortSignal} [options.startSignal] The owning managed Start's cancellation signal.
+     * @param {Object|null} [options.runtimeGeneration] The verified packaged runtime selected for this Start.
+     * @param {Object} [options.runtimeReferenceGuard] Live parent exclusion for a packaged reservation.
      * @returns {Promise<{generation: String, issuer: String, identity: String, grants: Object<String, String>}>}
      *     `grants` maps each enabled server to the capability its profile row carries; `identity` is the
      *     validated login the rows must name.
      */
-    async reserve({agent, registry = null, since = null, startSignal = null}) {
+    async reserve({agent, registry = null, since = null, startSignal = null, runtimeGeneration = null, runtimeReferenceGuard = null}) {
+        if (this.continuityPhase !== 'ready') throw new Error('Fleet launch continuity is not ready.');
+        if (this.journalFailed) throw new Error('Launch admission issuer is frozen after a failed durable transition.');
         if (startSignal && (
             typeof startSignal.aborted !== 'boolean' ||
             typeof startSignal.addEventListener !== 'function' ||
@@ -184,27 +490,34 @@ class McpLaunchAdmissionService extends Base {
             throw new Error(`McpLaunchAdmissionService.reserve: agent '${agent?.id}' has no valid githubUsername identity.`)
         }
 
+        const runtime = runtimeGeneration === null ? null : runtimeGenerationPin(runtimeGeneration);
+        if (runtime) assertRuntimeGenerationReferences(runtimeReferenceGuard, path.dirname(runtime.directory));
         this.observeRegistry(registry);
 
         const
             previous   = this.generations.get(agent.id),
             definition = projectDefinition(agent),
             generation = {
-                id         : crypto.randomUUID(),
-                agentId    : agent.id,
+                id                : crypto.randomUUID(),
+                agentId           : agent.id,
                 identity,
-                state      : STATES.RESERVED,
-                reason     : null,
-                reservedAt : new Date().toISOString(),
-                activatedAt: null,
-                revokedAt  : null,
+                state             : STATES.RESERVED,
+                reason            : null,
+                reservedAt        : new Date().toISOString(),
+                activatedAt       : null,
+                revokedAt         : null,
                 definition,
-                servers    : new Map(),
-                owners     : {},
-                proofs     : new Map(),
-                probe      : null,
-                waiters    : new Set(),
-                audit      : []
+                runtime,
+                generationRoot    : null,
+                servers           : new Map(),
+                owners            : {},
+                credentialBindings: {},
+                residentInputs    : {},
+                residentBindings  : {},
+                proofs            : new Map(),
+                probe             : null,
+                waiters           : new Set(),
+                audit             : []
             },
             grants     = {};
 
@@ -218,7 +531,9 @@ class McpLaunchAdmissionService extends Base {
 
             const grant = mintLaunchGrant();
 
-            generation.servers.set(key, {key, grantId: grant.id, secret: grant.secret, state: STATES.RESERVED, reason: null, args: null, env: null, owned: []});
+            generation.servers.set(key, {key, grantId: grant.id, secret: grant.secret,
+                capabilityHash: crypto.createHash('sha256').update(grant.capability).digest('hex'), state: STATES.RESERVED, reason: null,
+                args          : null, env: null, owned: [], resident: [], required: []});
             this.grants.set(grant.id, {generation, key});
             grants[key] = grant.capability
         }
@@ -236,7 +551,9 @@ class McpLaunchAdmissionService extends Base {
             }
 
             registry?.getDefinition && this.onDefinitionChange({id: agent.id, next: registry.getDefinition(agent.id)});
-            issuer = await this.listen()
+            issuer = await this.listen();
+            if (runtime) assertRuntimeGenerationReferences(runtimeReferenceGuard, path.dirname(runtime.directory));
+            this.persistAdmission()
         } catch (error) {
             this.revoke(agent.id, REASONS.START_FAILED, {generation: generation.id});
             throw error
@@ -248,8 +565,9 @@ class McpLaunchAdmissionService extends Base {
     /**
      * @summary Bind a reserved generation to the Start that launched and leased its seat. Each server
      * redeems its row's values ({@link Neo.ai.services.fleet.managedAgentWorkspacePlan.launchRowEnvNames}):
-     * a seat credential from its owner at each redemption, every other value from the environment Start
-     * injected. It also gets the argv of its fixed target. A server whose required value has neither is
+     * seat credentials and bound resident inputs from their original owners at each redemption,
+     * other held values from the environment Start injected. It also gets the argv of its fixed target.
+     * A server whose required value has neither is
      * revoked with `credential-missing`. A generation revoked or replaced meanwhile stays as it is.
      * @param {Object} options
      * @param {String} options.generation The id {@link reserve} returned.
@@ -261,14 +579,43 @@ class McpLaunchAdmissionService extends Base {
      *     the name its value goes under: `{credential, resolve, prove}`, where `credential` is a
      *     `LAUNCH_ADMISSION_CREDENTIALS` value, `resolve()` returns what the owner holds now, and
      *     `prove(value, {signal})` answers `{verdict, reason}`. Legacy `{ok}` answers remain supported.
+     * @param {Object} [options.residentInputs] Original resolved-config owners keyed by resident server.
      * @param {Function} options.probe `() => 'live'|'gone'|'unknown'`, whether the launched process is still
      *     the seat: the lifecycle's own process proof.
      * @returns {Object} The seat's admission status ({@link statusOf}).
      */
-    activate({generation: id, agentId, plan, env, owners = {}, probe}) {
+    activate({generation: id, agentId, plan, env, owners = {}, residentInputs = {}, probe}) {
+        if (this.continuityPhase !== 'ready') throw new Error('Fleet launch continuity is not ready.');
         const generation = this.generations.get(agentId);
 
         if (generation?.id !== id || generation.state !== STATES.RESERVED) return this.statusOf(agentId);
+
+        const roots          = [...new Set(plan.filter(row => row.enabled).map(row => row.sourceRoot))];
+        const generationRoot = generation.runtime?.runtimeRoot ?? roots[0] ?? null;
+        if (roots.length > 1 || roots.some(root => !path.isAbsolute(root || '')) ||
+            generation.runtime && plan.some(row => row.sourceRoot !== generationRoot || row.command !== generation.runtime.executable)) {
+            throw new Error('Launch admission targets do not bind the reserved runtime.')
+        }
+        const credentialBindings = {};
+        for (const [name, owner] of Object.entries(owners)) {
+            if (owner.binding !== undefined) {
+                if (!isAdmissibleEnvName(name) || !isLaunchCredentialBinding(owner.binding) ||
+                    owner.binding.agentId !== agentId || owner.binding.identity !== generation.identity) {
+                    throw new Error('Launch admission credential binding is invalid.');
+                }
+                credentialBindings[name] = structuredClone(owner.binding);
+            }
+        }
+
+        const residentBindings = {};
+        for (const [key, input] of Object.entries(residentInputs)) {
+            if (!plan.some(row => row.key === key && row.enabled && row.target === 'resident') ||
+                !isResidentMcpBinding(input.binding) || input.binding.server !== key ||
+                !Array.isArray(input.names) || new Set(input.names).size !== input.names.length ||
+                !input.names.every(isAdmissibleEnvName) || typeof input.read !== 'function' || typeof input.matches !== 'function') {
+                throw new Error('Launch admission resident input binding is invalid.');
+            }
+        }
 
         for (const server of generation.servers.values()) {
             const row = plan.find(entry => entry.key === server.key);
@@ -291,14 +638,20 @@ class McpLaunchAdmissionService extends Base {
             }
 
             server.owned = owned;
-            server.env   = Object.fromEntries(held.map(name => [name, env[name]]));
+            const resident = row.target === 'resident' ? residentInputs[server.key] : null;
+            server.resident = resident ? held.filter(name => resident.names.includes(name)) : [];
+            server.required = names.required;
+            if (resident) residentBindings[server.key] = {binding: structuredClone(resident.binding), names: [...server.resident]};
+            server.env   = Object.fromEntries(held.filter(name => !server.resident.includes(name)).map(name => [name, env[name]]));
             server.args  = row.target === 'tenant'
                 ? [path.join(row.sourceRoot, BRIDGE_ENTRYPOINT), '--url', row.url, '--token-env', row.credentialEnvVar]
                 : [...row.args];
             server.state = STATES.ACTIVE
         }
 
-        Object.assign(generation, {state: STATES.ACTIVE, activatedAt: new Date().toISOString(), owners: {...owners}, probe});
+        Object.assign(generation, {state: STATES.ACTIVE, activatedAt: new Date().toISOString(), generationRoot,
+            credentialBindings, residentBindings, residentInputs: {...residentInputs}, owners: {...owners}, probe});
+        this.persistAdmission();
         this.releaseStartSignal(generation);
         this.settle(generation);
 
@@ -326,9 +679,10 @@ class McpLaunchAdmissionService extends Base {
         if (!generation || (id && generation.id !== id) || generation.state === STATES.REVOKED) return false;
 
         this.releaseStartSignal(generation);
-        Object.assign(generation, {state: STATES.REVOKED, reason, revokedAt: new Date().toISOString(), probe: null, owners: {}});
+        Object.assign(generation, {state: STATES.REVOKED, reason, revokedAt: new Date().toISOString(), probe: null, owners: {}, residentInputs: {}});
         generation.proofs.clear();
         generation.servers.forEach(server => revokeServer(server, server.state === STATES.REVOKED ? server.reason : reason));
+        this.persistAdmission();
         this.settle(generation);
 
         return true
@@ -462,6 +816,8 @@ class McpLaunchAdmissionService extends Base {
 
         if (request.server   !== server.key)          return refuse(REFUSALS.SERVER_MISMATCH);
         if (request.identity !== generation.identity) return refuse(REFUSALS.IDENTITY_MISMATCH);
+        if (this.continuityPhase !== 'ready') return refuse(REFUSALS.ISSUER_UNAVAILABLE, REASONS.RECOVERY_UNVERIFIED);
+        if (this.journalFailed) return refuse(REFUSALS.ISSUER_UNAVAILABLE, REASONS.DURABILITY_FAILED);
 
         if (server.state === STATES.RESERVED && generation.state === STATES.RESERVED && !await this.waitForSettlement(generation)) {
             return refuse(REFUSALS.PENDING_TIMEOUT)
@@ -471,6 +827,15 @@ class McpLaunchAdmissionService extends Base {
 
         if (revoked()) return refuse(REFUSALS.REVOKED, server.reason ?? generation.reason);
 
+        const resident         = generation.residentInputs[server.key];
+        const residentSnapshot = resident ? resident.read() : {};
+        if (residentSnapshot === null) return refuse(REFUSALS.CREDENTIAL_UNPROVEN);
+        if (server.resident.some(name => server.required.includes(name) && typeof residentSnapshot[name] !== 'string')) {
+            return refuse(REFUSALS.CREDENTIAL_MISSING);
+        }
+        const residentEnv = Object.fromEntries(server.resident.filter(name => typeof residentSnapshot[name] === 'string')
+            .map(name => [name, residentSnapshot[name]]));
+
         const
             owners      = server.owned.map(name => generation.owners[name]),
             credentials = server.owned.map((name, index) => readOwner(owners[index])),
@@ -478,8 +843,15 @@ class McpLaunchAdmissionService extends Base {
 
         if (missing > -1) return refuse(REFUSALS.CREDENTIAL_MISSING, ownerCredentialKind(owners[missing]));
 
-        const proofs = await Promise.all(server.owned.map((name, index) => this.prove(generation, name, credentials[index])));
+        // This exact snapshot also becomes the child's env. Never re-read the port after proving it.
+        const childEnv = {...server.env, ...residentEnv};
+        const port     = typeof childEnv.NEO_NL_PORT === 'string' && /^[1-9][0-9]{0,4}$/.test(childEnv.NEO_NL_PORT)
+            ? Number(childEnv.NEO_NL_PORT) : null;
+        const proofs = await Promise.all(server.owned.map((name, index) => this.prove(generation, name, credentials[index], port)));
+        if (this.journalFailed) return refuse(REFUSALS.ISSUER_UNAVAILABLE, REASONS.DURABILITY_FAILED);
         if (revoked()) return refuse(REFUSALS.REVOKED, server.reason ?? generation.reason);
+        if (this.continuityPhase !== 'ready') return refuse(REFUSALS.ISSUER_UNAVAILABLE, REASONS.RECOVERY_UNVERIFIED);
+        if (resident && !resident.matches()) return refuse(REFUSALS.CREDENTIAL_UNPROVEN);
 
         // A definite refusal wins over a concurrent unavailable proof; neither retires the generation.
         const failed  = proofs.findIndex(proof => proof.verdict === 'refused'),
@@ -500,10 +872,16 @@ class McpLaunchAdmissionService extends Base {
 
         if (observed !== 'live') return refuse(REFUSALS.PROCESS_UNKNOWN);
 
+        try { this.journal?.assertOwner() } catch {
+            this.freezeAdmission();
+            return refuse(REFUSALS.ISSUER_UNAVAILABLE, REASONS.DURABILITY_FAILED)
+        }
+
         return answer({
-            outcome: OUTCOMES.ADMITTED,
-            env    : {...server.env, ...Object.fromEntries(server.owned.map((name, index) => [name, credentials[index]]))},
-            args   : [...server.args]
+            outcome       : OUTCOMES.ADMITTED,
+            generationRoot: generation.generationRoot,
+            env           : {...childEnv, ...Object.fromEntries(server.owned.map((name, index) => [name, credentials[index]]))},
+            args          : [...server.args]
         })
     }
 
@@ -514,20 +892,23 @@ class McpLaunchAdmissionService extends Base {
      * @param {Object} generation
      * @param {String} name The name the value goes under.
      * @param {String} value
-     * @returns {Promise<{verdict: String, reason?: String}>}
+     * @param {Number|null} port Port captured for this child, relevant only to the Bridge token owner.
+     * @returns {Promise<{verdict: String, reason: (String|undefined)}>}
      * @protected
      */
-    prove(generation, name, value) {
+    prove(generation, name, value, port = null) {
         const
             {owners, proofs} = generation,
-            key              = `${name}\0${crypto.createHash('sha256').update(value).digest('base64url')}`;
+            bridge           = ownerCredentialKind(owners[name]) === 'bridge-token',
+            key              = `${name}\0${crypto.createHash('sha256').update(value).digest('base64url')}\0${bridge ? port : ''}`;
 
         if (!proofs.has(key)) {
             let timer;
             const controller = new AbortController();
 
             const proof = Promise.race([
-                Promise.resolve().then(() => owners[name].prove(value, {signal: controller.signal})),
+                Promise.resolve().then(() => owners[name].prove(value, {signal: controller.signal,
+                    ...(bridge ? {port, timeoutMs: this.proofTimeoutMs} : {})})),
                 new Promise(resolve => {
                     timer = setTimeout(() => {
                         resolve({verdict: 'unanswered', reason: 'proof-timeout'});
@@ -553,19 +934,26 @@ class McpLaunchAdmissionService extends Base {
     }
 
     /**
-     * @summary Start the loopback listener once, on an ephemeral port. A new Fleet process gets a new port,
-     * so a row written by an earlier one reaches no issuer.
+     * @summary Bind a new issuer on an ephemeral port, or a proved successor on the exact original origin.
+     * A recovery bind conflict never retries on another port or adopts the process holding the endpoint.
+     * @param {Object} [options]
+     * @param {String|null} [options.origin=null] Original custody-proved loopback origin for recovery only.
      * @returns {Promise<String>} The origin profile rows name.
      */
-    listen() {
+    listen({origin = null} = {}) {
+        if (origin !== null && (!/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(origin) ||
+            Number(origin.split(':').at(-1)) > 65535)) throw new Error('Original launch issuer origin is invalid.');
         return this.listening ??= new Promise((resolve, reject) => {
             const server = http.createServer((req, res) => void this.handle(req, res));
 
-            server.once('error', reject);
-            server.listen(0, '127.0.0.1', () => {
+            server.once('error', () => reject(new Error(origin
+                ? 'Original launch issuer endpoint could not be acquired; no alternate port selected.'
+                : 'Launch issuer endpoint could not be acquired.')));
+            server.listen(origin === null ? 0 : Number(origin.split(':').at(-1)), '127.0.0.1', () => {
                 server.unref();
                 this.httpServer = server;
-                resolve(`http://127.0.0.1:${server.address().port}`)
+                this.issuerOrigin = `http://127.0.0.1:${server.address().port}`;
+                resolve(this.issuerOrigin)
             })
         })
     }
@@ -574,10 +962,28 @@ class McpLaunchAdmissionService extends Base {
      * @summary Close the listener and drop every grant, then destroy the instance.
      */
     destroy() {
-        this.generations.forEach(generation => this.revoke(generation.agentId, REASONS.REPLACED));
-        this.httpServer?.close();
+        try {
+            if (this.continuityPhase !== 'handed-off') {
+                this.generations.forEach(generation => this.revoke(generation.agentId, REASONS.REPLACED))
+            }
+        } finally {
+            this.httpServer?.close();
+            this.journal?.close();
+            super.destroy()
+        }
+    }
 
-        super.destroy()
+    /** @summary Release this process's endpoint and lease without claiming a clean transition. */
+    async closeUnclean() {
+        if (this.continuityPhase === 'handed-off') return;
+        this.continuityPhase = 'unavailable';
+        this.grants.clear();
+        this.journal?.close();
+        if (this.httpServer) {
+            const server = this.httpServer;
+            this.httpServer = this.listening = null;
+            await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
+        }
     }
 
     /**
@@ -607,6 +1013,8 @@ class McpLaunchAdmissionService extends Base {
 
         const before = generation.definition, after = projectDefinition(next);
 
+        if (!before) return void this.revoke(id, REASONS.PLAN_CHANGED);
+
         if (after.harnessType !== before.harnessType || after.launchOwner !== before.launchOwner ||
             after.rawLaunch !== before.rawLaunch || !isDeepStrictEqual(after.mcpTarget, before.mcpTarget)) {
             return void this.revoke(id, REASONS.PLAN_CHANGED)
@@ -616,7 +1024,8 @@ class McpLaunchAdmissionService extends Base {
             if (!after.matrix[server.key] && server.state !== STATES.REVOKED) revokeServer(server, REASONS.SERVER_DISABLED)
         });
 
-        generation.definition = after
+        generation.definition = after;
+        this.persistAdmission()
     }
 
     /**
@@ -655,7 +1064,8 @@ class McpLaunchAdmissionService extends Base {
      * @protected
      */
     answer(generation, server, request, payload) {
-        record(generation.audit, {at: new Date().toISOString(), server: server.key, outcome: payload.outcome, code: payload.code ?? null, reason: payload.reason ?? null}, this.auditLimit);
+        record(generation.audit, {at: new Date().toISOString(), server: server.key, outcome: payload.outcome, code: payload.code ?? null,
+            reason: payload.reason ?? null, generationRoot: generation.generationRoot}, this.auditLimit);
 
         return signLaunchResponse(server.secret, request, payload)
     }
@@ -745,7 +1155,8 @@ function readOwner(owner) {
 /** @summary Return a fixed credential-type label, never an owner-supplied value. @param {Object} owner @returns {String|undefined} */
 function ownerCredentialKind(owner) {
     if (owner.credential === 'seat-pat') return 'seat-pat';
-    if (owner.credential === 'plane-bearer') return 'plane-bearer'
+    if (owner.credential === 'plane-bearer') return 'plane-bearer';
+    if (owner.credential === 'bridge-token') return 'bridge-token'
 }
 
 /**

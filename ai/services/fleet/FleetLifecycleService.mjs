@@ -1,32 +1,40 @@
-import {execFile, execFileSync, spawn}                              from 'child_process';
-import fs                                                           from 'fs';
-import path                                                         from 'path';
-import {isDeepStrictEqual}                                          from 'node:util';
-import AiConfig                                                     from '../../config.mjs';
-import {generateLocalBearerToken}                                   from '../../mcp/server/shared/helpers/localBearer.mjs';
-import Base                                                         from 'neo.mjs/src/core/Base.mjs';
-import {MCP_SERVERS, mcpCatalogFor, resolveMcpMatrix}               from '../../../src/fleet/contract/mcpServers.mjs';
-import {listHarnessTypes, resolveHarnessSeatSettings}               from '../../../src/fleet/contract/harnessTypes.mjs';
-import {REMOTE_MCP_CREDENTIAL_ENV_VAR, SEAT_PLANE_BASE_ENV_VAR}     from './mcpServers.mjs';
-import {deriveAgentInstanceHome}                                    from './deriveAgentInstanceHome.mjs';
-import {deriveCodexHome, deriveHarnessLaunchSpec}                   from './deriveHarnessLaunchSpec.mjs';
-import {readCodexSeatSettings}                                      from './codexConfigToml.mjs';
-import {deriveNodeRuntimeEnv, NODE_RUNTIME_ENV}                     from './deriveNodeRuntimeEnv.mjs';
-import FleetRegistryService                                         from './FleetRegistryService.mjs';
-import {readSeatEnvOperatorKeys, SEAT_ENV_NOT_REGULAR}              from './seatEnvFile.mjs';
-import {readSeatSessionFolder}                                      from './seatSessionFolder.mjs';
-import memoryCoreConfig                                             from '../../mcp/server/memory-core/config.mjs';
-import knowledgeBaseConfig                                          from '../../mcp/server/knowledge-base/config.mjs';
-import neuralLinkConfig                                             from '../../mcp/server/neural-link/config.mjs';
-import githubWorkflowConfig                                         from '../../mcp/server/github-workflow/config.mjs';
-import gitlabWorkflowConfig                                         from '../../mcp/server/gitlab-workflow/config.mjs';
-import {MANAGED_WORKSPACE_MCP_SERVER_DESCRIPTORS}                   from './managedAgentWorkspacePlan.mjs';
-import McpLaunchAdmissionService                                    from './McpLaunchAdmissionService.mjs';
-import {LAUNCH_ADMISSION_REASONS}                                   from '../../../src/fleet/contract/launchAdmission.mjs';
-import {isOnInstance}                                               from './provisionAgentRepo.mjs';
-import {cleanupCodexDesktopCrashpad, probeCodexDesktopCapabilities} from './manageCodexDesktopRuntime.mjs';
-import {probeAntigravityRuntime}                                   from './probeAntigravityRuntime.mjs';
-import {GIT_IDENTITY_ENV, gitIdentityEnv}                           from './seatGitIdentity.mjs';
+import {execFile, execFileSync, spawn}                                          from 'child_process';
+import fs                                                                       from 'fs';
+import path                                                                     from 'path';
+import {isDeepStrictEqual}                                                      from 'node:util';
+import AiConfig                                                                 from '../../config.mjs';
+import {generateLocalBearerToken}                                               from '../../mcp/server/shared/helpers/localBearer.mjs';
+import Base                                                                     from 'neo.mjs/src/core/Base.mjs';
+import {MCP_SERVERS, mcpCatalogFor, resolveMcpMatrix}                           from '../../../src/fleet/contract/mcpServers.mjs';
+import {listHarnessTypes, resolveHarnessSeatSettings}                           from '../../../src/fleet/contract/harnessTypes.mjs';
+import {REMOTE_MCP_CREDENTIAL_ENV_VAR, SEAT_PLANE_BASE_ENV_VAR}                 from './mcpServers.mjs';
+import {deriveAgentInstanceHome}                                                from './deriveAgentInstanceHome.mjs';
+import {deriveCodexHome, deriveHarnessLaunchSpec}                               from './deriveHarnessLaunchSpec.mjs';
+import {readCodexSeatSettings}                                                  from './codexConfigToml.mjs';
+import {deriveNodeRuntimeEnv, NODE_RUNTIME_ENV}                                 from './deriveNodeRuntimeEnv.mjs';
+import FleetRegistryService                                                     from './FleetRegistryService.mjs';
+import {readSeatEnvOperatorKeys, SEAT_ENV_NOT_REGULAR}                          from './seatEnvFile.mjs';
+import {readSeatSessionFolder}                                                  from './seatSessionFolder.mjs';
+import memoryCoreConfig                                                         from '../../mcp/server/memory-core/config.mjs';
+import knowledgeBaseConfig                                                      from '../../mcp/server/knowledge-base/config.mjs';
+import neuralLinkConfig                                                         from '../../mcp/server/neural-link/config.mjs';
+import githubWorkflowConfig                                                     from '../../mcp/server/github-workflow/config.mjs';
+import gitlabWorkflowConfig                                                     from '../../mcp/server/gitlab-workflow/config.mjs';
+import {MANAGED_WORKSPACE_MCP_SERVER_DESCRIPTORS}                               from './managedAgentWorkspacePlan.mjs';
+import McpLaunchAdmissionService                                                from './McpLaunchAdmissionService.mjs';
+import {LAUNCH_ADMISSION_REASONS}                                               from '../../../src/fleet/contract/launchAdmission.mjs';
+import {isOnInstance}                                                           from './provisionAgentRepo.mjs';
+import {cleanupCodexDesktopCrashpad, probeCodexDesktopCapabilities}             from './manageCodexDesktopRuntime.mjs';
+import {GIT_IDENTITY_ENV, gitIdentityEnv}                                       from './seatGitIdentity.mjs';
+import {runtimeGenerationPin, readRuntimeGeneration}                            from './runtimeGeneration.mjs';
+import {assertRuntimeGenerationReferences, waitForRuntimeGenerationReferences}  from './runtimeGenerationLease.mjs';
+import {createSeatRuntimeRecord, isBridgeSigningAuthority, seatRuntimeSnapshot} from './seatRuntimeRecord.mjs';
+import {writeFileAtomicSync}                                                    from '../shared/atomicFileWrite.mjs';
+
+import {createResidentMcpInputOwner, createBridgeTokenOwner, restoreLaunchCredentialOwner} from './launchCredentialOwners.mjs';
+import {recoverLaunchProfileGrants}                                                        from './launchProfileCustody.mjs';
+import {LAUNCH_ADMISSION_PROTOCOL}                                                         from './mcpLaunchAdmission.mjs';
+import {probeAntigravityRuntime}                                                           from './probeAntigravityRuntime.mjs';
 
 // Reserve the Neural Link policy slot against credential collisions and launch-metadata overrides.
 // Fleet does not impose a projection; explicitly restricted NL servers own their own ceiling.
@@ -528,6 +536,13 @@ class FleetLifecycleService extends Base {
     processes = new Map()
 
     /**
+     * Verified packaged runtime observed by the Fleet entrypoint, or null in checkout mode.
+     * This is a boot fact, never a user setting or evidence of an adopted seat's original runtime.
+     * @member {Object|null} installedRuntime=null
+     */
+    installedRuntime = null
+
+    /**
      * Starts still preparing or arming, including those queued for a seat's home, keyed by each attempt's Stop signal.
      * Every attempt owns two fences: Stop aborts its `stop` controller synchronously, and the operator's Skip its `skip`
      * controller ({@link skipDependencies}). Finishing one attempt cannot remove another attempt's cancellation.
@@ -660,6 +675,10 @@ class FleetLifecycleService extends Base {
      * @param {Object} [opts.gitIdentity] `{name, email}` the seat commits as, injected as author and committer
      *     under the four reserved `GIT_AUTHOR_*` / `GIT_COMMITTER_*` slots.
      * @param {AbortSignal} [opts.startSignal] The pending managed attempt's lifecycle-owned Stop fence.
+     * @param {Object} [opts.runtimeGeneration] The boot descriptor used by this prepared Start's MCP
+     *     commands. Raw launches and adopted records have no inferred generation.
+     * @param {Object[]} [opts.runtimePlan] The exact plan prepared for that runtime; its digest binds custody.
+     * @param {Object} [opts.runtimeReferenceGuard] Transient generation-parent exclusion held through Start publication.
      * @param {Function} [opts.bindAntigravityProject] Trusted, curated Antigravity-only Start callback. When present,
      *     it runs after the app-bundle process is leased and before its reserved MCP generation activates; this
      *     callback path returns a Promise while every other harness keeps the synchronous status shape.
@@ -677,9 +696,25 @@ class FleetLifecycleService extends Base {
         }
 
         if (opts.startSignal?.aborted) return this.canceledStart(id);
+        if (this.getLaunchAdmission().continuityPhase !== 'ready') throw new Error('Fleet Start refused: launch continuity is not ready.');
         if (this.isRunning(id)) {
             if (bindAntigravityProject) throw new Error('FleetLifecycleService.start: Antigravity project binding requires a new Start.');
             return this.status(id)
+        }
+        if (this.getLaunchAdmission().journalFailed) throw new Error('Fleet Start refused: runtime custody is frozen.');
+
+        if (this.installedRuntime && !opts.runtimeGeneration) {
+            throw new Error('Fleet Start refused: a packaged Start requires its prepared runtime.');
+        }
+
+        if (opts.runtimeGeneration && opts.runtimeGeneration !== this.installedRuntime?.generation) {
+            throw new Error('FleetLifecycleService.start: prepared runtime does not match this Fleet boot.')
+        }
+        if (opts.runtimeGeneration && !this.getLaunchAdmission().journal) {
+            throw new Error('Fleet Start refused: packaged runtime custody is not attached.');
+        }
+        if (opts.runtimeGeneration) {
+            assertRuntimeGenerationReferences(opts.runtimeReferenceGuard, path.dirname(opts.runtimeGeneration.directory));
         }
 
         const priorRecord = this.processes.get(id);
@@ -704,9 +739,9 @@ class FleetLifecycleService extends Base {
 
         if (bindAntigravityProject) {
             const
-                signal = opts.startSignal,
+                signal     = opts.startSignal,
                 generation = opts.launchAdmission?.generation,
-                admission = this.getLaunchAdmission().statusOf?.(id);
+                admission  = this.getLaunchAdmission().statusOf?.(id);
 
             if (agent.harnessType !== 'antigravity' || agent.metadata?.launch ||
                 !SURVIVING_HARNESS_TYPES.has(agent.harnessType)) {
@@ -741,7 +776,7 @@ class FleetLifecycleService extends Base {
         delete launchOptions.bindAntigravityProject;
         delete launchOptions.resolvedProcessEnvironment;
 
-        const launch = this.resolveLaunch(agent, {...launchOptions, cwd, serverPassword}),
+        const launch                          = this.resolveLaunch(agent, {...launchOptions, cwd, serverPassword}),
               {command, args, env: launchEnv} = launch;
 
         if (bindAntigravityProject && !launch.instanceHome) {
@@ -906,7 +941,13 @@ class FleetLifecycleService extends Base {
         // bridgeTokenEnvVar (never credentialEnvVar). The raw token enters the child env only — the
         // tracked process record never carries it (mirrors the PAT secret posture); the Bridge
         // handshake verifies it and fails closed on absence/mismatch.
-        env[this.bridgeTokenEnvVar] = this.getRegistry().mintBridgeToken(id).token;
+        const bridgeToken = opts.runtimeGeneration
+            ? this.getRegistry().mintBridgeToken(id, {withAuthority: true})
+            : this.getRegistry().mintBridgeToken(id);
+        if (opts.runtimeGeneration && !isBridgeSigningAuthority(bridgeToken.authority)) {
+            throw new Error('FleetLifecycleService.start: original Bridge signing authority was not captured.');
+        }
+        env[this.bridgeTokenEnvVar] = bridgeToken.token;
 
         // Agent identity: every FM-spawned harness carries the definition's canonical GitHub login
         // under the FIXED NEO_AGENT_IDENTITY var (a cross-process contract — the MCP identity
@@ -977,14 +1018,15 @@ class FleetLifecycleService extends Base {
 
         const record = {
             id, child,
-            cwd        : cwd ?? null,
-            pid        : child.pid ?? null,
-            state      : 'running',
-            startedAt  : new Date().toISOString(),
-            exitCode   : null,
-            signal     : null,
-            exitedAt   : null,
-            stderrBytes: 0,
+            bridgeAuthority: opts.runtimeGeneration ? structuredClone(bridgeToken.authority) : null,
+            cwd            : cwd ?? null,
+            pid            : child.pid ?? null,
+            state          : 'running',
+            startedAt      : new Date().toISOString(),
+            exitCode       : null,
+            signal         : null,
+            exitedAt       : null,
+            stderrBytes    : 0,
             // Curated-launch observability: the family + isolated home let `status` compute the live
             // per-home `authRequired` heuristic; null for raw-launch agents (unknown layout).
             harnessType             : launch.instanceHome ? agent.harnessType : null,
@@ -1008,7 +1050,8 @@ class FleetLifecycleService extends Base {
             // what proves later that the leased pid still runs this seat ({@link probeSeat})
             launchInterpreter  : survivesFleetExit ? readShebangLine(resolvedCommand) : null,
             profileArg         : survivesFleetExit ? args.find(arg => arg.startsWith('--user-data-dir=')) ?? null : null,
-            admissionGeneration: null
+            admissionGeneration: null,
+            runtimeGeneration  : opts.runtimeGeneration ?? null
         };
         this.processes.set(id, record);
 
@@ -1058,7 +1101,7 @@ class FleetLifecycleService extends Base {
             record.failureReason = 'tracked harness process emitted an error';
             record.exitedAt      = new Date().toISOString();
 
-            record.admissionGeneration && this.getLaunchAdmission().revoke(id, LAUNCH_ADMISSION_REASONS.PROCESS_EXITED, {generation: record.admissionGeneration});
+            this.revokeProcessAdmission(record);
 
             if (record.electronProfile && record.pid != null) {
                 // A successfully spawned Desktop main can emit `error` without proving process exit.
@@ -1069,6 +1112,7 @@ class FleetLifecycleService extends Base {
             } else {
                 record.child = null;
             }
+            this.persistRuntimeState(record);
         });
 
         if (opts.startSignal?.aborted) {
@@ -1092,37 +1136,62 @@ class FleetLifecycleService extends Base {
                 void this.stop(id, {cancelPending: false});
                 throw new Error(`FleetLifecycleService.start: ${record.failureReason} — agent '${id}'.`)
             }
+        }
 
-            // the seat now runs and is leased: its profile rows' grants may admit its MCP children
-            if (bindAntigravityProject) {
-                return this.finishAntigravityStart({id, agent, record, env, opts, callback: bindAntigravityProject})
+        try {
+            const slots = this.launchAdmissionOwners({agent, record, launchAdmission: opts.launchAdmission});
+            if (survivesFleetExit && opts.launchAdmission) record.admissionGeneration = opts.launchAdmission.generation;
+            if (record.runtimeGeneration) {
+                record.pidStartedAt ??= this.getProcessInspectFn()(record.pid)?.startedAt ?? null;
+                record.runtimeStart = createSeatRuntimeRecord({record, identity: agentIdentity,
+                    plan   : opts.runtimePlan, env, owners: slots,
+                    profile: opts.launchAdmission?.profile ?? null, leaseRequired: survivesFleetExit});
+                this.getLaunchAdmission().persistAdmission();
             }
 
-            this.activateLaunchAdmission({id, agent, record, env, launchAdmission: opts.launchAdmission});
+            // Activation follows durable Start publication and any trusted project-binding callback.
+            if (survivesFleetExit && opts.launchAdmission) {
+                if (bindAntigravityProject) {
+                    return this.finishAntigravityStart({id, agent, record, env, opts, callback: bindAntigravityProject});
+                }
+                this.activateLaunchAdmission({id, agent, record, env, launchAdmission: opts.launchAdmission});
+            }
+        } catch (error) {
+            record.failureReason = 'the original Start could not be committed; the new seat is being stopped';
+            void this.stop(id, {cancelPending: false});
+            throw error
         }
 
         return this.status(id);
     }
 
-    /** @summary Activate a reserved generation only after its surviving process has passed Start gates. */
-    activateLaunchAdmission({id, agent, record, env, launchAdmission}) {
-        if (!launchAdmission) return;
-
+    /** @summary Binds the same original credential owners for durable Start capture and later activation. */
+    launchAdmissionOwners({agent, record, launchAdmission}) {
         const
-            owners = launchAdmission.owners ?? {},
+            owners = launchAdmission?.owners ?? {},
             slots  = {
                 [agent.forge === 'gitlab' ? 'NEO_GITLAB_PAT' : this.credentialEnvVar]: owners.pat,
                 [REMOTE_MCP_CREDENTIAL_ENV_VAR]                                      : owners.plane
             };
+        if (record.runtimeGeneration && launchAdmission?.plan.some(row => row.key === 'neural-link' && row.enabled)) {
+            slots[this.bridgeTokenEnvVar] = createBridgeTokenOwner({registry: this.registry, agent, authority: record.bridgeAuthority});
+        }
+        return slots;
+    }
 
+    /** @summary Activate a reserved generation only after its surviving process has passed Start gates. */
+    activateLaunchAdmission({id, agent, record, env, launchAdmission}) {
+        if (!launchAdmission) return;
+        const slots = this.launchAdmissionOwners({agent, record, launchAdmission});
         record.admissionGeneration = launchAdmission.generation;
         this.getLaunchAdmission().activate({
-            generation: launchAdmission.generation,
-            agentId   : id,
-            plan      : launchAdmission.plan,
-            env       : Object.fromEntries(Object.entries(env).filter(([name]) => !Object.hasOwn(slots, name))),
-            owners    : Object.fromEntries(Object.entries(slots).filter(([, owner]) => owner)),
-            probe     : () => this.probeSeat(record)
+            generation    : launchAdmission.generation,
+            agentId       : id,
+            plan          : launchAdmission.plan,
+            env           : Object.fromEntries(Object.entries(env).filter(([name]) => !Object.hasOwn(slots, name))),
+            owners        : Object.fromEntries(Object.entries(slots).filter(([, owner]) => owner)),
+            residentInputs: launchAdmission.residentInputs ?? {},
+            probe         : () => this.probeSeat(record)
         })
     }
 
@@ -1137,14 +1206,14 @@ class FleetLifecycleService extends Base {
     async finishAntigravityStart({id, agent, record, env, opts, callback}) {
         const
             launchAdmission = opts.launchAdmission,
-            generation = launchAdmission.generation,
-            signal = opts.startSignal,
-            descriptor = Object.freeze({
+            generation      = launchAdmission.generation,
+            signal          = opts.startSignal,
+            descriptor      = Object.freeze({
                 id,
-                pid: record.pid,
+                pid         : record.pid,
                 pidStartedAt: record.pidStartedAt,
                 instanceHome: record.instanceHome,
-                cwd: record.cwd,
+                cwd         : record.cwd,
                 signal
             });
         let failureReason = null, failureCause = null;
@@ -1154,6 +1223,11 @@ class FleetLifecycleService extends Base {
                 failureReason = LAUNCH_ADMISSION_REASONS.STOP_REQUESTED
             } else {
                 await callback(descriptor);
+
+                if (!signal.aborted && record.runtimeStart) {
+                    await recoverLaunchProfileGrants({managedRoot: fs.realpathSync(this.getInstanceRoot()),
+                        instanceHome: record.instanceHome, workspaceRoot: record.cwd, binding: record.runtimeStart.profile});
+                }
 
                 if (signal.aborted) {
                     failureReason = LAUNCH_ADMISSION_REASONS.STOP_REQUESTED
@@ -1362,10 +1436,12 @@ class FleetLifecycleService extends Base {
      * (read from the persisted process record) — so a provisioned agent restarts inside its own checkout,
      * not this process's directory, and its checkout-path-keyed auto-memory does not fork. `restart` of a
      * non-running agent is just `start` (at the recorded `cwd` when one exists).
+     * Packaged seats use FleetManager's prepared restart, never this checkout-only compatibility path.
      * @param {String} id
      * @returns {Promise<Object>} status
      */
     async restart(id) {
+        if (this.installedRuntime) throw new Error('Fleet restart refused: a packaged seat requires a prepared managed restart.');
         const priorCwd = this.processes.get(id)?.cwd ?? null;
         const stopped  = await this.stop(id);
 
@@ -1408,6 +1484,8 @@ class FleetLifecycleService extends Base {
      *     `gitIdentity` is the identity the seat's last provisioned start resolved ({@link setGitIdentity}), also
      *     after a start it refused; `null` before the first. `seatModel` is what that start found of the seat's
      *     declared model in its harness's catalog ({@link setSeatModel}); `null` before a start read one.
+     *     `runtimeGeneration` carries the original Start's runtime and retention pin; missing original
+     *     bindings are explicitly unknown, even when this Fleet has a newer installed runtime.
      */
     status(id) {
         this.adoptLeasedSeats();
@@ -1449,13 +1527,29 @@ class FleetLifecycleService extends Base {
                 instanceAddress: record.wakeRoute.instanceAddress ?? null,
                 subscriptionId : record.wakeRoute.subscriptionId ?? null
             } : null,
-            repos          : record.repos ? record.repos.map(repo => ({...repo})) : null,
-            dependencies   : this.dependenciesOf(id),
-            sessionFolder  : this.sessionFolderFor(record),
-            gitIdentity    : this.gitIdentityOf(id),
-            seatModel      : this.seatModelOf(id),
-            launchAdmission: this.launchAdmissionOf(id, record)
+            repos            : record.repos ? record.repos.map(repo => ({...repo})) : null,
+            dependencies     : this.dependenciesOf(id),
+            sessionFolder    : this.sessionFolderFor(record),
+            gitIdentity      : this.gitIdentityOf(id),
+            seatModel        : this.seatModelOf(id),
+            launchAdmission  : this.launchAdmissionOf(id, record),
+            runtimeGeneration: this.runtimeGenerationOf(record)
         };
+    }
+
+    /**
+     * @summary Projects this Start's runtime for retention and display, independent of MCP-child activity.
+     * Only proved terminal lifecycle states release a pin; unresolved cleanup or ownership retains it.
+     * @param {Object} record Existing lifecycle record.
+     * @returns {Object} Runtime facts plus `pin: held|released|unknown`.
+     * @private
+     */
+    runtimeGenerationOf(record) {
+        const pin = this.getLaunchAdmission().journalFailed || record.runtimeUnresolved || record.ownershipUnresolved || record.cleanupUnresolved ? 'unknown' :
+            ['stopped', 'exited'].includes(record.state) ? 'released' :
+                ['running', 'stopping'].includes(record.state) ? 'held' : 'unknown';
+        return record.runtimeGeneration ? {...runtimeGenerationPin(record.runtimeGeneration), pin} :
+            {id: null, directory: null, runtimeRoot: null, executable: null, payloadDigest: null, pin: 'unknown'}
     }
 
     /**
@@ -1870,13 +1964,10 @@ class FleetLifecycleService extends Base {
 
         if (!pidStartedAt) return 'its start time could not be read';
 
-        const
-            leasePath = path.join(record.instanceHome, SEAT_LEASE_FILE),
-            tmpPath   = `${leasePath}.${process.pid}.tmp`;
+        const leasePath = path.join(record.instanceHome, SEAT_LEASE_FILE);
 
         try {
-            fs.mkdirSync(record.instanceHome, {recursive: true});
-            fs.writeFileSync(tmpPath, JSON.stringify({
+            writeFileAtomicSync(leasePath, JSON.stringify({
                 version    : 1,
                 agentId    : record.id,
                 harnessType: record.harnessType,
@@ -1884,13 +1975,10 @@ class FleetLifecycleService extends Base {
                 pidStartedAt,
                 startedAt  : record.startedAt,
                 cwd        : record.cwd
-            }, null, 4), {mode: 0o600});
-            fs.renameSync(tmpPath, leasePath);
+            }, null, 4), {mode: 0o600, fsync: true});
             record.pidStartedAt = pidStartedAt;
             return null
         } catch (error) {
-            try { fs.rmSync(tmpPath, {force: true}) } catch {}
-
             const words = failureWords(error, `the lease of agent '${record.id}' could not be written`);
 
             return words ? `its lease could not be written: ${words}` : 'its lease could not be written; the Fleet log names the cause'
@@ -2041,6 +2129,200 @@ class FleetLifecycleService extends Base {
     }
 
     /**
+     * @summary Attaches the one Fleet journal before any lifecycle record is created or adopted.
+     * Previous records are returned for recovery checks, never automatically adopted as authority.
+     * @param {Object} options Journal custody and durable-write seams.
+     * @returns {Object|null} Previous evidence and its issuer-handoff disposition.
+     */
+    openRuntimeCustody(options) {
+        if (this.processes.size) throw new Error('Runtime custody must be opened before lifecycle adoption or Start.');
+        return this.getLaunchAdmission().openJournal({...options,
+            readSeatStarts: () => [...this.processes.values()].filter(record => record.runtimeStart).map(seatRuntimeSnapshot)});
+    }
+
+    /**
+     * @summary Re-attach original runtime pins and reconstruct native admission without preparing a profile.
+     * Lease adoption remains the process owner. A different or unobserved process retains an unknown pin;
+     * it cannot inherit the old Start's grants. Runtime verification uses this process's trusted reader.
+     * @param {Object} options
+     * @param {Object} options.tenantService Original plane/tenant credential owner.
+     * @param {Function} [options.verifyRuntime=readRuntimeGeneration] Isolated-test seam for payload verification.
+     * @param {Function} [options.readGrants=recoverLaunchProfileGrants] Isolated-test seam for profile custody.
+     * @returns {Promise<Object[]>} Admission dispositions without credentials or capabilities.
+     */
+    async recoverRuntimeCustody(options = {}) {
+        if (!this.getLaunchAdmission().journal) throw new Error('Runtime custody must be attached before recovery.');
+        const runtime = runtimeGenerationPin(this.installedRuntime?.generation);
+        const guard   = await waitForRuntimeGenerationReferences({directory: path.dirname(runtime.directory), signal: options.signal});
+        try {
+            const result = await this.recoverRuntimeCustodyUnderGuard(options, guard);
+            assertRuntimeGenerationReferences(guard, path.dirname(runtime.directory));
+            return result;
+        } finally { guard.release(); }
+    }
+
+    /** @summary Reconstructs retained references while publication and retirement share exclusion. @private */
+    async recoverRuntimeCustodyUnderGuard({tenantService, verifyRuntime = readRuntimeGeneration, readGrants = recoverLaunchProfileGrants}, runtimeReferenceGuard) {
+        const admission = this.getLaunchAdmission();
+        if (!admission.journal) throw new Error('Runtime custody must be attached before recovery.');
+        const previous = admission.journal.previous, registry = this.getRegistry(), verified = new Map();
+        this.adoptLeasedSeats();
+        for (const saved of previous?.snapshot.seats ?? []) {
+            const start  = saved.start;
+            let   record = this.processes.get(start.agentId);
+            if (!record) {
+                record = {id: start.agentId, child: null, adopted: false, pid: start.pid, startedAt: start.startedAt,
+                    state              : 'failed', harnessType: start.harnessType, instanceHome: start.instanceHome,
+                    ownershipUnresolved: true, failureReason: 'the original runtime seat could not be re-adopted'};
+                this.processes.set(start.agentId, record);
+            }
+            Object.assign(record, {runtimeStart: structuredClone(start), runtimeGeneration: {...start.runtime},
+                runtimeUnresolved: true, admissionGeneration: start.admissionGeneration,
+                cleanupUnresolved: Boolean(record.cleanupUnresolved || saved.cleanupUnresolved)});
+            if (!record.adopted && this.probeSeat(start) === 'gone' && !record.cleanupUnresolved) {
+                Object.assign(record, {state: 'exited', ownershipUnresolved: false, runtimeUnresolved: false});
+            }
+        }
+
+        /** @summary Verify a retained pin without importing its code or replacing its lifecycle record. */
+        const verifyPin = async start => {
+            const record = this.processes.get(start.agentId);
+            if (!record || !this.matchesRuntimeStart(record, start)) return false;
+            const key = JSON.stringify(start.runtime);
+            if (!verified.has(key)) verified.set(key, Promise.resolve().then(() => verifyRuntime({directory: start.runtime.directory})));
+            try {
+                const runtime = await verified.get(key);
+                record.runtimeUnresolved = !runtime || !isDeepStrictEqual(runtimeGenerationPin(runtime), start.runtime) ||
+                    runtime.compatibility?.launchProtocol !== LAUNCH_ADMISSION_PROTOCOL ||
+                    this.processes.get(start.agentId) !== record || !this.matchesRuntimeStart(record, start) || this.probeSeat(record) !== 'live';
+            } catch {}
+            return !record.runtimeUnresolved;
+        };
+        const dispositions = await admission.recover({registry, runtimeReferenceGuard, restoreSeat: async (start, saved) => {
+            if (!await verifyPin(start)) throw Error();
+            return this.readOriginalRuntimeInputs(start, saved, {tenantService, readGrants});
+        }});
+        for (const {start} of previous?.snapshot.seats ?? []) await verifyPin(start);
+        admission.persistAdmission();
+        return dispositions;
+    }
+
+    /**
+     * @summary Read the original profile and reconstruct its input owners for either handoff or recovery.
+     * @param {Object} start Immutable Start record.
+     * @param {Object} saved Admission metadata from the same Start.
+     * @param {Object} options Existing tenant service and optional custody reader; fresh Starts may be checked at handoff.
+     * @returns {Promise<Object>} Transient capabilities and callbacks, never persistable credentials.
+     * @private
+     */
+    async readOriginalRuntimeInputs(start, saved, {tenantService, readGrants = recoverLaunchProfileGrants, adopted = true} = {}) {
+        const record = this.processes.get(start.agentId), registry = this.getRegistry();
+        if (!record || !this.matchesRuntimeStart(record, start, {adopted})) throw Error();
+        const capabilities = await readGrants({managedRoot: fs.realpathSync(this.getInstanceRoot()),
+            instanceHome: record.instanceHome, workspaceRoot: record.cwd, binding: start.profile});
+        const owners = Object.fromEntries(Object.entries(saved.credentialBindings).map(([name, binding]) =>
+            [name, restoreLaunchCredentialOwner(binding, {registry, tenantService})]));
+        const residentInputs = Object.fromEntries(Object.entries(saved.residentBindings).map(([key, source]) =>
+            [key, createResidentMcpInputOwner({binding: source.binding, names: source.names, read: () => this.readResidentMcpInput(key)})]));
+        const probe = () => this.processes.get(start.agentId) === record && this.matchesRuntimeStart(record, start, {adopted}) &&
+            !record.runtimeUnresolved ? this.probeSeat(record) : 'unknown';
+        return {capabilities, owners, residentInputs, probe};
+    }
+
+    /**
+     * @summary Verify surviving runtime pins and current original-owner inputs before the issuer seals succession.
+     * Pending Starts, legacy seats and unproved inputs refuse handoff without preventing ordinary Quit.
+     * @param {Object} options Existing tenant owner, with isolated-test seams for runtime/profile reads.
+     * @returns {Promise<Object>} The admission owner's terminal handoff disposition.
+     */
+    handoffRuntimeCustody({tenantService, verifyRuntime = readRuntimeGeneration, readGrants = recoverLaunchProfileGrants} = {}) {
+        const admission = this.getLaunchAdmission();
+        return admission.handoff({verifySeats: async () => {
+            if (this.pendingStarts.size) throw Error();
+            this.adoptLeasedSeats();
+            const verified = new Map();
+            for (const record of this.processes.values()) {
+                if (['stopped', 'exited'].includes(record.state) && !record.ownershipUnresolved && !record.cleanupUnresolved) continue;
+                const start = record.runtimeStart;
+                if (!start || record.runtimeUnresolved || !this.matchesRuntimeStart(record, start, {adopted: false}) || this.probeSeat(record) !== 'live') throw Error();
+                const key = JSON.stringify(start.runtime);
+                if (!verified.has(key)) verified.set(key, Promise.resolve().then(() => verifyRuntime({directory: start.runtime.directory})));
+                const runtime = await verified.get(key);
+                if (!runtime || !isDeepStrictEqual(runtimeGenerationPin(runtime), start.runtime) ||
+                    runtime.compatibility?.launchProtocol !== LAUNCH_ADMISSION_PROTOCOL) throw Error();
+                if (start.admissionGeneration) {
+                    const saved = admission.admissionSnapshot().generations.find(row => row.id === start.admissionGeneration);
+                    if (!saved || !['active', 'revoked'].includes(saved.state)) throw Error();
+                    if (saved.state === 'revoked') continue;
+                    const recovered = await this.readOriginalRuntimeInputs(start, saved, {tenantService, readGrants, adopted: false});
+                    const servers   = admission.recoverServers({saved, start, recovered});
+                    for (const server of servers.values()) {
+                        if (server.state === 'revoked') continue;
+                        const resident = recovered.residentInputs[server.key], env = resident ? resident.read() : {};
+                        if (env === null || server.resident.some(name => server.required.includes(name) && typeof env[name] !== 'string')) throw Error();
+                        const values = server.owned.map(name => recovered.owners[name].resolve());
+                        if (values.some(value => typeof value !== 'string' || !value.trim())) throw Error();
+                        const port       = typeof env.NEO_NL_PORT === 'string' && /^[1-9][0-9]{0,4}$/.test(env.NEO_NL_PORT) ? Number(env.NEO_NL_PORT) : null;
+                        const generation = admission.generations.get(start.agentId);
+                        const proofs     = await Promise.all(server.owned.map((name, index) => admission.prove(generation, name, values[index], port)));
+                        if (proofs.some(row => row.verdict !== 'proved') || resident && !resident.matches()) throw Error();
+                    }
+                    if (recovered.probe() !== 'live') throw Error();
+                }
+            }
+        }});
+    }
+
+    /**
+     * @summary Corroborates the immutable Start against the lease-derived record and current registry identity.
+     * @param {Object} record Record adopted through the existing lifecycle owner.
+     * @param {Object} start Original durable Start, never derived from a writable lease.
+     * @param {Object} [options]
+     * @param {Boolean} [options.adopted=true] Recovery requires adoption; handoff may inspect the original child.
+     * @returns {Boolean}
+     * @private
+     */
+    matchesRuntimeStart(record, start, {adopted = true} = {}) {
+        const agent = this.getRegistry().getDefinition(start.agentId);
+        return !!agent && !agent.metadata?.launch && start.leaseRequired && (record.adopted || !adopted && record.child) && record.state === 'running' &&
+            !record.ownershipUnresolved && !record.cleanupUnresolved &&
+            agent.harnessType === start.harnessType && agent.githubUsername?.trim().replace(/^@/, '') === start.identity &&
+            ['pid', 'pidStartedAt', 'startedAt', 'cwd', 'instanceHome', 'launchCommand', 'launchInterpreter', 'profileArg', 'harnessType']
+                .every(key => (record[key] ?? null) === start[key]);
+    }
+
+    /**
+     * @summary Publishes an observed terminal/error state from a process callback. Durability loss freezes
+     * the issuer and leaves retention unknown; a callback cannot throw an unhandled process exception.
+     * @param {Object} record
+     * @returns {Boolean} Whether its observation was durably published, or needed no runtime record.
+     * @private
+     */
+    persistRuntimeState(record) {
+        if (!record.runtimeStart) return true;
+        if (!this.getLaunchAdmission().journal) return false;
+        try {
+            this.getLaunchAdmission().persistAdmission();
+            return true
+        } catch {
+            record.failureReason = 'Fleet runtime custody could not be updated; launch admission is frozen';
+            return false
+        }
+    }
+
+    /** @summary Revokes from a process callback while preserving cleanup after a failed durable write. */
+    revokeProcessAdmission(record) {
+        if (!record.admissionGeneration) return;
+        const admission = this.getLaunchAdmission();
+        try {
+            admission.revoke(record.id, LAUNCH_ADMISSION_REASONS.PROCESS_EXITED, {generation: record.admissionGeneration});
+        } catch {
+            admission.freezeAdmission();
+            record.failureReason = 'Fleet admission revocation could not be committed; the issuer is frozen';
+        }
+    }
+
+    /**
      * @summary Whether a process runs a Claude Desktop or Antigravity seat's profile: the seat's launch
      * binary with its own `--user-data-dir` as a whole word, the proof the lease uses ({@link probeSeat}).
      * Helpers carry the argument too, but not the binary, so they do not count. Start rewrites the profile's MCP rows
@@ -2141,11 +2423,12 @@ class FleetLifecycleService extends Base {
         record.exitedAt = new Date().toISOString();
         record.child    = null;
 
-        record.admissionGeneration && this.getLaunchAdmission().revoke(record.id, LAUNCH_ADMISSION_REASONS.PROCESS_EXITED, {generation: record.admissionGeneration});
+        this.revokeProcessAdmission(record);
         this.removeSeatLease(record);
 
         if (!record.electronProfile) {
             record.state           = 'stopped';
+            this.persistRuntimeState(record);
             record.finalizePromise = Promise.resolve();
             return record.finalizePromise;
         }
@@ -2156,6 +2439,7 @@ class FleetLifecycleService extends Base {
             record.state             = 'failed';
             record.cleanupUnresolved = true;
             record.failureReason     = 'Codex Desktop helper cleanup cannot be proven: the installed bundle no longer names its Crashpad helper';
+            this.persistRuntimeState(record);
             record.finalizePromise   = Promise.resolve();
             return record.finalizePromise;
         }
@@ -2189,7 +2473,7 @@ class FleetLifecycleService extends Base {
                 record.state             = 'failed';
                 record.failureReason     = words ? `Codex Desktop helper cleanup failed: ${words}` : 'Codex Desktop helper cleanup failed; the Fleet log names the cause';
                 record.cleanupUnresolved = true;
-            });
+            }).then(() => { this.persistRuntimeState(record) });
 
         return record.finalizePromise;
     }
@@ -2551,35 +2835,61 @@ class FleetLifecycleService extends Base {
      *     it; omitted, only a tenant row does.
      * @returns {Object<String,Object<String,String>>} Per-server child environment, not an artifact.
      */
-    resolveResidentMcpEnvironment(agent, {remote = agent.mcpTarget?.kind === 'tenant'} = {}) {
-        if (agent.metadata?.launch) return {};
-        const matrix = resolveMcpMatrix(agent.mcpServers, mcpCatalogFor(agent.forge)), result = {};
+    resolveResidentMcpEnvironment(agent, options) {
+        return this.captureResidentMcpInputs(agent, {...options, bind: false}).environment;
+    }
+
+    /**
+     * @summary Capture the export used by preparation and optionally bind later reads to that same source.
+     * @param {Object} agent Original Fleet definition.
+     * @param {Object} [options]
+     * @param {Boolean} [options.remote] Existing placement choice for this Start.
+     * @param {Boolean} [options.bind=true] False retains the ordinary transient-export API.
+     * @returns {Object} Transient `{environment,owners}`; owners retain only metadata and callbacks.
+     */
+    captureResidentMcpInputs(agent, {remote = agent.mcpTarget?.kind === 'tenant', bind = true} = {}) {
+        const environment = {}, owners = {};
+        if (agent.metadata?.launch) return {environment, owners};
+        const matrix = resolveMcpMatrix(agent.mcpServers, mcpCatalogFor(agent.forge));
         for (const {key} of MCP_SERVERS) {
             if (!matrix[key] || (remote && REMOTE_MCP_SERVER_KEYS.has(key))) continue;
-            const descriptor    = MANAGED_WORKSPACE_MCP_SERVER_DESCRIPTORS[key];
-            const providerSlots = descriptor.providerCredentialEnv || {};
-            const envNames      = descriptor.runtimeEnv.filter(name =>
-                !SEAT_ENV.has(name) && !Object.values(providerSlots).includes(name));
-            if (descriptor.providerCredentialEnv) {
-                for (const provider of [AiConfig.modelProvider, AiConfig.embeddingProvider]) {
-                    if (providerSlots[provider]) envNames.push(providerSlots[provider]);
-                }
+            const current = this.readResidentMcpInput(key);
+            environment[key] = current.env;
+            if (bind) {
+                owners[key] = createResidentMcpInputOwner({binding: current.binding, names: Object.keys(current.env),
+                    read: () => this.readResidentMcpInput(key)});
             }
-            const values = this.residentMcpEnvSource ? this.residentMcpEnvSource(key) : ({
-                'memory-core'    : memoryCoreConfig, 'knowledge-base': knowledgeBaseConfig,
-                'neural-link'    : neuralLinkConfig, 'github-workflow': githubWorkflowConfig,
-                'gitlab-workflow': gitlabWorkflowConfig
-            })[key].exportEnv({
-                envNames,
-                includePlaneMembers: true
-            });
-            if (!values || typeof values !== 'object' || Array.isArray(values) ||
-                !path.isAbsolute(values.NEO_PLANE_DATA_ROOT || '')) {
-                throw new Error(`FleetLifecycleService: '${key}' has no placed resident MCP environment.`)
-            }
-            result[key] = {...values}
         }
-        return result
+        return {environment, owners};
+    }
+
+    /**
+     * @summary Read the existing resolved config export and classify its server, plane and provider owners.
+     * @param {String} key Fixed MCP catalog key.
+     * @returns {Object} `{env,binding}`; only binding may enter durable custody.
+     */
+    readResidentMcpInput(key) {
+        const descriptor    = MANAGED_WORKSPACE_MCP_SERVER_DESCRIPTORS[key];
+        const providerSlots = descriptor.providerCredentialEnv || {};
+        const envNames      = descriptor.runtimeEnv.filter(name => !SEAT_ENV.has(name) && !Object.values(providerSlots).includes(name));
+        if (descriptor.providerCredentialEnv) {
+            for (const provider of [AiConfig.modelProvider, AiConfig.embeddingProvider]) {
+                if (providerSlots[provider]) envNames.push(providerSlots[provider]);
+            }
+        }
+        const config = {
+            'memory-core'    : memoryCoreConfig, 'knowledge-base': knowledgeBaseConfig, 'neural-link': neuralLinkConfig,
+            'github-workflow': githubWorkflowConfig, 'gitlab-workflow': gitlabWorkflowConfig
+        }[key];
+        const values = this.residentMcpEnvSource ? this.residentMcpEnvSource(key) : config.exportEnv({envNames, includePlaneMembers: true});
+        if (!values || typeof values !== 'object' || Array.isArray(values) || !path.isAbsolute(values.NEO_PLANE_DATA_ROOT || '')) {
+            throw new Error(`FleetLifecycleService: '${key}' has no placed resident MCP environment.`);
+        }
+        return {env: {...values}, binding: {version: 1, kind: 'resident-config', server: key,
+            plane    : {id: values.NEO_PLANE_ID, dataRoot: values.NEO_PLANE_DATA_ROOT},
+            providers: {model: descriptor.providerCredentialEnv ? config.modelProvider : null,
+                embedding: descriptor.providerCredentialEnv ? config.embeddingProvider : null,
+                ask      : key === 'knowledge-base' ? config.askSynthesis.provider : null}}};
     }
 
     /**
@@ -2708,7 +3018,7 @@ class FleetLifecycleService extends Base {
 
         const capability = {
             harnessType: 'antigravity',
-            binaryPath: launchBinaryPath,
+            binaryPath : launchBinaryPath,
             launchBinaryPath,
             nativeRuntime
         };
@@ -2739,8 +3049,8 @@ class FleetLifecycleService extends Base {
 
         const
             configuredBinary = this.getHarnessBinaryPath('antigravity'),
-            selectedBinary = configuredBinary && this.resolveExecutable(configuredBinary, environment.PATH),
-            capability = context.capability;
+            selectedBinary   = configuredBinary && this.resolveExecutable(configuredBinary, environment.PATH),
+            capability       = context.capability;
 
         if (!selectedBinary || capability?.harnessType !== 'antigravity' ||
             capability.binaryPath !== selectedBinary || capability.launchBinaryPath !== selectedBinary ||

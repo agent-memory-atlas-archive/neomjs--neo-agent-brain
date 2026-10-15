@@ -23,10 +23,10 @@
  * `process.cwd()` — an absent binding fails loud rather than silently projecting into whatever
  * directory the process happened to start in.
  */
-import {execFileSync}                      from 'node:child_process';
-import fs                                  from 'node:fs';
-import path                                from 'node:path';
-import {fileURLToPath, pathToFileURL}      from 'node:url';
+import {execFileSync}                 from 'node:child_process';
+import fs                             from 'node:fs';
+import path                           from 'node:path';
+import {fileURLToPath, pathToFileURL} from 'node:url';
 
 const
     dirname = path.dirname(fileURLToPath(import.meta.url)),
@@ -183,8 +183,8 @@ export function enumerateHooks(runtimeRoot) {
             .forEach(name => hooks.push({
                 executable: true,
                 harness,
-                source: path.join(sourceDir, name),
-                target: path.posix.join(targetDir, name)
+                source    : path.join(sourceDir, name),
+                target    : path.posix.join(targetDir, name)
             }))
     });
 
@@ -668,8 +668,8 @@ export function checkProjection({agentosRuntimeRoot, targetRepoRoot}) {
     // re-projecting would change. A separate "does settings look right" heuristic would be a second
     // model of the same decision, and the two would drift.
     const
-        reconciliation      = reconcileClaudeSettings({agentosRuntimeRoot, targetRepoRoot, write: false}),
-        unreconciledEvents  = [];
+        reconciliation     = reconcileClaudeSettings({agentosRuntimeRoot, targetRepoRoot, write: false}),
+        unreconciledEvents = [];
 
     if (!reconciliation.declared) {
         // Nothing declared, nothing to drift from.
@@ -1169,7 +1169,7 @@ export function writeLocalExclude({targetRepoRoot, targets, blockOwner = 'projec
     let stripped = existing;
     if (beginLines.length === 1) {
         const
-            start = existing.indexOf(begin),
+            start    = existing.indexOf(begin),
             endStart = existing.indexOf(end, start + begin.length),
             endAfter = endStart + end.length;
 
@@ -1177,7 +1177,7 @@ export function writeLocalExclude({targetRepoRoot, targets, blockOwner = 'projec
 
         const
             removeStart = start > 0 && existing[start - 1] === '\n' ? start - 1 : start,
-            removeEnd = existing[endAfter] === '\r' && existing[endAfter + 1] === '\n' ? endAfter + 2
+            removeEnd   = existing[endAfter] === '\r' && existing[endAfter + 1] === '\n' ? endAfter + 2
                 : existing[endAfter] === '\n' ? endAfter + 1
                     : endAfter;
 
@@ -1195,10 +1195,10 @@ export function writeLocalExclude({targetRepoRoot, targets, blockOwner = 'projec
 /** @summary Validate the projector's optional pre-resolved Git directory against the ordinary target clone. @private */
 function validateResolvedGitDir(targetRepoRoot, resolvedGitDir) {
     const
-        root = fs.realpathSync(targetRepoRoot),
-        expected = path.join(root, '.git'),
+        root      = fs.realpathSync(targetRepoRoot),
+        expected  = path.join(root, '.git'),
         candidate = path.resolve(resolvedGitDir),
-        stat = fs.lstatSync(candidate);
+        stat      = fs.lstatSync(candidate);
 
     if (candidate !== expected || !stat.isDirectory() || stat.isSymbolicLink()) {
         throw new Error('writeLocalExclude: refusing an unbound or symlinked Git directory')
@@ -1380,10 +1380,10 @@ export function main(argv) {
         }
 
         const labels = {
-            escapedSpecifiers: 'source reaches outside the runtime root',
-            missing          : 'declared but not projected (the seat runs nothing)',
-            orphans          : 'projected but no longer declared (still executing)',
-            stale            : 'projected from a different revision or a different runtime root',
+            escapedSpecifiers : 'source reaches outside the runtime root',
+            missing           : 'declared but not projected (the seat runs nothing)',
+            orphans           : 'projected but no longer declared (still executing)',
+            stale             : 'projected from a different revision or a different runtime root',
             trackedConflicts  : 'tracked file occupies a projection path',
             unplacedCommands  : 'a seat config declares a script the projector did not place',
             unreconciledEvents: 'the Claude settings do not match the declared event manifest'

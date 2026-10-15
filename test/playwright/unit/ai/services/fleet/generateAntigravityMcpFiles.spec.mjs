@@ -1,12 +1,12 @@
-import {expect, test} from '@playwright/test';
-import {spawn, spawnSync} from 'node:child_process';
-import fs from 'node:fs';
-import http from 'node:http';
-import os from 'node:os';
-import path from 'node:path';
-import {fileURLToPath} from 'node:url';
-import {generateAntigravityMcpFiles} from '../../../../../../ai/services/fleet/generateAntigravityMcpFiles.mjs';
-import {MCP_SERVERS} from '../../../../../../src/fleet/contract/mcpServers.mjs';
+import {expect, test}                                             from '@playwright/test';
+import {spawn, spawnSync}                                         from 'node:child_process';
+import fs                                                         from 'node:fs';
+import http                                                       from 'node:http';
+import os                                                         from 'node:os';
+import path                                                       from 'node:path';
+import {fileURLToPath}                                            from 'node:url';
+import {generateAntigravityMcpFiles}                              from '../../../../../../ai/services/fleet/generateAntigravityMcpFiles.mjs';
+import {MCP_SERVERS}                                              from '../../../../../../src/fleet/contract/mcpServers.mjs';
 import {mintLaunchGrant, signLaunchResponse, verifyLaunchRequest} from '../../../../../../ai/services/fleet/mcpLaunchAdmission.mjs';
 
 const SERVER = 'neo-mjs-memory-core';
@@ -18,15 +18,15 @@ function fixture(root, name) {
     fs.writeFileSync(launcher, 'process.stdout.write(JSON.stringify({argv: process.argv.slice(2), env: process.env}));');
     const rows = {[SERVER]: {
         command: process.execPath,
-        args: [launcher, '--server', 'memory-core'],
-        env: {
-            NEO_AGENT_IDENTITY: name.replace(/[^a-z0-9]/g, '-'),
-            NEO_FLEET_LAUNCH_GRANT: mintLaunchGrant().capability,
+        args   : [launcher, '--server', 'memory-core'],
+        env    : {
+            NEO_AGENT_IDENTITY     : name.replace(/[^a-z0-9]/g, '-'),
+            NEO_FLEET_LAUNCH_GRANT : mintLaunchGrant().capability,
             NEO_FLEET_LAUNCH_ISSUER: 'http://127.0.0.1:12345'
         }
     }};
     const processEnvironment = {HOME: root, PATH: '/usr/bin:/bin', LANG: 'C', USER: "literal'$(touch ignored)\nvalue"};
-    const generated = generateAntigravityMcpFiles({profileHome, rows, processEnvironment});
+    const generated          = generateAntigravityMcpFiles({profileHome, rows, processEnvironment});
     for (const file of generated.files) {
         fs.mkdirSync(path.dirname(file.path), {recursive: true});
         fs.writeFileSync(file.path, file.content, {mode: file.mode});
@@ -38,7 +38,7 @@ function fixture(root, name) {
 function run(f, environment = {}) {
     const row = f.generated.mcpServers[SERVER];
     return spawnSync(row.command, row.args, {
-        env: {AGY_BROWSER_ACTIVE_PORT_FILE: path.join(f.profileHome, 'DevToolsActivePort'), ...environment},
+        env     : {AGY_BROWSER_ACTIVE_PORT_FILE: path.join(f.profileHome, 'DevToolsActivePort'), ...environment},
         encoding: 'utf8', timeout: 5000
     })
 }
@@ -67,13 +67,13 @@ test.describe('Antigravity profile MCP carrier', () => {
         const f = fixture(root, 'seat-a'), hook = path.join(root, 'startup.sh'), marker = path.join(root, 'executed');
         fs.writeFileSync(hook, `touch '${marker}'`);
         const result = run(f, {
-            GH_TOKEN: 'foreign-pat', GITHUB_TOKEN: 'foreign-alias', GEMINI_API_KEY: 'foreign-provider',
-            NEO_AGENT_IDENTITY: 'foreign-seat', NEO_MCP_REMOTE_TOKEN: 'foreign-plane',
+            GH_TOKEN              : 'foreign-pat', GITHUB_TOKEN: 'foreign-alias', GEMINI_API_KEY: 'foreign-provider',
+            NEO_AGENT_IDENTITY    : 'foreign-seat', NEO_MCP_REMOTE_TOKEN: 'foreign-plane',
             NEO_FLEET_LAUNCH_GRANT: 'foreign-grant', NODE_OPTIONS: '--not-a-node-option',
-            NODE_PATH: '/foreign/modules', PATH: '/foreign/bin', ENV: hook, BASH_ENV: hook,
-            SHELLOPTS: 'xtrace', BASHOPTS: 'expand_aliases', PS4: `$(/usr/bin/touch '${marker}') `,
-            'BASH_FUNC_read%%': `() { /usr/bin/touch '${marker}'; }`,
-            'BASH_FUNC_exec%%': `() { /usr/bin/touch '${marker}'; }`
+            NODE_PATH             : '/foreign/modules', PATH: '/foreign/bin', ENV: hook, BASH_ENV: hook,
+            SHELLOPTS             : 'xtrace', BASHOPTS: 'expand_aliases', PS4: `$(/usr/bin/touch '${marker}') `,
+            'BASH_FUNC_read%%'    : `() { /usr/bin/touch '${marker}'; }`,
+            'BASH_FUNC_exec%%'    : `() { /usr/bin/touch '${marker}'; }`
         });
         expect(result.error).toBeUndefined();
         expect(result.status, result.stderr).toBe(0);
@@ -108,7 +108,7 @@ test.describe('Antigravity profile MCP carrier', () => {
     });
 
     test('a server without a profile invoker stays refused even if another seat declares it', () => {
-        const f = fixture(root, 'seat-a');
+        const f     = fixture(root, 'seat-a');
         const empty = generateAntigravityMcpFiles({profileHome: path.join(root, 'seat-disabled'), rows: {}, processEnvironment: {}});
         expect(empty.files).toEqual([]);
         expect(Object.keys(empty.mcpServers).sort()).toEqual(MCP_SERVERS.map(({key}) => `neo-mjs-${key}`).sort());
@@ -132,15 +132,15 @@ test.describe('Antigravity profile MCP carrier', () => {
 
     test('existing launcher authenticates each grant and rejects another generation target', async () => {
         const records = new Map();
-        const server = http.createServer((req, res) => {
+        const server  = http.createServer((req, res) => {
             let data = '';
             req.on('data', chunk => { data += chunk });
             req.on('end', () => {
                 const request = JSON.parse(data), record = records.get(request.grant);
-                const valid = record && request.identity === record.identity && request.server === 'memory-core' &&
+                const valid   = record && request.identity === record.identity && request.server === 'memory-core' &&
                     verifyLaunchRequest(record.grant.secret, request);
                 const answer = valid ? signLaunchResponse(record.grant.secret, request, {
-                    outcome: 'admitted', args: [record.target], env: {GH_TOKEN: 'admitted-fixture-token'}
+                    outcome: 'admitted', generationRoot: record.generation, args: [record.target], env: {GH_TOKEN: 'admitted-fixture-token'}
                 }) : {outcome: 'refused', code: 'unknown-grant'};
                 res.writeHead(200, {'content-type': 'application/json'}).end(JSON.stringify(answer));
             });
@@ -159,7 +159,7 @@ test.describe('Antigravity profile MCP carrier', () => {
                 fs.writeFileSync(target, `process.stdout.write(JSON.stringify({identity:process.env.NEO_AGENT_IDENTITY,
                     tokenAdmitted:process.env.GH_TOKEN==='admitted-fixture-token',
                     aliasAbsent:!('GITHUB_TOKEN' in process.env), grantConsumed:!('NEO_FLEET_LAUNCH_GRANT' in process.env)}));`);
-                const record = {identity, target, grant};
+                const record = {identity, target, grant, generation};
                 records.set(grant.id, record);
                 const generated = generateAntigravityMcpFiles({profileHome, processEnvironment: {PATH: '/usr/bin:/bin', LANG: 'C'}, rows: {
                     [SERVER]: {command: process.execPath, args: [path.join(generation, 'ai/mcp/client/fleetMcpLauncher.mjs'), '--server', 'memory-core'],
@@ -173,13 +173,13 @@ test.describe('Antigravity profile MCP carrier', () => {
                 return {profileHome, generated, record};
             });
             const launch = seat => new Promise((resolve, reject) => {
-                const row = seat.generated.mcpServers[SERVER];
+                const row   = seat.generated.mcpServers[SERVER];
                 const child = spawn(row.command, row.args, {env: {
                     AGY_BROWSER_ACTIVE_PORT_FILE: path.join(seat.profileHome, 'DevToolsActivePort'),
-                    NEO_AGENT_IDENTITY: 'foreign', GH_TOKEN: 'inherited-foreign', GITHUB_TOKEN: 'inherited-alias'
+                    NEO_AGENT_IDENTITY          : 'foreign', GH_TOKEN: 'inherited-foreign', GITHUB_TOKEN: 'inherited-alias'
                 }, stdio: ['ignore', 'pipe', 'pipe']});
-                let stdout = '', stderr = '';
-                const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
+                let   stdout = '', stderr = '';
+                const timer  = setTimeout(() => child.kill('SIGKILL'), 5000);
                 child.stdout.on('data', data => { stdout += data });
                 child.stderr.on('data', data => { stderr += data });
                 child.once('error', error => { clearTimeout(timer); reject(error) });
@@ -197,6 +197,12 @@ test.describe('Antigravity profile MCP carrier', () => {
             expect(foreignTarget.code).toBe(1);
             expect(foreignTarget.stdout).toBe('');
             expect(foreignTarget.stderr).toContain('target-invalid');
+            seats[0].record.target = path.join(seats[0].record.generation, 'target.mjs');
+            seats[0].record.generation = seats[1].record.generation;
+            const foreignGeneration = await launch(seats[0]);
+            expect(foreignGeneration.code).toBe(1);
+            expect(foreignGeneration.stdout).toBe('');
+            expect(foreignGeneration.stderr).toContain('target-invalid');
             records.delete(seats[1].record.grant.id);
             const revoked = await launch(seats[1]);
             expect(revoked.code).toBe(1);

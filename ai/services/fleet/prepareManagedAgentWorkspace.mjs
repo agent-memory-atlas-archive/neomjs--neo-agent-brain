@@ -11,10 +11,17 @@ import {hydrateCurrentWorktree}                       from '../../scripts/migrat
 import {MCP_SERVERS, mcpCatalogFor, resolveMcpMatrix} from '../../../src/fleet/contract/mcpServers.mjs';
 import {applyCodexSeatSettings, parseTomlTableHeader} from './codexConfigToml.mjs';
 import {deriveNodeRuntimeEnv}                         from './deriveNodeRuntimeEnv.mjs';
-import {KIMI_SEAT_SERVERS, generateKimiSeatConfig}    from './generateKimiSeatConfig.mjs';
+import {
+    DESKTOP_PROFILE_RECEIPT,
+    createDesktopLaunchBinding,
+    createAntigravityLaunchBinding,
+    desktopProfileProjection as claudeJsonOwnedProjection,
+    recoverLaunchProfileGrants
+} from './launchProfileCustody.mjs';
+import {KIMI_SEAT_SERVERS, generateKimiSeatConfig}                                            from './generateKimiSeatConfig.mjs';
 import {ANTIGRAVITY_MEMORY_FILE, ANTIGRAVITY_MCP_WORKSPACE_FILE, generateAntigravityMcpFiles} from './generateAntigravityMcpFiles.mjs';
-import {registerAntigravityProject}                    from './antigravityProjectRegistry.mjs';
-import {classifyAntigravityRuntimeFingerprint}         from './probeAntigravityRuntime.mjs';
+import {registerAntigravityProject}                                                           from './antigravityProjectRegistry.mjs';
+import {classifyAntigravityRuntimeFingerprint}                                                from './probeAntigravityRuntime.mjs';
 import {
     deriveAgentInstanceHome,
     deriveAgentMemoryDir
@@ -44,8 +51,7 @@ const
     CLAUDE_MEMORY_SETTING    = 'autoMemoryDirectory',
     // What a Claude Desktop profile row runs, and what a tenant row's launcher hands to.
     LAUNCHER_ENTRYPOINT      = 'ai/mcp/client/fleetMcpLauncher.mjs',
-    BRIDGE_ENTRYPOINT        = 'ai/mcp/client/stdioToStreamableHttp.mjs',
-    DESKTOP_PROFILE_RECEIPT  = '.neo-fleet-claude-desktop-profile.json';
+    BRIDGE_ENTRYPOINT        = 'ai/mcp/client/stdioToStreamableHttp.mjs';
 
 /**
  * @summary Convergence states for Fleet-owned workspace artifacts. `DIVERGENT` is emitted on the
@@ -402,7 +408,7 @@ async function applyManagedAgentWorkspacePlanUnchecked({
         fileSystem
     });
 
-    const {artifacts, antigravityProject} = await prepareHarnessArtifacts({
+    const {artifacts, antigravityProject, launchAdmissionBinding: nativeLaunchAdmissionBinding} = await prepareHarnessArtifacts({
         agent,
         targetRepoRoot    : canonicalTargetRepoRoot,
         instanceRoot      : canonicalInstanceRoot,
@@ -438,6 +444,16 @@ async function applyManagedAgentWorkspacePlanUnchecked({
 
     seatInstructions.artifact && artifacts.push(seatInstructions.artifact);
 
+    const launchAdmissionBinding = agent.harnessType === 'claude-desktop' ? createDesktopLaunchBinding({
+        rows    : renderDesktopLaunchRows({agent, plan, residentMcpEnv, launchAdmission}),
+        identity: launchAdmission.identity, issuer: launchAdmission.issuer
+    }) : nativeLaunchAdmissionBinding ?? null;
+    if (launchAdmissionBinding) {
+        await recoverLaunchProfileGrants({
+            managedRoot: canonicalInstanceRoot, instanceHome, workspaceRoot: canonicalTargetRepoRoot, binding: launchAdmissionBinding, fileSystem
+        });
+    }
+
     return {
         agentosRuntimeRoot: canonicalAgentosRuntimeRoot,
         targetRepoRoot    : canonicalTargetRepoRoot,
@@ -455,6 +471,7 @@ async function applyManagedAgentWorkspacePlanUnchecked({
         artifacts,
         ...(antigravityProject ? {antigravityProject} : {}),
         seatInstructions  : seatInstructions.observation,
+        ...(launchAdmissionBinding ? {launchAdmissionBinding} : {}),
         ...(trust.records.length ? {repoTrust: trust.records} : {})
     }
 }
@@ -797,7 +814,7 @@ async function prepareHarnessArtifacts({
             return {artifacts: await prepareClaudeDesktopArtifacts({agent, targetRepoRoot, instanceHome, plan, claudeConfigRoot, residentMcpEnv, launchAdmission, fileSystem})};
         case 'antigravity': {
             const generated = await prepareAntigravityArtifacts({
-                agent, instanceHome, plan, residentMcpEnv, launchAdmission, fileSystem,
+                agent, instanceHome, targetRepoRoot, plan, residentMcpEnv, launchAdmission, fileSystem,
                 processEnvironment: antigravityStart.processEnvironment
             });
             if (generated.residuals.length) throw unsupported('Antigravity profile contains unowned invokers; resolve them before Start');
@@ -805,26 +822,27 @@ async function prepareHarnessArtifacts({
                 targetRepoRoot, instanceHome, mcpServers: generated.mcpServers,
                 exclusion: antigravityStart.exclusion, fileSystem
             });
-            const memoryDir = deriveAgentMemoryDir({instanceRoot, agentId: agent.id}),
+            const memoryDir    = deriveAgentMemoryDir({instanceRoot, agentId: agent.id}),
                   memoryLoader = await convergeTextArtifact({
-                filePath: path.join(targetRepoRoot, ANTIGRAVITY_MEMORY_FILE),
+                filePath      : path.join(targetRepoRoot, ANTIGRAVITY_MEMORY_FILE),
                 desiredContent: '# Fleet seat memory\n\n' +
                     `Operational identity for this managed workspace: @${launchAdmission.identity}.\n` +
                     'Use the current Fleet-issued identity and loaded seat memory when legacy global harness notes differ.\n\n' +
                     `@[Seat memory](${path.join(memoryDir, 'MEMORY.md')})\n` +
                     `@[Bearer identity](${path.join(memoryDir, 'identity.md')})\n`,
                 ownedProjection: wholeFileOwnedProjection, ownedLabel: 'Antigravity memory loader',
-                trustedRoot: targetRepoRoot, fileSystem
+                trustedRoot    : targetRepoRoot, fileSystem
             });
             const project = await registerAntigravityProject({
-                registryDirectory: antigravityStart.registryDirectory,
-                profileDirectory: instanceHome, projectRoot: targetRepoRoot, name: agent.id,
+                registryDirectory   : antigravityStart.registryDirectory,
+                profileDirectory    : instanceHome, projectRoot: targetRepoRoot, name: agent.id,
                 projectMcpAllowRules: generated.projectMcpAllowRules, fileSystem,
-                writeAtomic: (file, content, options) => writeFileAtomic(file, content, {...options, fsModule: fileSystem})
+                writeAtomic         : (file, content, options) => writeFileAtomic(file, content, {...options, fsModule: fileSystem})
             });
             return {
-                artifacts: [...generated.artifacts, ...workspace, memoryLoader],
-                antigravityProject: {id: project.projectId, name: project.projectName, root: project.projectRoot}
+                artifacts             : [...generated.artifacts, ...workspace, memoryLoader],
+                launchAdmissionBinding: generated.launchAdmissionBinding,
+                antigravityProject    : {id: project.projectId, name: project.projectName, root: project.projectRoot}
             }
         }
         default:
@@ -1479,6 +1497,7 @@ function renderDesktopLaunchRows({agent, plan, residentMcpEnv, launchAdmission})
  * @param {Object} options
  * @param {Object} options.agent
  * @param {String} options.instanceHome Antigravity's isolated Electron user-data directory.
+ * @param {String} options.targetRepoRoot Canonical original workspace selected for this Start.
  * @param {Object[]} options.plan Bound canonical MCP rows.
  * @param {Object} options.residentMcpEnv Resolved resident child environments.
  * @param {Object} options.launchAdmission Reserved, per-server launch grants.
@@ -1487,13 +1506,15 @@ function renderDesktopLaunchRows({agent, plan, residentMcpEnv, launchAdmission})
  * @returns {Promise<Object>} Profile invokers, complete workspace rows, permission rules, and residual files.
  * @private
  */
-export async function prepareAntigravityArtifacts({agent, instanceHome, plan, residentMcpEnv, launchAdmission, fileSystem,
+export async function prepareAntigravityArtifacts({agent, instanceHome, targetRepoRoot, plan, residentMcpEnv, launchAdmission, fileSystem,
     processEnvironment}) {
     const
-        rows = renderDesktopLaunchRows({agent, plan, residentMcpEnv, launchAdmission}),
-        generated = generateAntigravityMcpFiles({profileHome: instanceHome, rows, processEnvironment}),
-        artifacts = [],
-        residuals = [],
+        rows                   = renderDesktopLaunchRows({agent, plan, residentMcpEnv, launchAdmission}),
+        generated              = generateAntigravityMcpFiles({profileHome: instanceHome, rows, processEnvironment}),
+        launchAdmissionBinding = createAntigravityLaunchBinding({instanceHome, workspaceRoot: targetRepoRoot,
+            identity: launchAdmission.identity, issuer: launchAdmission.issuer, files: generated.files}),
+        artifacts      = [],
+        residuals      = [],
         generatedNames = new Set(Object.keys(generated.mcpServers).filter(name => !generated.mcpServers[name].disabled));
 
     await ensureDirectoryArtifact(path.join(instanceHome, '.neo-fleet-mcp'), instanceHome, fileSystem, {mode: 0o700});
@@ -1513,7 +1534,7 @@ export async function prepareAntigravityArtifacts({agent, instanceHome, plan, re
     }
 
     for (const file of generated.files) {
-        const key = path.basename(file.path, '.sh');
+        const key         = path.basename(file.path, '.sh');
         const observation = await convergeTextArtifact({
             filePath       : file.path,
             desiredContent : file.content,
@@ -1528,7 +1549,7 @@ export async function prepareAntigravityArtifacts({agent, instanceHome, plan, re
         artifacts.push(observation)
     }
 
-    return {artifacts, mcpServers: generated.mcpServers, projectMcpAllowRules: generated.projectMcpAllowRules, residuals}
+    return {artifacts, mcpServers: generated.mcpServers, projectMcpAllowRules: generated.projectMcpAllowRules, residuals, launchAdmissionBinding}
 }
 
 /** @summary Retire only unchanged invokers whose content remains bound to Fleet's receipt. @private */
@@ -1578,9 +1599,9 @@ export function mergeAntigravityWorkspaceMcpConfig(source, desiredServers, recor
     }
 
     const
-        existing = parsed.mcpServers || {},
+        existing      = parsed.mcpServers || {},
         expectedNames = [...ANTIGRAVITY_MCP_NAMES].sort(),
-        desiredNames = desiredServers && typeof desiredServers === 'object' && !Array.isArray(desiredServers)
+        desiredNames  = desiredServers && typeof desiredServers === 'object' && !Array.isArray(desiredServers)
             ? Object.keys(desiredServers).sort()
             : [],
         owned = Object.fromEntries(Object.entries(existing).filter(([name]) => ANTIGRAVITY_MCP_NAMES.has(name))),
@@ -1617,9 +1638,9 @@ export async function convergeAntigravityWorkspaceMcp({targetRepoRoot, instanceH
         throw unsupported('Antigravity workspace MCP needs an exact host Git exclusion proof before writing')
     }
 
-    const filePath = path.join(targetRepoRoot, relativePath),
+    const filePath    = path.join(targetRepoRoot, relativePath),
           receiptPath = path.join(instanceHome, '.neo-fleet-antigravity-workspace.json'),
-          adapter = 'antigravity';
+          adapter     = 'antigravity';
     await assertNoSymlinkSegments({rootPath: targetRepoRoot, targetPath: filePath, fileSystem, label: 'Antigravity workspace MCP'});
     await assertNoSymlinkSegments({rootPath: instanceHome, targetPath: receiptPath, fileSystem, label: 'Antigravity workspace receipt'});
     const existing = await fileSystem.readFile(filePath, 'utf8').catch(error => {
@@ -1635,10 +1656,10 @@ export async function convergeAntigravityWorkspaceMcp({targetRepoRoot, instanceH
             throw transportDivergence(filePath, 'Antigravity workspace MCP', 'invalid JSON')
         }
     }
-    const receipt = await readTransportReceipt({receiptPath, adapter, filePath, fileSystem}),
+    const receipt  = await readTransportReceipt({receiptPath, adapter, filePath, fileSystem}),
           recorded = receipt?.projectionSha256 === hashProjection(owned) ? owned : {},
-          desired = mergeAntigravityWorkspaceMcpConfig(existing, mcpServers, recorded),
-          status = existing === null ? WORKSPACE_ARTIFACT_STATES.CREATED
+          desired  = mergeAntigravityWorkspaceMcpConfig(existing, mcpServers, recorded),
+          status   = existing === null ? WORKSPACE_ARTIFACT_STATES.CREATED
               : isDeepStrictEqual(canonicalize(owned), canonicalize(mcpServers))
                   ? WORKSPACE_ARTIFACT_STATES.MATCH : WORKSPACE_ARTIFACT_STATES.UPDATED,
           artifacts = [{path: filePath, status, ownedKeys: 'canonical Antigravity MCP rows'}];
@@ -2799,22 +2820,6 @@ function readCodexProjectTrust(source, repoPath, filePath) {
     } catch {
         throw transportDivergence(filePath, 'projects.<managed-repo>.trust_level', 'invalid Codex home TOML')
     }
-}
-
-/** @private */
-function claudeJsonOwnedProjection(source) {
-    let parsed;
-    try {
-        parsed = JSON.parse(source);
-    } catch {
-        return {__invalidJson: true};
-    }
-
-    const result = {};
-    for (const [name, definition] of Object.entries(parsed?.mcpServers || {})) {
-        if (name.startsWith(NEO_MCP_NAME_PREFIX)) result[name] = definition;
-    }
-    return canonicalize(result);
 }
 
 const TRANSPORT_SERVER_NAMES = Object.freeze([
