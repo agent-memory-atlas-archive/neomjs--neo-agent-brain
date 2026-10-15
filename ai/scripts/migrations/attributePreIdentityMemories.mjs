@@ -20,10 +20,17 @@
  * does every row without evidence. A row without a session, or with an empty one, carries only its own evidence.
  *
  * Each re-keyed Chroma row records its rule, its evidence and the graph state it replaced (`attributionRule`,
- * `attributionEvidence`, `attributionPrior`). That record is the journal. An apply writes Chroma first and then
- * re-keys every journaled graph node in one SQLite transaction, so a re-run completes an interrupted apply.
- * `--reverse` restores the graph from the journal before it clears the journal in Chroma. One transaction across
- * both stores is impossible; this is the bounded form of atomic that `reconcileRawMemoryGraphIdentities.mjs` uses.
+ * `attributionEvidence`, `attributionPrior`, and `attributionLegacyPrior` for a legacy projection). That record is the
+ * journal. An apply writes Chroma first and then re-keys every journaled graph node in one SQLite transaction, so a
+ * re-run completes an interrupted apply. `--reverse` restores the graph from the journal before it clears the journal
+ * in Chroma. One transaction across both stores is impossible; this is the bounded form of atomic that
+ * `reconcileRawMemoryGraphIdentities.mjs` uses.
+ *
+ * A row's legacy `memory:<uuid>` projection is REM's old copy of the row, so it moves with the row. Left behind, it
+ * would hold the old tenant beside the re-keyed row, a conflict the reconciler refuses to converge. An apply moves it
+ * only from the shared mirror, and journals that prior first; a projection the identity already held is left alone,
+ * and one holding another owner is refused. A reverse restores only a journaled projection. Its refusal keeps the
+ * whole row attributed, journal included, so a retry can finish it.
  *
  * Usage:
  *   node ai/scripts/migrations/attributePreIdentityMemories.mjs --identity <id> [--alias <id>]... [--harness <marker>]...
@@ -36,12 +43,18 @@
 import path                           from 'node:path';
 import {fileURLToPath}                from 'node:url';
 import {normalizeAgentIdentityNodeId} from '../../graph/normalizeAgentIdentityNodeId.mjs';
-import {RAW_MEMORY_NODE_LABEL}        from '../../services/memory-core/helpers/rawMemoryGraphIdentity.mjs';
+import {
+    LEGACY_RAW_MEMORY_NODE_LABEL,
+    legacyRawMemoryGraphId,
+    RAW_MEMORY_NODE_LABEL
+} from '../../services/memory-core/helpers/rawMemoryGraphIdentity.mjs';
 
 const
     BATCH_SIZE     = 200,
     PAGE_SIZE      = 2000,
     SHARED_USER_ID = 'shared',
+    // a shared row's owner, which its legacy projection mirrors until the row is attributed
+    SHARED_OWNER   = Object.freeze({agentIdentity: null, propertyUserId: SHARED_USER_ID, userId: SHARED_USER_ID}),
     // the one wrapper a harness is known to open a session with: the Gemini CLI's `<session_context>` line
     ENVELOPE_LINE  = /^<session_context>[ \t]*\r?\n/,
     // the wake digest header: `[WAKE][priority:high] 3 events for @neo-gpt: …`
@@ -281,14 +294,15 @@ export function reportPlan(plan, {sample = 10} = {}) {
 }
 
 /**
- * @summary Reads a raw-memory node's owner column and its two identity properties.
+ * @summary Reads one graph projection of a raw memory: its owner column and its two identity properties.
  * @param {Object} db better-sqlite3 connection
- * @param {String} id
+ * @param {String} id The row id
+ * @param {Boolean} [legacy=false] Read the row's Chroma-backed `memory:<uuid>` node instead of its `AGENT_MEMORY` node
  * @returns {{agentIdentity: String|null, propertyUserId: String|null, userId: String|null}|null} `null` when the
- * graph holds no raw-memory node of that id
+ * graph holds no such projection
  */
-function readGraphOwner(db, id) {
-    const row = db.prepare('SELECT user_id, data FROM Nodes WHERE id = ?').get(id);
+function readGraphOwner(db, id, legacy = false) {
+    const row = db.prepare('SELECT user_id, data FROM Nodes WHERE id = ?').get(legacy ? legacyRawMemoryGraphId(id) : id);
 
     if (!row) {
         return null
@@ -296,39 +310,89 @@ function readGraphOwner(db, id) {
 
     const data = JSON.parse(row.data);
 
-    return data.label === RAW_MEMORY_NODE_LABEL
+    // a `memory:<uuid>` node without the row's `chromaId` is curated ontology, never a projection
+    return (legacy ? data.label === LEGACY_RAW_MEMORY_NODE_LABEL && data.properties?.chromaId === id : data.label === RAW_MEMORY_NODE_LABEL)
         ? {agentIdentity: data.properties?.agentIdentity ?? null, propertyUserId: data.properties?.userId ?? null, userId: row.user_id ?? null}
         : null
 }
 
 /**
- * @summary Sets a raw-memory node's owner column and identity properties; a `null` property is deleted.
+ * @param {Object} left
+ * @param {Object} right
+ * @returns {Boolean}
+ */
+function sameOwner(left, right) {
+    return left.agentIdentity === right.agentIdentity && left.propertyUserId === right.propertyUserId && left.userId === right.userId
+}
+
+/**
+ * @summary Sets a graph projection's owner column and identity properties; a `null` property is deleted.
  * @param {Object} db better-sqlite3 connection
- * @param {String} id
+ * @param {String} id The row id
  * @param {{agentIdentity: String|null, propertyUserId: String|null, userId: String|null}} owner
+ * @param {Boolean} [legacy=false] Write the row's legacy projection
  * @returns {String} `updated`, `unchanged` or `missing`
  */
-function writeGraphOwner(db, id, owner) {
-    const current = readGraphOwner(db, id);
+function writeGraphOwner(db, id, owner, legacy = false) {
+    const current = readGraphOwner(db, id, legacy);
 
     if (!current) {
         return 'missing'
     }
 
-    if (current.agentIdentity === owner.agentIdentity && current.propertyUserId === owner.propertyUserId && current.userId === owner.userId) {
+    if (sameOwner(current, owner)) {
         return 'unchanged'
     }
 
     const
-        data       = JSON.parse(db.prepare('SELECT data FROM Nodes WHERE id = ?').get(id).data),
+        nodeId     = legacy ? legacyRawMemoryGraphId(id) : id,
+        data       = JSON.parse(db.prepare('SELECT data FROM Nodes WHERE id = ?').get(nodeId).data),
         properties = {...data.properties};
 
     owner.agentIdentity  === null ? delete properties.agentIdentity : properties.agentIdentity = owner.agentIdentity;
     owner.propertyUserId === null ? delete properties.userId        : properties.userId        = owner.propertyUserId;
 
-    db.prepare('UPDATE Nodes SET user_id = ?, data = ? WHERE id = ?').run(owner.userId, JSON.stringify({...data, properties}), id);
+    db.prepare('UPDATE Nodes SET user_id = ?, data = ? WHERE id = ?').run(owner.userId, JSON.stringify({...data, properties}), nodeId);
 
     return 'updated'
+}
+
+/**
+ * @summary Moves a row's legacy projection from one owner to the other; one that holds neither is refused, never
+ * overwritten.
+ * @param {Object} db better-sqlite3 connection
+ * @param {String} id The row id
+ * @param {Object} from The owner the projection holds before the move
+ * @param {Object} to
+ * @returns {String} `updated`, `unchanged`, `missing` or `refused`
+ */
+function moveLegacyProjection(db, id, from, to) {
+    const current = readGraphOwner(db, id, true);
+
+    return current && !sameOwner(current, from) && !sameOwner(current, to) ? 'refused' : writeGraphOwner(db, id, to, true)
+}
+
+/**
+ * @summary The prior owner an apply moves a row's legacy projection from: journaled by an earlier run, or the shared
+ * mirror the projection still holds, which this run journals. Only an owner the journal records is ever restored.
+ * @param {Object} db better-sqlite3 connection
+ * @param {{id: String, metadata: Object}} row
+ * @param {Object} owner The identity's owner
+ * @returns {{journaled: Boolean, prior: Object}|String} the prior; else `missing`, `held` (the identity's before any
+ * run, so nothing to move) or `refused` (another owner)
+ */
+function legacyPriorOf(db, {id, metadata}, owner) {
+    const journaled = JSON.parse(metadata.attributionLegacyPrior ?? 'null');
+
+    if (journaled) {
+        return {journaled: true, prior: journaled}
+    }
+
+    const current = readGraphOwner(db, id, true);
+
+    return !current ? 'missing'
+        : sameOwner(current, SHARED_OWNER) ? {journaled: false, prior: SHARED_OWNER}
+        : sameOwner(current, owner) ? 'held' : 'refused'
 }
 
 /**
@@ -353,68 +417,115 @@ async function updateChroma(collection, rows, batchSize) {
  * @param {Object} options.db better-sqlite3 connection
  * @param {Object} options.plan {@link planAttribution}'s plan
  * @param {Number} [options.batchSize=200]
- * @returns {Promise<{chromaUpdated: Number, graphMissing: Number, graphUpdated: Number}>}
+ * @returns {Promise<{chromaUpdated: Number, graphMissing: Number, graphUpdated: Number, legacyRefused: Number, legacyUpdated: Number}>}
+ * `graphMissing` counts rows without an `AGENT_MEMORY` node; `legacy*` counts their `memory:<uuid>` projections
  */
 export async function applyAttribution({batchSize = BATCH_SIZE, collection, db, plan}) {
     const
-        owner   = {agentIdentity: plan.identity, propertyUserId: plan.userId, userId: plan.userId},
-        updates = plan.attribute.map(({evidence, id, metadata, rule}) => ({
-            id,
-            metadata: {
-                ...metadata,
-                agentIdentity      : plan.identity,
-                attributionEvidence: evidence,
-                attributionPrior   : JSON.stringify(readGraphOwner(db, id)),
-                attributionRule    : rule,
-                userId             : plan.userId
+        owner  = {agentIdentity: plan.identity, propertyUserId: plan.userId, userId: plan.userId},
+        counts = {missing: 0, unchanged: 0, updated: 0},
+        legacy = {missing: 0, refused: 0, unchanged: 0, updated: 0},
+        moves  = new Map(),
+        // the journal entry for a legacy prior this run records; `null` when there is none to record
+        legacyJournal = row => {
+            const found = legacyPriorOf(db, row, owner);
+
+            if (typeof found === 'string') {
+                found === 'refused' && legacy.refused++;
+                return null
             }
-        })),
-        counts  = {missing: 0, unchanged: 0, updated: 0};
+
+            moves.set(row.id, found.prior);
+
+            return found.journaled ? null : {attributionLegacyPrior: JSON.stringify(found.prior)}
+        },
+        updates = [
+            ...plan.attribute.map(({evidence, id, metadata, rule}) => ({
+                id,
+                metadata: {
+                    ...metadata,
+                    agentIdentity      : plan.identity,
+                    attributionEvidence: evidence,
+                    attributionPrior   : JSON.stringify(readGraphOwner(db, id)),
+                    attributionRule    : rule,
+                    userId             : plan.userId,
+                    ...legacyJournal({id, metadata})
+                }
+            })),
+            // an attributed row whose legacy projection an earlier run left behind journals it now
+            ...plan.journal.flatMap(row => {
+                const entry = legacyJournal(row);
+
+                return entry ? [{id: row.id, metadata: {...row.metadata, ...entry}}] : []
+            })
+        ];
 
     await updateChroma(collection, updates, batchSize);
 
     db.transaction(() => {
-        for (const {id} of [...plan.journal, ...updates]) {
+        for (const {id} of [...plan.journal, ...plan.attribute]) {
             counts[writeGraphOwner(db, id, owner)]++
+        }
+
+        for (const [id, prior] of moves) {
+            legacy[moveLegacyProjection(db, id, prior, owner)]++
         }
     })();
 
-    return {chromaUpdated: updates.length, graphMissing: counts.missing, graphUpdated: counts.updated}
+    return {chromaUpdated: updates.length, graphMissing: counts.missing, graphUpdated: counts.updated, legacyRefused: legacy.refused, legacyUpdated: legacy.updated}
 }
 
 /**
  * @summary Restores every row an apply attributed to the identity: the graph from each row's journal first, then
- * the shared Chroma state. A reverse that stops between the two completes on its next run.
+ * the shared Chroma state. A reverse that stops between the two completes on its next run. A row whose journaled
+ * legacy projection is refused stays attributed, journal included, until a retry can restore it.
  * @param {Object} options
  * @param {Object} options.collection Chroma collection
  * @param {Object} options.db better-sqlite3 connection
  * @param {String} options.identity
  * @param {Object[]} options.rows Every raw-memory row, `{id, metadata}`
  * @param {Number} [options.batchSize=200]
- * @returns {Promise<{chromaRestored: Number, graphRestored: Number}>}
+ * @returns {Promise<{chromaRestored: Number, graphRestored: Number, legacyRefused: Number, legacyRestored: Number}>}
  */
 export async function reverseAttribution({batchSize = BATCH_SIZE, collection, db, identity, rows}) {
     const
-        target   = normalizeAgentIdentityNodeId(identity),
-        journal  = rows.filter(({metadata = {}}) => metadata.attributionRule && normalizeAgentIdentityNodeId(metadata.agentIdentity) === target),
-        restored = journal.map(({id, metadata}) => ({
-            id,
-            metadata: {...metadata, agentIdentity: null, attributionEvidence: null, attributionPrior: null, attributionRule: null, userId: SHARED_USER_ID}
-        }));
+        target  = normalizeAgentIdentityNodeId(identity),
+        owner   = {agentIdentity: target, propertyUserId: target.slice(1), userId: target.slice(1)},
+        journal = rows.filter(({metadata = {}}) => metadata.attributionRule && normalizeAgentIdentityNodeId(metadata.agentIdentity) === target),
+        legacy  = {missing: 0, refused: 0, unchanged: 0, updated: 0},
+        kept    = new Set();
 
     let graphRestored = 0;
 
     db.transaction(() => {
         for (const {id, metadata} of journal) {
+            const
+                legacyPrior = JSON.parse(metadata.attributionLegacyPrior ?? 'null'),
+                outcome     = legacyPrior ? moveLegacyProjection(db, id, owner, legacyPrior) : null;
+
+            // a journaled projection holding a third owner, or gone onto the canonical id, keeps its row attributed
+            if (outcome === 'refused' || outcome === 'missing') {
+                legacy.refused++;
+                kept.add(id);
+                continue
+            }
+
+            outcome && legacy[outcome]++;
+
             const prior = JSON.parse(metadata.attributionPrior ?? 'null');
 
             prior && writeGraphOwner(db, id, prior) === 'updated' && graphRestored++
         }
     })();
 
+    const restored = journal.filter(({id}) => !kept.has(id)).map(({id, metadata}) => ({
+        id,
+        metadata: {...metadata, agentIdentity: null, attributionEvidence: null, attributionLegacyPrior: null, attributionPrior: null, attributionRule: null, userId: SHARED_USER_ID}
+    }));
+
     await updateChroma(collection, restored, batchSize);
 
-    return {chromaRestored: restored.length, graphRestored}
+    return {chromaRestored: restored.length, graphRestored, legacyRefused: legacy.refused, legacyRestored: legacy.updated}
 }
 
 /**
@@ -492,14 +603,22 @@ async function main() {
     const db = new Database(dbPath, {fileMustExist: true});
 
     try {
+        let result;
+
         if (options.reverse) {
-            console.log(JSON.stringify({mode: 'REVERSE', dbPath, ...await reverseAttribution({collection, db, identity: options.identity, rows})}, null, 2));
-            return
+            result = await reverseAttribution({collection, db, identity: options.identity, rows});
+            console.log(JSON.stringify({mode: 'REVERSE', dbPath, ...result}, null, 2))
+        } else {
+            console.log(JSON.stringify({mode: 'APPLY', dbPath, ...reportPlan(plan, {sample: options.sample})}, null, 2));
+            result = await applyAttribution({collection, db, plan});
+            console.log(JSON.stringify(result, null, 2));
+            console.log('APPLY complete. Restart Memory Core processes to refresh in-memory graph caches.')
         }
 
-        console.log(JSON.stringify({mode: 'APPLY', dbPath, ...reportPlan(plan, {sample: options.sample})}, null, 2));
-        console.log(JSON.stringify(await applyAttribution({collection, db, plan}), null, 2));
-        console.log('APPLY complete. Restart Memory Core processes to refresh in-memory graph caches.')
+        // a refused projection still holds a foreign owner beside its re-keyed row
+        if (result.legacyRefused > 0) {
+            process.exitCode = 1
+        }
     } finally {
         db.close()
     }
