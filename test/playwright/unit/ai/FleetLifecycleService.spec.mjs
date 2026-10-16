@@ -3101,6 +3101,188 @@ test.describe('FleetLifecycleService.status — where a running Claude Desktop s
     });
 });
 
+test.describe('FleetLifecycleService.exitReasonFor — why a seat exited without a Stop', () => {
+    let root, logPath;
+
+    test.beforeEach(() => {
+        FleetLifecycleService.leasesAdopted     = true;
+        FleetLifecycleService.processes.clear();
+        root                                    = fs.mkdtempSync(path.join(os.tmpdir(), 'exit-reason-status-'));
+        logPath                                 = path.join(root, 'main.log');
+        FleetLifecycleService.claudeMainLogPath = logPath
+    });
+
+    test.afterEach(() => {
+        FleetLifecycleService.processes.clear();
+        FleetLifecycleService.leasesAdopted     = false;
+        FleetLifecycleService.claudeMainLogPath = null;
+        fs.rmSync(root, {recursive: true, force: true})
+    });
+
+    test('populated when a spawned or adopted seat exits without stop(id), null when stop(id) was called, and cleared on next start', async () => {
+        const
+            now  = new Date(),
+            pad  = n => String(n).padStart(2, '0'),
+            line = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())} [info] beforeQuitForUpdate handler fired, going down for update`;
+
+        fs.writeFileSync(logPath, `${line}\n`);
+
+        const unplannedRecord = {
+            id           : 'claude-seat',
+            state        : 'running',
+            harnessType  : 'claude-desktop',
+            stopRequested: false,
+            exitReason   : null
+        };
+        FleetLifecycleService.processes.set('claude-seat', unplannedRecord);
+
+        await FleetLifecycleService.finalizeExitedProcess(unplannedRecord, {code: 0, signal: null});
+
+        const unplannedStatus = FleetLifecycleService.status('claude-seat');
+        expect(unplannedStatus.state).toBe('stopped');
+        expect(unplannedStatus.exitReason).toEqual({
+            state      : 'harness-update',
+            exitedAt   : unplannedStatus.exitedAt,
+            logPath,
+            matchedLine: line
+        });
+
+        // A redundant stop(id) on an already-stopped seat keeps its captured exitReason
+        await FleetLifecycleService.stop('claude-seat');
+        expect(FleetLifecycleService.status('claude-seat').exitReason).toEqual({
+            state      : 'harness-update',
+            exitedAt   : unplannedStatus.exitedAt,
+            logPath,
+            matchedLine: line
+        });
+
+        // A failed Codex Desktop record with cleanupUnresolved stopped again records stopRequested and leaves exitReason null
+        const
+            origCleanup       = FleetLifecycleService.codexDesktopCleanupFn,
+            cleanupRetrySeat  = {
+                id                : 'codex-cleanup-retry',
+                state             : 'failed',
+                cleanupUnresolved : true,
+                child             : null,
+                electronProfile   : path.join(root, 'electron-profile'),
+                crashpadExecutable: '/Applications/Codex.app/Contents/Resources/chrome_crashpad_handler',
+                harnessType       : 'codex-desktop',
+                exitedAt          : unplannedStatus.exitedAt,
+                stopRequested     : false,
+                exitReason        : null
+            };
+        FleetLifecycleService.codexDesktopCleanupFn = async () => {};
+        FleetLifecycleService.processes.set('codex-cleanup-retry', cleanupRetrySeat);
+        try {
+            await FleetLifecycleService.stop('codex-cleanup-retry');
+            expect(FleetLifecycleService.status('codex-cleanup-retry')).toMatchObject({
+                state            : 'stopped',
+                cleanupUnresolved: false,
+                exitReason       : null
+            })
+        } finally {
+            FleetLifecycleService.codexDesktopCleanupFn = origCleanup
+        }
+
+        // Adopted seat exiting without stop(id) when refreshAdoptedSeat observes probeSeat === 'gone'
+        const adoptedRecord = {
+            id           : 'adopted-seat',
+            adopted      : true,
+            state        : 'running',
+            pid          : 987654,
+            pidStartedAt : 'Thu Oct 15 10:00:00 2026',
+            harnessType  : 'claude-desktop',
+            stopRequested: false,
+            exitReason   : null
+        };
+        FleetLifecycleService.processes.set('adopted-seat', adoptedRecord);
+        const
+            origSignal  = FleetLifecycleService.processSignalFn,
+            origInspect = FleetLifecycleService.processInspectFn;
+
+        FleetLifecycleService.processInspectFn = () => ({startedAt: 'Thu Oct 15 10:00:00 2026', command: ''});
+        FleetLifecycleService.processSignalFn  = () => {
+            const err = new Error('ESRCH');
+            err.code  = 'ESRCH';
+            throw err
+        };
+
+        try {
+            const adoptedStatus = FleetLifecycleService.status('adopted-seat');
+            expect(adoptedStatus.state).toBe('stopped');
+            expect(adoptedStatus.exitReason).toEqual({
+                state      : 'harness-update',
+                exitedAt   : adoptedStatus.exitedAt,
+                logPath,
+                matchedLine: line
+            });
+
+            // Adopted seat already gone before stop(id) is called keeps harness-update
+            const goneBeforeStop = {
+                id           : 'gone-before-stop',
+                adopted      : true,
+                state        : 'running',
+                pid          : 987655,
+                pidStartedAt : 'Thu Oct 15 10:00:00 2026',
+                harnessType  : 'claude-desktop',
+                stopRequested: false,
+                exitReason   : null
+            };
+            FleetLifecycleService.processes.set('gone-before-stop', goneBeforeStop);
+            await FleetLifecycleService.stop('gone-before-stop');
+            const goneBeforeStopStatus = FleetLifecycleService.status('gone-before-stop');
+            expect(goneBeforeStopStatus.state).toBe('stopped');
+            expect(goneBeforeStopStatus.exitReason).toEqual({
+                state      : 'harness-update',
+                exitedAt   : goneBeforeStopStatus.exitedAt,
+                logPath,
+                matchedLine: line
+            });
+
+            // Live adopted seat stopped via stop(id) keeps exitReason null
+            let alive = true;
+            FleetLifecycleService.processSignalFn = (_pid, sig) => {
+                if (sig === 'SIGTERM') {
+                    alive = false;
+                    return
+                }
+                if (!alive) {
+                    const err = new Error('ESRCH');
+                    err.code  = 'ESRCH';
+                    throw err
+                }
+            };
+            const stoppedAdopted = {
+                id           : 'stopped-adopted',
+                adopted      : true,
+                state        : 'running',
+                pid          : 987656,
+                pidStartedAt : 'Thu Oct 15 10:00:00 2026',
+                harnessType  : 'claude-desktop',
+                stopRequested: false,
+                exitReason   : null
+            };
+            FleetLifecycleService.processes.set('stopped-adopted', stoppedAdopted);
+            await FleetLifecycleService.stop('stopped-adopted');
+            expect(FleetLifecycleService.status('stopped-adopted').exitReason).toBeNull()
+        } finally {
+            FleetLifecycleService.processSignalFn  = origSignal;
+            FleetLifecycleService.processInspectFn = origInspect
+        }
+
+        // Subsequent running record clears exitReason
+        FleetLifecycleService.processes.set('claude-seat', {
+            id           : 'claude-seat',
+            state        : 'running',
+            harnessType  : 'claude-desktop',
+            stopRequested: false,
+            exitReason   : null
+        });
+        expect(FleetLifecycleService.status('claude-seat').exitReason).toBeNull();
+        expect(FleetLifecycleService.status('nobody').exitReason).toBeNull()
+    });
+});
+
 test.describe('FleetLifecycleService.setGitIdentity — the Git identity a seat\'s last start resolved', () => {
     test.beforeEach(() => { FleetLifecycleService.leasesAdopted = true; FleetLifecycleService.processes.clear(); FleetLifecycleService.gitIdentities.clear(); });
     test.afterEach(() => { FleetLifecycleService.processes.clear(); FleetLifecycleService.gitIdentities.clear(); FleetLifecycleService.leasesAdopted = false; });
