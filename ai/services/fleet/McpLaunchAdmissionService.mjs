@@ -170,6 +170,14 @@ class McpLaunchAdmissionService extends Base {
     /** @member {String} continuityPhase Boot recovery excludes new Starts until its evidence is settled. @private */
     continuityPhase = 'ready'
 
+    /**
+     * @member {Object|null} continuityRecord What boot recovery found: the previous issuer's exit
+     * (`previousReason`: `null` after a proved handoff, else `unclean-issuer-exit` or `handoff-replayed`),
+     * whether its handoff was proved, its origin, and each retained generation's disposition with the
+     * check that kept it stale. `null` until {@link recover} has run.
+     */
+    continuityRecord = null
+
     /** @member {Promise|null} handoffPromise One terminal handoff attempt per issuer. @private */
     handoffPromise = null
 
@@ -208,6 +216,8 @@ class McpLaunchAdmissionService extends Base {
         if (!this.journal || this.generations.size || this.listening || this.continuityPhase !== 'ready' ||
             typeof restoreSeat !== 'function') throw new Error('Launch recovery must precede admission and Start.');
         const previous = this.journal.previous;
+        this.continuityRecord = {recoveredAt: new Date().toISOString(), previousReason: previous?.reason ?? null,
+            handoffProved: previous?.handoffProved ?? null, origin: previous?.origin ?? null, seats: []};
         if (!previous) return [];
         const retainedRuntimes = [...previous.snapshot.generations.map(row => row.runtime),
             ...previous.snapshot.seats.map(row => row.start.runtime)].filter(Boolean);
@@ -225,6 +235,7 @@ class McpLaunchAdmissionService extends Base {
                 ...structuredClone(saved), definition, generationRoot: saved.runtime?.runtimeRoot ?? null,
                 state  : saved.state === STATES.REVOKED ? STATES.REVOKED : STATES.STALE,
                 reason : saved.state === STATES.REVOKED ? saved.reason : REASONS.RECOVERY_UNVERIFIED,
+                detail : saved.state === STATES.REVOKED || previous.handoffProved ? null : previous.reason,
                 servers: new Map(saved.servers.map(row => [row.key, {...row, secret: null,
                     state : row.state === STATES.REVOKED ? STATES.REVOKED : STATES.STALE,
                     reason: row.state === STATES.REVOKED ? row.reason : REASONS.RECOVERY_UNVERIFIED,
@@ -242,23 +253,30 @@ class McpLaunchAdmissionService extends Base {
                     if (saved.state !== STATES.ACTIVE) continue;
                     const seat = previous.snapshot.seats.find(row => row.start.agentId === saved.agentId);
                     try {
-                        if (!seat || seat.state !== 'running' || seat.ownershipUnresolved || seat.cleanupUnresolved ||
-                            seat.start.admissionGeneration !== saved.id || seat.start.identity !== saved.identity ||
-                            seat.start.profile?.issuer !== previous.origin || !isDeepStrictEqual(seat.start.runtime, saved.runtime)) throw Error();
+                        // Each check names itself: the one that fails is what the seat's row will say.
+                        const unproved = !seat ? 'no seat record' : seat.state !== 'running' ? `seat state '${seat.state}'`
+                            : seat.ownershipUnresolved ? 'seat ownership unresolved' : seat.cleanupUnresolved ? 'seat cleanup unresolved'
+                            : seat.start.admissionGeneration !== saved.id ? 'admission generation mismatch'
+                            : seat.start.identity !== saved.identity ? 'identity mismatch'
+                            : seat.start.profile?.issuer !== previous.origin ? 'profile issuer is not the original origin'
+                            : !isDeepStrictEqual(seat.start.runtime, saved.runtime) ? 'runtime pin mismatch' : null;
+                        if (unproved) throw new Error(unproved);
                         const recovered = await restoreSeat(seat.start, saved);
                         if (generation.state === STATES.REVOKED) continue;
                         const agent      = registry.getDefinition(saved.agentId);
                         const definition = agent && projectDefinition(agent);
-                        if (!definition || loginOf(agent) !== saved.identity ||
-                            crypto.createHash('sha256').update(canonicalJson(definition)).digest('hex') !== saved.definitionHash ||
-                            observeProcess(recovered.probe) !== 'live') throw Error();
+                        const changed    = !definition ? 'definition missing' : loginOf(agent) !== saved.identity ? 'identity changed'
+                            : crypto.createHash('sha256').update(canonicalJson(definition)).digest('hex') !== saved.definitionHash ? 'definition changed'
+                            : observeProcess(recovered.probe) !== 'live' ? 'process not live' : null;
+                        if (changed) throw new Error(changed);
                         const effective = {...saved, servers: saved.servers.map(row => generation.servers.get(row.key).state === STATES.REVOKED
                             ? {...row, state: STATES.REVOKED, reason: generation.servers.get(row.key).reason} : row)};
                         const servers = this.recoverServers({saved: effective, start: seat.start, recovered});
-                        Object.assign(generation, {definition, servers, state: STATES.ACTIVE, reason: null,
+                        Object.assign(generation, {definition, servers, state: STATES.ACTIVE, reason: null, detail: null,
                             owners: recovered.owners, residentInputs: recovered.residentInputs, probe: recovered.probe});
-                    } catch {
-                        // One unproved survivor cannot authorize itself or discard another seat's evidence.
+                    } catch (error) {
+                        // One unproved survivor cannot authorize itself or discard another seat's evidence; it says which check failed.
+                        generation.detail = error?.message || 'the original Start, its runtime pin or its inputs did not verify';
                     }
                 }
                 if (previous.origin !== null) await this.listen({origin: previous.origin});
@@ -269,7 +287,7 @@ class McpLaunchAdmissionService extends Base {
                 if (generation.state !== STATES.ACTIVE) continue;
                 if (observeProcess(generation.probe) !== 'live') {
                     Object.assign(generation, {state: STATES.STALE, reason: REASONS.RECOVERY_UNVERIFIED,
-                        owners: {}, residentInputs: {}, probe: null});
+                        detail: 'process not live after recovery', owners: {}, residentInputs: {}, probe: null});
                     generation.servers.forEach(server => { server.secret = null; });
                     continue;
                 }
@@ -277,13 +295,14 @@ class McpLaunchAdmissionService extends Base {
             }
             this.persistAdmission();
             this.continuityPhase = 'ready';
-            return [...this.generations.values()].map(row => ({agentId: row.agentId, state: row.state, reason: row.reason}));
+            this.continuityRecord.seats = [...this.generations.values()].map(row => ({agentId: row.agentId, state: row.state, reason: row.reason, detail: row.detail ?? null}));
+            return this.continuityRecord.seats.map(row => ({...row}));
         } catch (error) {
             this.continuityPhase = 'unavailable';
             this.grants.clear();
             for (const generation of this.generations.values()) {
                 if (generation.state === STATES.REVOKED) continue;
-                Object.assign(generation, {state: STATES.STALE, reason: REASONS.RECOVERY_UNVERIFIED, owners: {}, residentInputs: {}, probe: null});
+                Object.assign(generation, {state: STATES.STALE, reason: REASONS.RECOVERY_UNVERIFIED, detail: error?.message || 'recovery failed', owners: {}, residentInputs: {}, probe: null});
                 generation.servers.forEach(server => { server.secret = null; });
             }
             try {
@@ -309,25 +328,27 @@ class McpLaunchAdmissionService extends Base {
         const {capabilities, owners, residentInputs} = recovered;
         if (canonicalJson(Object.keys(capabilities).sort()) !== canonicalJson(saved.servers.map(row => row.key).sort()) ||
             canonicalJson(Object.keys(start.profile.grants).sort()) !== canonicalJson(saved.servers.map(row => row.key).sort()) ||
-            canonicalJson(start.targets.map(row => row.key).sort()) !== canonicalJson(saved.servers.map(row => row.key).sort())) throw Error();
+            canonicalJson(start.targets.map(row => row.key).sort()) !== canonicalJson(saved.servers.map(row => row.key).sort())) throw new Error('server set changed');
         for (const [name, owner] of Object.entries(owners)) {
-            if (!isDeepStrictEqual(owner.binding, saved.credentialBindings[name]) || !owner.matches()) throw Error();
+            if (!isDeepStrictEqual(owner.binding, saved.credentialBindings[name]) || !owner.matches()) throw new Error(`credential owner changed: ${name}`);
         }
         for (const [key, input] of Object.entries(residentInputs)) {
-            if (!isDeepStrictEqual({binding: input.binding, names: input.names}, saved.residentBindings[key]) || !input.matches()) throw Error();
+            if (!isDeepStrictEqual({binding: input.binding, names: input.names}, saved.residentBindings[key]) || !input.matches()) throw new Error(`resident input changed: ${key}`);
         }
         return new Map(saved.servers.map(row => {
             const capability = capabilities[row.key], grant = parseLaunchCapability(capability), expected = start.profile.grants[row.key];
             if (!grant || grant.id !== row.grantId || expected.id !== row.grantId || expected.sha256 !== row.capabilityHash ||
-                crypto.createHash('sha256').update(capability).digest('hex') !== row.capabilityHash) throw Error();
+                crypto.createHash('sha256').update(capability).digest('hex') !== row.capabilityHash) throw new Error(`capability changed: ${row.key}`);
             const target = start.targets.find(target => target.key === row.key);
             const owned  = [], resident = [], required = target.slots.filter(slot => slot.required).map(slot => slot.name);
             if (row.state !== STATES.REVOKED) {
-                if (row.state !== STATES.ACTIVE) throw Error();
+                if (row.state !== STATES.ACTIVE) throw new Error(`server state changed: ${row.key}`);
                 for (const slot of target.slots) {
                     if (slot.state === 'owner' && owners[slot.name]) owned.push(slot.name);
                     else if (slot.state === 'held' && residentInputs[row.key]?.names.includes(slot.name)) resident.push(slot.name);
-                    else if (slot.state !== 'absent' || slot.required) throw Error();
+                    else if (slot.state === 'owner') throw new Error(`credential owner missing: ${slot.name}`);
+                    else if (slot.state === 'held') throw new Error(`resident input missing: ${slot.name}`);
+                    else if (slot.state !== 'absent' || slot.required) throw new Error(`slot unaccounted: ${slot.name}`);
                 }
             }
             return [row.key, {...row, secret: grant.secret, args: [...target.args], env: {}, owned, resident, required}];
@@ -340,14 +361,18 @@ class McpLaunchAdmissionService extends Base {
      * custody without a handoff; ordinary process Quit remains the caller's choice, never blocked here.
      * @param {Object} options
      * @param {Function} options.verifySeats Validates every surviving seat against its original Start.
+     * @param {Function} [options.onStage] `(stage) => void`, called as each stage begins and once more on
+     *     a refusal (`refused at <stage>: <reason>`), so a caller's log witnesses how far a handoff got
+     *     even when the host kills the process mid-stage; never awaited, never trusted with control.
      * @returns {Promise<Object>} Coalesced terminal disposition, without grants or input values.
      */
-    handoff({verifySeats}) {
-        return this.handoffPromise ??= this.performHandoff(verifySeats);
+    handoff({verifySeats, onStage = null}) {
+        return this.handoffPromise ??= this.performHandoff(verifySeats, onStage);
     }
 
     /** @summary One bounded terminal transition; only the owner-facing handoff method starts it. @private */
-    async performHandoff(verifySeats) {
+    async performHandoff(verifySeats, onStage = null) {
+        const witness = stage => { try { onStage?.(stage) } catch {} };
         if (!this.journal || this.journalFailed || this.continuityPhase !== 'ready' || typeof verifySeats !== 'function') {
             throw new Error('Fleet continuity refused: custody-unavailable.');
         }
@@ -377,17 +402,22 @@ class McpLaunchAdmissionService extends Base {
                 stage = 'endpoint-binding';
                 throw new Error('Fleet continuity refused: endpoint-binding.');
             }
+            witness(stage);
             await bounded(Promise.resolve().then(verifySeats));
             stage = 'proof-drain';
+            witness(stage);
             await bounded(Promise.all([...this.generations.values()].flatMap(row => [...row.proofs.values()])));
             this.persistAdmission();
             stage = 'endpoint-release';
+            witness(stage);
             await bounded(release());
             stage = 'durable-handoff';
+            witness(stage);
             this.journal.handoff(this.admissionSnapshot(), this.issuerOrigin);
             this.continuityPhase = 'handed-off';
             return {state: 'handed-off'};
-        } catch {
+        } catch (error) {
+            witness(`refused at ${stage}${error?.message && !/^Fleet continuity refused/.test(error.message) ? `: ${error.message}` : ''}`);
             this.continuityPhase = 'unavailable';
             this.grants.clear();
             this.journal.close();
@@ -745,7 +775,10 @@ class McpLaunchAdmissionService extends Base {
      * @param {Object} [options]
      * @param {Boolean} [options.running=false] Whether the lifecycle holds the seat as running. A running
      *     seat without a generation of this process is `stale`.
-     * @returns {{state: String, reason: String|null, generation: String|null, since: String|null,
+     * `detail` says why a stale row is stale in this process's own words: for a running seat this issuer
+     * holds no generation for, the previous issuer's exit as boot recovery read it; for a retained
+     * generation, the check that kept it stale.
+     * @returns {{state: String, reason: String|null, detail: String|null, generation: String|null, since: String|null,
      *     servers: Object[], recent: Object[]}}
      */
     statusOf(agentId, {running = false} = {}) {
@@ -755,6 +788,7 @@ class McpLaunchAdmissionService extends Base {
             return {
                 state     : running ? STATES.STALE : STATES.NONE,
                 reason    : running ? REASONS.ISSUER_REPLACED : null,
+                detail    : running ? this.continuityRecord?.previousReason ?? null : null,
                 generation: null,
                 since     : null,
                 servers   : [],
@@ -765,6 +799,7 @@ class McpLaunchAdmissionService extends Base {
         return {
             state     : generation.state,
             reason    : generation.reason,
+            detail    : generation.detail ?? null,
             generation: generation.id,
             since     : generation.revokedAt ?? generation.activatedAt ?? generation.reservedAt,
             servers   : [...generation.servers.values()].map(({key, state, reason}) => ({key, state, reason})),
