@@ -48,13 +48,18 @@ const CI_STATES = Object.freeze({
  */
 function ownerOf(node, identities) {
     const
-        login = node.author?.login ?? null,
-        name  = AUTHOR_LINE.exec(node.body ?? '')?.[1]?.trim(),
-        seat  = name ? identities.byName(name) : null;
+        login        = node.author?.login ?? null,
+        knownAccount = Boolean(login && identities.byLogin(login));
 
-    if (seat) return {kind: 'seat', seat, login};
+    if (!knownAccount || node.author?.__typename === 'Bot') {
+        return {kind: 'outside', seat: null, login}
+    }
 
-    return {kind: login && identities.byLogin(login) ? 'unowned' : 'outside', seat: null, login}
+    const
+        name = AUTHOR_LINE.exec(node.body ?? '')?.[1]?.trim(),
+        seat = name ? identities.byName(name) : null;
+
+    return seat ? {kind: 'seat', seat, login} : {kind: 'unowned', seat: null, login}
 }
 
 /**
@@ -72,15 +77,16 @@ function reviewerOf(reviewer, identities) {
 
 /**
  * @summary A connection's nodes, and whether they are all of them. A connection without its
- * `pageInfo`, or one with a next page, is known only as far as it shows.
+ * `pageInfo`, or one with a remaining page along its pagination direction, is known only as far as it shows.
  * @param {Object} connection
+ * @param {'hasNextPage'|'hasPreviousPage'} [boundary='hasNextPage']
  * @returns {{nodes: Object[], complete: Boolean}}
  * @private
  */
-function connectionOf(connection) {
+function connectionOf(connection, boundary = 'hasNextPage') {
     const nodes = Array.isArray(connection?.nodes) ? connection.nodes : null;
 
-    return {nodes: nodes ?? [], complete: Boolean(nodes) && connection.pageInfo?.hasNextPage === false}
+    return {nodes: nodes ?? [], complete: Boolean(nodes) && connection.pageInfo?.[boundary] === false}
 }
 
 /**
@@ -102,6 +108,7 @@ export function normalizePullRequest(node, identities, {apiBase = null} = {}) {
         requests  = connectionOf(node.reviewRequests),
         reviews   = connectionOf(node.latestReviews),
         opinions  = connectionOf(node.latestOpinionatedReviews),
+        suites    = commit?.checkSuites === undefined ? {nodes: [], complete: true} : connectionOf(commit.checkSuites, 'hasPreviousPage'),
         requested = requests.nodes.map(item => reviewerOf(item?.requestedReviewer, identities)),
         // whether each review judged the current head
         judged    = item => ({reviewer: reviewerOf(item?.author, identities), state: item?.state ?? null, onHead: item?.commit?.oid === head}),
@@ -111,26 +118,31 @@ export function normalizePullRequest(node, identities, {apiBase = null} = {}) {
         // an item naming no reviewer is unknown, so its list is known only as far as it resolves
         requestsComplete = requests.complete && requested.every(Boolean),
         reviewsComplete  = reviews.complete && reviewed.every(review => review.reviewer),
-        opinionsComplete = opinions.complete && opined.every(opinion => opinion.reviewer);
+        opinionsComplete = opinions.complete && opined.every(opinion => opinion.reviewer),
+        runApproval      = suites.nodes.some(suite => suite?.conclusion === 'ACTION_REQUIRED' && suite.workflowRun?.event !== 'pull_request_review')
+            ? 'action_required' : null;
 
     return {
-        key      : `${repo}#${node.number}`,
+        key              : `${repo}#${node.number}`,
         repo,
-        number   : node.number,
-        title    : typeof node.title === 'string' ? node.title.replace(/\s+/g, ' ').trim() || null : null,
+        number           : node.number,
+        title            : typeof node.title === 'string' ? node.title.replace(/\s+/g, ' ').trim() || null : null,
         head,
-        ci       : CI_STATES[commit?.statusCheckRollup?.state] ?? null,
-        verdict  : node.reviewDecision ?? null,
-        mergeable: node.mergeable ?? null,
-        draft    : Boolean(node.isDraft),
-        owner    : ownerOf(node, identities),
-        requested: requested.filter(Boolean).sort(),
-        reviews  : reviewed.filter(review => review.reviewer),
-        opinions : opined.filter(opinion => opinion.reviewer),
-        reviewRecords: normalizeReviewRecords(node, apiBase),
+        ci               : CI_STATES[commit?.statusCheckRollup?.state] ?? null,
+        verdict          : node.reviewDecision ?? null,
+        mergeable        : node.mergeable ?? null,
+        draft            : Boolean(node.isDraft),
+        authorAssociation: node.authorAssociation ?? null,
+        bot              : node.author?.__typename === 'Bot',
+        runApproval,
+        owner            : ownerOf(node, identities),
+        requested        : requested.filter(Boolean).sort(),
+        reviews          : reviewed.filter(review => review.reviewer),
+        opinions         : opined.filter(opinion => opinion.reviewer),
+        reviewRecords    : normalizeReviewRecords(node, apiBase),
         requestsComplete,
         opinionsComplete,
-        partial  : !requestsComplete || !reviewsComplete || !opinionsComplete
+        partial          : !requestsComplete || !reviewsComplete || !opinionsComplete || !suites.complete
     }
 }
 
@@ -256,7 +268,12 @@ function arrivalOf(row, previousComplete, pulse) {
  * @private
  */
 function readBy(row, seats) {
-    return seats.length > 0 && (!row.requestsComplete || seats.includes(`@${row.owner?.login}`) || row.requested.some(seat => seats.includes(seat)))
+    return seats.length > 0 && (
+        row.owner?.kind === 'outside' && seats.includes('outside') ||
+        !row.requestsComplete ||
+        seats.includes(`@${row.owner?.login}`) ||
+        row.requested.some(seat => seats.includes(seat))
+    )
 }
 
 /**
