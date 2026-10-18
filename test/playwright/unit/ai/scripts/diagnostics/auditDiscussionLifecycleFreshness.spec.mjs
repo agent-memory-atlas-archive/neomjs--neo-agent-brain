@@ -1,5 +1,6 @@
-import {test, expect} from '@playwright/test';
-import {formatReport} from '../../../../../../ai/scripts/diagnostics/audit-discussion-lifecycle.mjs';
+import {test, expect}                        from '@playwright/test';
+import {formatReport, resolveDiscussionsDir} from '../../../../../../ai/scripts/diagnostics/audit-discussion-lifecycle.mjs';
+import {resolveIssuesDir}                    from '../../../../../../ai/scripts/diagnostics/detectTruncatedTimelines.mjs';
 
 /**
  * @summary The freshness caveat this guard emits BEFORE any finding.
@@ -130,5 +131,22 @@ test.describe('audit-discussion-lifecycle — the snapshot states its own age', 
               parsed   = JSON.parse(report(snapshot, {json: true}));
 
         expect(parsed.snapshot).toEqual(snapshot)
-    })
+    });
+
+    test('resolveDiscussionsDir and resolveIssuesDir refuse naming their declared CLI flags and config leaves when unconfigured (#459)', () => {
+        expect(() => resolveDiscussionsDir({configuredDir: ''})).toThrow(
+            /audit-discussion-lifecycle:.*--discussions-dir.*NEO_MCP_GITHUB_DISCUSSIONS_DIR.*NEO_MCP_GITHUB_CONTENT_ROOT/
+        );
+        expect(resolveDiscussionsDir({
+            configuredDir: '/tmp/corpus/neo/discussions'
+        })).toBe('/tmp/corpus/neo/discussions');
+
+        expect(() => resolveIssuesDir({argv: [], configuredDir: ''})).toThrow(
+            /detectTruncatedTimelines:.*--issues-dir.*NEO_MCP_GITHUB_ISSUES_DIR.*NEO_MCP_GITHUB_CONTENT_ROOT/
+        );
+        expect(resolveIssuesDir({
+            argv         : ['--issues-dir', '/tmp/corpus/neo/issues'],
+            configuredDir: ''
+        })).toBe('/tmp/corpus/neo/issues');
+    });
 });

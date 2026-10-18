@@ -1,3 +1,5 @@
+import 'neo.mjs/src/Neo.mjs';
+import 'neo.mjs/src/core/_export.mjs';
 import fs                                     from 'node:fs/promises';
 import path                                   from 'node:path';
 import process                                from 'node:process';
@@ -5,6 +7,7 @@ import {execFile}                             from 'node:child_process';
 import {promisify}                            from 'node:util';
 import {fileURLToPath}                        from 'node:url';
 import {Command, InvalidArgumentError}        from 'commander';
+import githubWorkflowConfig                   from '../../mcp/server/github-workflow/config.mjs';
 import {classifyDiscussionRoutingDisposition} from '../../services/github-workflow/shared/discussionRoutingDisposition.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -21,8 +24,30 @@ const execFileAsync = promisify(execFile);
  * @see https://github.com/neomjs/neo/issues/11236
  */
 
-const DEFAULT_DISCUSSIONS_DIR = path.resolve(process.cwd(), 'resources/content/discussions');
-const DEFAULT_STALE_DAYS      = 90;
+const DEFAULT_STALE_DAYS = 90;
+
+/**
+ * Resolves the synced Discussions corpus directory from CLI `--discussions-dir` or the declared
+ * `issueSync.discussionsDir` config leaf, refusing when none is configured.
+ * @param {Object} [options={}]
+ * @param {String} [options.discussionsDir]
+ * @param {String} [options.configuredDir=githubWorkflowConfig.issueSync.discussionsDir]
+ * @returns {String}
+ */
+function resolveDiscussionsDir({discussionsDir, configuredDir = githubWorkflowConfig.issueSync.discussionsDir} = {}) {
+    if (typeof discussionsDir === 'string' && discussionsDir.trim().length > 0) {
+        return path.resolve(discussionsDir.trim());
+    }
+
+    if (typeof configuredDir === 'string' && configuredDir.trim().length > 0) {
+        return path.resolve(configuredDir.trim());
+    }
+
+    throw new Error(
+        'audit-discussion-lifecycle: no discussions directory configured (pass --discussions-dir <path> or set ' +
+        'issueSync.discussionsDirOverride / NEO_MCP_GITHUB_DISCUSSIONS_DIR or issueSync.contentRootOverride / NEO_MCP_GITHUB_CONTENT_ROOT).'
+    );
+}
 
 /**
  * How old the synced snapshot may be before its verdicts are labelled stale.
@@ -534,7 +559,7 @@ function createArgParser({silent = false} = {}) {
         .description('Audit synced Ideation Sandbox Discussions for lifecycle-close compliance.')
         .exitOverride()
         .allowExcessArguments(false)
-        .option('--discussions-dir <path>', 'Synced Discussions corpus directory.', DEFAULT_DISCUSSIONS_DIR)
+        .option('--discussions-dir <path>', 'Synced Discussions corpus directory.')
         .option('--fixture <path>', 'JSON fixture file to audit instead of the synced corpus.')
         .option('--stale-days <days>', 'Open-discussion age threshold.', parsePositiveNumber, DEFAULT_STALE_DAYS)
         .option('--max-snapshot-age-hours <hours>', 'Snapshot age past which findings are labelled stale.', parsePositiveNumber, DEFAULT_MAX_SNAPSHOT_AGE_HOURS)
@@ -568,7 +593,7 @@ function parseArgs(argv, {silent = false} = {}) {
     const options = program.opts();
 
     return {
-        discussionsDir     : path.resolve(options.discussionsDir),
+        discussionsDir     : options.discussionsDir ? path.resolve(options.discussionsDir) : null,
         failOn             : options.reportOnly ? 'none' : options.failOn,
         fixture            : options.fixture ? path.resolve(options.fixture) : null,
         json               : options.json,
@@ -732,9 +757,13 @@ async function main() {
         return
     }
 
+    const discussionsDir = options.fixture
+        ? null
+        : resolveDiscussionsDir({discussionsDir: options.discussionsDir});
+
     const discussions = options.fixture
         ? await loadFixture(options.fixture)
-        : await loadDiscussionsFromDir(options.discussionsDir);
+        : await loadDiscussionsFromDir(discussionsDir);
 
     const result = auditDiscussions(discussions, {
         now      : options.now,
@@ -746,9 +775,9 @@ async function main() {
     result.snapshot = options.fixture
         ? {ageHours: null, ingestedAt: null, reason: 'fixture input — not a synced snapshot', source: 'fixture'}
         : await resolveSnapshotFreshness({
-            discussionsDir: options.discussionsDir,
-            execFileFn    : execFileAsync,
-            now           : options.now
+            discussionsDir,
+            execFileFn: execFileAsync,
+            now       : options.now
         });
 
     const report = formatReport(result, {
@@ -782,6 +811,8 @@ export {
     auditDiscussions,
     classifyDiscussion,
     formatReport,
+    parseArgs,
     parseFrontmatter,
+    resolveDiscussionsDir,
     shouldFail
 };

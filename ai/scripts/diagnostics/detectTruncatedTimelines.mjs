@@ -28,16 +28,52 @@
  * @see ai/services/github-workflow/sync/IssueSyncer.mjs
  * @see ai/services/github-workflow/queries/issueQueries.mjs
  */
-import fs              from 'fs/promises';
-import path            from 'path';
-import {fileURLToPath} from 'url';
-import matter          from 'gray-matter';
+import 'neo.mjs/src/Neo.mjs';
+import 'neo.mjs/src/core/_export.mjs';
+import fs                   from 'fs/promises';
+import path                 from 'path';
+import {fileURLToPath}      from 'url';
+import matter               from 'gray-matter';
+import githubWorkflowConfig from '../../mcp/server/github-workflow/config.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
 
-const projectRoot = path.resolve(__dirname, '../../..');
-const issuesDir   = path.resolve(projectRoot, 'resources/content/issues');
+/**
+ * Resolves the active issues directory from CLI `--issues-dir` or the declared
+ * `issueSync.issuesDir` config leaf, refusing when none is configured.
+ * @param {Object} [options={}]
+ * @param {String[]} [options.argv=process.argv.slice(2)]
+ * @param {String} [options.configuredDir=githubWorkflowConfig.issueSync.issuesDir]
+ * @returns {String}
+ */
+export function resolveIssuesDir({argv = process.argv.slice(2), configuredDir = githubWorkflowConfig.issueSync.issuesDir} = {}) {
+    for (let i = 0; i < argv.length; i++) {
+        const arg = argv[i];
+        if (arg === '--issues-dir') {
+            const next = argv[i + 1];
+            if (typeof next === 'string' && next.trim().length > 0 && !next.startsWith('--')) {
+                return path.resolve(next.trim());
+            }
+            throw new Error('detectTruncatedTimelines: --issues-dir requires a directory path.');
+        }
+        if (arg.startsWith('--issues-dir=')) {
+            const val = arg.slice('--issues-dir='.length).trim();
+            if (val.length > 0) {
+                return path.resolve(val);
+            }
+            throw new Error('detectTruncatedTimelines: --issues-dir requires a directory path.');
+        }
+    }
+
+    if (typeof configuredDir === 'string' && configuredDir.trim().length > 0) {
+        return path.resolve(configuredDir.trim());
+    }
+
+    throw new Error(
+        'detectTruncatedTimelines: no issues directory configured (pass --issues-dir <path> or set ' +
+        'issueSync.issuesDirOverride / NEO_MCP_GITHUB_ISSUES_DIR or issueSync.contentRootOverride / NEO_MCP_GITHUB_CONTENT_ROOT).'
+    );
+}
 
 // Mirrors IssueSyncer's `maxTimelineItemsPerIssue` default. If that config changes,
 // this constant must move with it — both encode the same GitHub-imposed page size.
@@ -58,7 +94,7 @@ const TIMELINE_HEADING_RE = /^## Timeline$/m;
 
 async function scanDir(dir) {
     const files = [];
-    const walk = async (d) => {
+    const walk  = async (d) => {
         const entries = await fs.readdir(d, {withFileTypes: true});
         for (const e of entries) {
             const full = path.join(d, e.name);
@@ -112,7 +148,8 @@ function analyzeFile(filePath, raw) {
 }
 
 async function main() {
-    const jsonMode = process.argv.includes('--json');
+    const jsonMode  = process.argv.includes('--json');
+    const issuesDir = resolveIssuesDir();
 
     const files   = await scanDir(issuesDir);
     const reports = [];
@@ -160,7 +197,9 @@ async function main() {
     }
 }
 
-main().catch(e => {
-    console.error('Error:', e);
-    process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+    main().catch(e => {
+        console.error('Error:', e);
+        process.exit(1);
+    });
+}

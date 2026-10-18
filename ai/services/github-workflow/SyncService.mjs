@@ -176,9 +176,18 @@ class SyncService extends Base {
      * be pushed to GitHub before the pull. Scheduled CI emission passes `false` and remains read-only.
      * @param {Number[]} [options.refetchIssues=[]] Issues the `issues` facet force-refetches in this run,
      * failing the facet unless each comes back (`IssueSyncer#pullFromGitHub`).
+     * @param {String} [options.contentRoot=aiConfig.issueSync.contentRoot] Configured corpus root; an
+     * undeclared root throws naming `NEO_MCP_GITHUB_CONTENT_ROOT` before loading metadata or fetching.
      * @returns {Promise<object>} Statistics for the emitted generated content, plus `facetOutcomes`.
      */
-    async emitGeneratedContent({pushLocalChanges = true, refetchIssues = []} = {}) {
+    async emitGeneratedContent({pushLocalChanges = true, refetchIssues = [], contentRoot = this.#getConfig().issueSync.contentRoot} = {}) {
+        if (!contentRoot) {
+            throw new Error(
+                'SyncService#emitGeneratedContent: no GitHub workflow contentRoot is configured ' +
+                '(set issueSync.contentRootOverride / NEO_MCP_GITHUB_CONTENT_ROOT).'
+            );
+        }
+
         const
             metadata = await MetadataManager.load(),
             outcomes = [],
@@ -408,14 +417,15 @@ class SyncService extends Base {
      * @param {Object} [options]
      * @param {Number[]} [options.refetchIssues=[]] Issues to force-refetch in this emission, for corpus files
      * that drifted from GitHub without an `updatedAt` change.
+     * @param {String} [options.contentRoot] Optional explicit corpus root forwarded to `emitGeneratedContent`.
      * @returns {Promise<object>} Facet statistics and truthful aggregate outcome.
      * @throws {Error} When a facet fails to advance or this run writes a logical-identity collision in the archive.
      */
-    async emitConversationCorpus({refetchIssues = []} = {}) {
+    async emitConversationCorpus({refetchIssues = [], contentRoot} = {}) {
         const
             archiveRoot     = this.#getConfig().issueSync.archiveRoot,
             baselineArchive = snapshotArchiveTree(archiveRoot),
-            result          = await this.emitGeneratedContent({pushLocalChanges: false, refetchIssues}),
+            result          = await this.emitGeneratedContent({pushLocalChanges: false, refetchIssues, contentRoot}),
             targets         = collectWrittenArchiveTargets(archiveRoot, baselineArchive),
             collisions      = findLogicalIdentityCollisions({archiveRoot, targets});
 
@@ -622,16 +632,19 @@ class SyncService extends Base {
     /**
      * The main public entry point for the synchronization process.
      *
+     * @summary Runs full GitHub workflow synchronization and auto-pushes generated content.
+     * @param {Object} [options={}]
+     * @param {String} [options.contentRoot] Optional explicit content root forwarded to `emitGeneratedContent`.
      * @returns {Promise<object>} A comprehensive object containing detailed statistics and timing
      * information about all operations performed during the sync.
      */
-    async runFullSync() {
+    async runFullSync({contentRoot} = {}) {
         const startTime = new Date();
-        let   syncStats = await this.emitGeneratedContent();
+        let   syncStats = await this.emitGeneratedContent({contentRoot});
 
         await this.autoPushGeneratedContent({
             rerunEmission: async () => {
-                syncStats = await this.emitGeneratedContent();
+                syncStats = await this.emitGeneratedContent({contentRoot});
             }
         });
 
