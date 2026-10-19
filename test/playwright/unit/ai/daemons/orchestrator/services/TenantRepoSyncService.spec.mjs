@@ -1679,11 +1679,13 @@ test.describe('TenantRepoSyncService (#11790)', () => {
     });
 
     test('skipped when no tenantRepos configured', async () => {
-        const taskStateService = createTaskStateService();
+        const taskStateService = createTaskStateService(),
+              logs             = [];
 
         const result = await TenantRepoSyncService.runTask({
             reason           : 'manual-test',
             taskStateService,
+            writeLog         : (level, message) => logs.push(`${level} ${message}`),
             tenantReposConfig: {tenantRepos: []},
             revisionsFilePath: revisionsFile
         });
@@ -1691,6 +1693,8 @@ test.describe('TenantRepoSyncService (#11790)', () => {
         expect(result.status).toBe('skipped');
         expect(result.details.reason).toBe('no-tenant-repos-configured');
         expect(result.details.repoCount).toBe(0);
+        // DEBUG, not INFO: the sweep repeats this line every cadence on a deployment with no tenant repos
+        expect(logs.filter(line => line.includes('No tenantRepos configured'))).toEqual(['DEBUG [TenantRepoSync] No tenantRepos configured; skipping.']);
         // The real record carries the disposition: a skip stamps the cycle and leaves the exit code and
         // the success clock alone.
         expect(taskStateService.getTaskState('tenant-repo-sync')).toMatchObject({running: false, lastExitCode: null, lastSuccessAt: null, lastCompletionAt: expect.any(String)});
@@ -8834,7 +8838,7 @@ test.describe('TenantRepoSyncService (#11790)', () => {
         // And the scheduler reads it: measured live before this existed, a 47k-chunk first ingest
         // waited the full 30-minute cadence after every clean slice.
         const {isRepoDue} = await import('../../../../../../../ai/daemons/orchestrator/scheduling/tenantRepoSync.mjs');
-        const due = isRepoDue({
+        const due         = isRepoDue({
             repo              : {tenantId: 't1', repoSlug: 'org/rotating'},
             persistedRepoState: revisions['t1/org/rotating'],
             now               : revisions['t1/org/rotating'].lastRunAttemptAt + 1,
