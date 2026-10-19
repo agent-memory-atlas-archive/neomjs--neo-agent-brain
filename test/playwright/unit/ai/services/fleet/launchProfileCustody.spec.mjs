@@ -363,6 +363,19 @@ test.describe('Codex original profile custody', () => {
     test('a project table that would win over the bound home table refuses', async () => {
         await write(projectConfig, table('neo-mjs-neural-link', {...row, command: '/operator/node'}) + '\n');
         await expect(recover()).rejects.toMatchObject({reason: 'workspace-mismatch'});
+        await write(projectConfig, '[mcp_servers."neo-mjs-neural-link"]\nenv = { NEO_FLEET_LAUNCH_GRANT = "forged" }\n');
+        await expect(recover()).rejects.toMatchObject({reason: 'workspace-mismatch'});
+    });
+
+    test('the seat\'s tool approvals for the bound table keep custody in either layer', async () => {
+        const approvals = name => [
+            `[mcp_servers."${name}".tools."healthcheck"]`, 'approval_mode = "approve"', '',
+            `[mcp_servers."${name}".tools."query_vdom"]`, 'approval_mode = "prompt"', ''
+        ].join('\n');
+        await write(projectConfig, approvals('neo-mjs-neural-link'));
+        expect(await recover()).toEqual({'neural-link': grant.capability});
+        await write(homeConfig, homeSource + '\n' + approvals('neo-mjs-neural-link'));
+        expect(await recover()).toEqual({'neural-link': grant.capability});
     });
 
     test('no project config is no override, but one that appears during recovery refuses', async () => {
