@@ -561,7 +561,19 @@ class ConfigBase extends ConfigProvider {
                  * @type {number}
                  */
                 tenantProbeTimeoutMs: leaf(30000, 'NEO_FLEET_TENANT_PROBE_TIMEOUT_MS', 'number'),
-                harnessBinaries     : {
+                /**
+                 * Whole-quit budget in milliseconds that Fleet may spend across request drain and
+                 * launch-admission continuity handoff before the host's grace escalates to SIGKILL.
+                 * `devFleetServer` (`cleanShutdown`) reads this leaf once at quit start (falling back
+                 * to `proofTimeoutMs` when non-positive), drains requests under
+                 * `Math.min(proofTimeoutMs, remaining())`, and passes `deadlineMs: remaining()` to
+                 * `handoffRuntimeCustody` -> `McpLaunchAdmissionService#performHandoff` so drain and
+                 * handoff share one deadline (`10000` ms default for standalone dev servers; packaged
+                 * Fleet Manager host serializes `graceMs - margin` via `NEO_FLEET_SHUTDOWN_BUDGET_MS`).
+                 * @type {number}
+                 */
+                shutdownBudgetMs: leaf(10000, 'NEO_FLEET_SHUTDOWN_BUDGET_MS', 'number'),
+                harnessBinaries : {
                     /**
                      * The antigravity harness binary — the app-bundle MAIN binary (a directly
                      * spawnable, supervisable child), never an `open -n` launcher. macOS default;
