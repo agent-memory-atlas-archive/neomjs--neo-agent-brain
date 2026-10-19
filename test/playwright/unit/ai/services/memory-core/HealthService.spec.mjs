@@ -2076,15 +2076,16 @@ test.describe('HealthService #10724 — buildSummaryProviderBlock', () => {
  * @see Neo.ai.services.memory-core.HealthService#buildBackupStateBlock
  */
 test.describe('HealthService #10844 — buildBackupStateBlock', () => {
-    let buildBackupStateBlock;
+    let buildBackupStateBlock, resolveComposedBackupBlock;
 
     const mockPath = {
         join: (...args) => args.join('/')
     };
 
     test.beforeAll(async () => {
-        const mod = await import('../../../../../../ai/services/memory-core/HealthService.mjs');
-        buildBackupStateBlock = mod.buildBackupStateBlock;
+        const mod                  = await import('../../../../../../ai/services/memory-core/HealthService.mjs');
+        buildBackupStateBlock      = mod.buildBackupStateBlock;
+        resolveComposedBackupBlock = mod.resolveComposedBackupBlock;
     });
 
     test('distinguishes an unavailable backup root from an observed-empty one (#17495)', async () => {
@@ -2101,6 +2102,8 @@ test.describe('HealthService #10844 — buildBackupStateBlock', () => {
 
         expect(unavailable).toEqual({
             observationStatus: 'unavailable',
+            reason           : 'no backup receipt in deployment state and no mounted backup root; the orchestrator owns backups',
+            owner            : 'orchestrator',
             lastSuccessful   : null,
             lastCompleted    : null,
             count            : null,
@@ -2116,6 +2119,81 @@ test.describe('HealthService #10844 — buildBackupStateBlock', () => {
             unverifiedCount  : 0
         });
         expect(unavailable).not.toEqual(observedEmpty)
+    });
+
+    test('#1207 — projects the bridge receipt on the container fixture (no root, receipt present), keeps mounted root on single-process, and reports reason + owner when neither exists', async () => {
+        const receipt = {
+            backup           : {durationMs: 53282, error: null, status: 'success'},
+            bundleCompletedAt: '2026-10-19T13:28:47.768Z',
+            bundleName       : 'backup-2026-10-19T13-27-54.488Z',
+            finishedAt       : '2026-10-19T13:28:47.770Z',
+            integrity        : {emptySubsystems: [], restorable: true}
+        };
+
+        // Container fixture: no mounted backup root, bridge receipt present (AC-1)
+        const containerResult = resolveComposedBackupBlock(
+            await buildBackupStateBlock('/unmounted/backups', {
+                pathExists: async () => false
+            }, mockPath),
+            receipt
+        );
+
+        expect(containerResult).toEqual({
+            observationStatus: 'observed',
+            source           : 'bridge-receipt',
+            restorable       : true,
+            lastSuccessful   : '2026-10-19T13-27-54.488Z',
+            lastCompleted    : '2026-10-19T13-27-54.488Z',
+            count            : null,
+            unusableCount    : 0,
+            unverifiedCount  : 0
+        });
+
+        // Single-process fixture: mounted backup root present -> local directory scan wins
+        const singleProcessResult = resolveComposedBackupBlock(
+            await buildBackupStateBlock('/mounted/backups', {
+                pathExists: async p => p === '/mounted/backups' || p.endsWith('bundle-meta.json'),
+                readdir   : async () => [{isDirectory: () => true, name: 'backup-2026-10-19T13-27-54.488Z'}],
+                readJson  : async () => ({
+                    timestamp  : '2026-10-19T13-27-54.488Z',
+                    completedAt: '2026-10-19T13:28:47.768Z',
+                    integrity  : [
+                        {subsystem: 'kb',    status: 'pass', sourceCount: 10, bundleCount: 10},
+                        {subsystem: 'mc',    status: 'pass', sourceCount: 10, bundleCount: 10},
+                        {subsystem: 'graph', status: 'pass', sourceCount: 10, bundleCount: 10}
+                    ]
+                })
+            }, mockPath),
+            receipt
+        );
+
+        expect(singleProcessResult).toEqual({
+            observationStatus: 'observed',
+            lastSuccessful   : '2026-10-19T13-27-54.488Z',
+            lastCompleted    : '2026-10-19T13-27-54.488Z',
+            count            : 1,
+            unusableCount    : 0,
+            unverifiedCount  : 0
+        });
+
+        // Neither receipt nor mounted root -> unavailable with reason + owner (AC-2)
+        const neitherResult = resolveComposedBackupBlock(
+            await buildBackupStateBlock('/unmounted/backups', {
+                pathExists: async () => false
+            }, mockPath),
+            null
+        );
+
+        expect(neitherResult).toEqual({
+            observationStatus: 'unavailable',
+            reason           : 'no backup receipt in deployment state and no mounted backup root; the orchestrator owns backups',
+            owner            : 'orchestrator',
+            lastSuccessful   : null,
+            lastCompleted    : null,
+            count            : null,
+            unusableCount    : null,
+            unverifiedCount  : null
+        });
     });
 
     test('an unreadable backup root carries null counts instead of measured-looking zeros (#17495)', async () => {

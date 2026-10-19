@@ -697,6 +697,78 @@ async function buildSubscriptionArmingBlock() {
  * @singleton
  */
 
+export const BACKUP_UNAVAILABLE_REASON =
+    'no backup receipt in deployment state and no mounted backup root; the orchestrator owns backups';
+export const BACKUP_OWNER = 'orchestrator';
+
+/**
+ * @summary Projects the healthcheck `backup` block from the orchestrator's bridge receipt.
+ * Uses the bundle timestamp (`bundleName` stripped of its `'backup-'` prefix) for `lastSuccessful`
+ * and `lastCompleted` to match `bundle-meta.json`'s `timestamp` in the local scan; `count` is
+ * always `null` because a single-run receipt does not enumerate the retained series.
+ * @param {Object|null} receipt Validated `snapshot.maintenance.lastBackup` record.
+ * @returns {Object|null}
+ */
+export function projectBackupBlockFromReceipt(receipt) {
+    if (!receipt || typeof receipt !== 'object' || !receipt.backup) {
+        return null;
+    }
+
+    const status = receipt.backup.status;
+    if (status !== 'success' && status !== 'failed') {
+        return null;
+    }
+
+    const
+        succeeded       = status === 'success',
+        restorable      = succeeded ? (receipt.integrity?.restorable ?? null) : null,
+        bundleTimestamp = typeof receipt.bundleName === 'string'
+            ? (receipt.bundleName.startsWith('backup-') ? receipt.bundleName.slice('backup-'.length) : receipt.bundleName)
+            : (receipt.bundleCompletedAt ?? null);
+
+    return {
+        observationStatus: 'observed',
+        source           : 'bridge-receipt',
+        restorable,
+        lastSuccessful   : succeeded && restorable !== false ? bundleTimestamp : null,
+        lastCompleted    : succeeded ? bundleTimestamp : null,
+        count            : null,
+        unusableCount    : succeeded ? (restorable === false ? 1 : 0) : null,
+        unverifiedCount  : succeeded ? (restorable === null ? 1 : 0) : null
+    };
+}
+
+/**
+ * @summary Sole receipt-resolution path for the composed healthcheck `backup` block: keeps a local
+ * `observed` or `unreadable` result (where `unreadable` carries `error` without `reason`/`owner`),
+ * projects from `bridgeReceipt` when the local root is `unavailable`, or returns `unavailable` with
+ * `reason` and `owner`.
+ * @param {Object|null} localBackup Block returned by `buildBackupStateBlock`.
+ * @param {Object|null} bridgeReceipt `deploymentInspection.snapshot.maintenance.lastBackup`.
+ * @returns {Object}
+ */
+export function resolveComposedBackupBlock(localBackup, bridgeReceipt = null) {
+    if (localBackup?.observationStatus === 'observed' || localBackup?.observationStatus === 'unreadable') {
+        return localBackup;
+    }
+
+    const projected = projectBackupBlockFromReceipt(bridgeReceipt);
+    if (projected) {
+        return projected;
+    }
+
+    return {
+        observationStatus: 'unavailable',
+        reason           : localBackup?.reason ?? BACKUP_UNAVAILABLE_REASON,
+        owner            : localBackup?.owner ?? BACKUP_OWNER,
+        lastSuccessful   : null,
+        lastCompleted    : null,
+        count            : null,
+        unusableCount    : null,
+        unverifiedCount  : null
+    };
+}
+
 /**
  * @summary Projects the backup directory state into the observability block for the healthcheck.
  *
@@ -737,16 +809,21 @@ async function buildSubscriptionArmingBlock() {
  */
 export async function buildBackupStateBlock(backupPath, fs, path) {
     const
+        baseNullCounts = {
+            lastSuccessful : null,
+            lastCompleted  : null,
+            count          : null,
+            unusableCount  : null,
+            unverifiedCount: null
+        },
         unavailable = {
             observationStatus: 'unavailable',
-            lastSuccessful   : null,
-            lastCompleted    : null,
-            count            : null,
-            unusableCount    : null,
-            unverifiedCount  : null
+            reason           : BACKUP_UNAVAILABLE_REASON,
+            owner            : BACKUP_OWNER,
+            ...baseNullCounts
         },
         observedEmpty = {
-            ...unavailable,
+            ...baseNullCounts,
             observationStatus: 'observed',
             count            : 0,
             unusableCount    : 0,
@@ -832,7 +909,7 @@ export async function buildBackupStateBlock(backupPath, fs, path) {
         };
     } catch (e) {
         return {
-            ...unavailable,
+            ...baseNullCounts,
             observationStatus: 'unreadable',
             error            : e.message
         };
