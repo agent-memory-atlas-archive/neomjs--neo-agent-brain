@@ -25,6 +25,7 @@ import path                        from 'path';
 import os                          from 'os';
 import {fileURLToPath}             from 'url';
 import {findSharedConfigMutations} from '../../../../../../ai/scripts/lint/check-aiconfig-test-mutation.mjs';
+import {snapshotAiConfig}          from '../memory-core/util.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
@@ -93,12 +94,13 @@ function getOnlyRow(spy) {
 }
 
 test.describe('VectorService.embed — tenant stamping (#11631)', () => {
-    let SDK, KB_VectorService, KB_DatabaseService, KB_ChromaManager, Logger;
+    let SDK, KB_VectorService, KB_DatabaseService, KB_ChromaManager, KB_Config, Logger;
+    let resolveTenantIsolationConfig;
     let TextEmbeddingService;
     let originalGetCollection;
     let originalEmbedTexts;
     let originalWarn;
-    let kbConfigSnapshot;
+    let kbSnapshot;
     let tmpDir, fixturePath;
     let warnCalls;
     let embeddingCalls;
@@ -106,15 +108,17 @@ test.describe('VectorService.embed — tenant stamping (#11631)', () => {
     test.beforeAll(async () => {
         SDK                  = await import('../../../../../../ai/services.mjs');
         KB_ChromaManager     = SDK.KB_ChromaManager;
+        KB_Config            = SDK.KB_Config;
         TextEmbeddingService = SDK.Memory_TextEmbeddingService;
 
         const VectorServiceModule   = await import('../../../../../../ai/services/knowledge-base/VectorService.mjs');
         const DatabaseServiceModule = await import('../../../../../../ai/services/knowledge-base/DatabaseService.mjs');
         const LoggerModule          = await import('../../../../../../ai/mcp/server/knowledge-base/logger.mjs');
 
-        KB_VectorService   = VectorServiceModule.default;
-        KB_DatabaseService = DatabaseServiceModule.default;
-        Logger             = LoggerModule.default;
+        KB_VectorService             = VectorServiceModule.default;
+        resolveTenantIsolationConfig = VectorServiceModule.resolveTenantIsolationConfig;
+        KB_DatabaseService           = DatabaseServiceModule.default;
+        Logger                       = LoggerModule.default;
 
         originalGetCollection = KB_ChromaManager.getKnowledgeBaseCollection.bind(KB_ChromaManager);
         originalEmbedTexts    = TextEmbeddingService.embedTexts.bind(TextEmbeddingService);
@@ -134,7 +138,7 @@ test.describe('VectorService.embed — tenant stamping (#11631)', () => {
         KB_ChromaManager.getKnowledgeBaseCollection = originalGetCollection;
         TextEmbeddingService.embedTexts             = originalEmbedTexts;
         Logger.warn                                 = originalWarn;
-        KB_VectorService.configSnapshot             = null;
+        kbSnapshot?.();
 
         if (tmpDir && fs.existsSync(tmpDir)) {
             fs.rmSync(tmpDir, {recursive: true, force: true});
@@ -142,8 +146,8 @@ test.describe('VectorService.embed — tenant stamping (#11631)', () => {
     });
 
     test.beforeEach(() => {
-        kbConfigSnapshot = KB_VectorService.createConfigSnapshot();
-        Object.assign(kbConfigSnapshot, {
+        kbSnapshot?.();
+        kbSnapshot = snapshotAiConfig(KB_Config, {
             batchSize         : 50,
             batchDelay        : 0,
             maxRetries        : 1,
@@ -153,11 +157,15 @@ test.describe('VectorService.embed — tenant stamping (#11631)', () => {
             spoofRejectionMode: 'overwrite',
             mcpSyncMaxChunks  : 50
         });
-        KB_VectorService.configSnapshot = kbConfigSnapshot;
 
         warnCalls      = [];
         embeddingCalls = [];
         Logger.warn    = (...args) => warnCalls.push(args);
+    });
+
+    test.afterEach(() => {
+        kbSnapshot?.();
+        kbSnapshot = null;
     });
 
     test('stamps Neo default tenant metadata before upsert', async () => {
@@ -286,7 +294,7 @@ test.describe('VectorService.embed — tenant stamping (#11631)', () => {
     test('reject mode fails before Chroma writes when client metadata conflicts', async () => {
         const spy = createSpyCollection();
         KB_ChromaManager.getKnowledgeBaseCollection = async () => spy;
-        kbConfigSnapshot.spoofRejectionMode = 'reject';
+        snapshotAiConfig(KB_Config, {spoofRejectionMode: 'reject'});
 
         writeFixtureJsonl(fixturePath, [{
             hash       : 'raw-hash-3',
@@ -309,35 +317,42 @@ test.describe('VectorService.embed — tenant stamping (#11631)', () => {
         expect(warnCalls).toHaveLength(0);
     });
 
-    test('honors nested knowledgeBase isolation config shape', async () => {
-        const spy = createSpyCollection();
-        KB_ChromaManager.getKnowledgeBaseCollection = async () => spy;
+    test('honors nested knowledgeBase isolation config shape', () => {
+        // Pass a plain config object directly to the pure `resolveTenantIsolationConfig(config)`
+        // helper instead of adding non-existing nested keys onto the shared `KB_Config` Provider singleton.
+        const nestedConfig = {
+            defaultTenantId   : 'flat-tenant',
+            defaultRepoSlug   : 'flat-repo',
+            defaultVisibility : 'team',
+            spoofRejectionMode: 'overwrite',
+            knowledgeBase     : {
+                defaultTenantId   : 'nested-tenant',
+                defaultRepoSlug   : 'nested-repo',
+                defaultVisibility : 'private',
+                spoofRejectionMode: 'reject'
+            }
+        };
 
-        // VectorService.getTenantIsolationConfig() reads `cfg.knowledgeBase ?? cfg`,
-        // so a truthy nested `knowledgeBase` object takes precedence over the flat tenant keys.
-        kbConfigSnapshot.knowledgeBase = {
+        expect(resolveTenantIsolationConfig(nestedConfig)).toEqual({
             defaultTenantId   : 'nested-tenant',
             defaultRepoSlug   : 'nested-repo',
             defaultVisibility : 'private',
-            spoofRejectionMode: 'overwrite'
+            spoofRejectionMode: 'reject'
+        });
+
+        // Tier-1 OPS `knowledgeBase` shape (alerting / reconciliation / GC without tenant fields)
+        // must fall back to the top-level flat config rather than shadowing it with undefineds.
+        const opsNestedConfig = {
+            defaultTenantId   : 'flat-tenant',
+            defaultRepoSlug   : 'flat-repo',
+            defaultVisibility : 'team',
+            spoofRejectionMode: 'overwrite',
+            knowledgeBase     : {
+                reconciliationIntervalMs: 60_000
+            }
         };
 
-        writeFixtureJsonl(fixturePath, [{
-            hash       : 'raw-hash-4',
-            type       : 'guide',
-            name       : 'NestedConfigDoc',
-            className  : '',
-            description: 'nested config',
-            content    : 'body'
-        }]);
-
-        await KB_VectorService.embed(fixturePath);
-
-        const row = getOnlyRow(spy);
-
-        expect(row.metadata.tenantId).toBe('nested-tenant');
-        expect(row.metadata.repoSlug).toBe('nested-repo');
-        expect(row.metadata.visibility).toBe('private');
+        expect(resolveTenantIsolationConfig(opsNestedConfig)).toBe(opsNestedConfig);
     });
 
     test('content hashes include tenant and repository identity', () => {
@@ -458,7 +473,7 @@ test.describe('VectorService.embed — tenant stamping (#11631)', () => {
     test('reject mode rejects a client-supplied ingestedAt before Chroma writes (#11712)', async () => {
         const spy = createSpyCollection();
         KB_ChromaManager.getKnowledgeBaseCollection = async () => spy;
-        kbConfigSnapshot.spoofRejectionMode = 'reject';
+        snapshotAiConfig(KB_Config, {spoofRejectionMode: 'reject'});
 
         writeFixtureJsonl(fixturePath, [{
             hash       : 'raw-hash-ingestedat-reject',

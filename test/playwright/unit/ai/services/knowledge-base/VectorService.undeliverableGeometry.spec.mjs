@@ -15,14 +15,15 @@ setup({
     }
 });
 
-import {test, expect} from '@playwright/test';
-import Neo            from 'neo.mjs/src/Neo.mjs';
-import * as core      from 'neo.mjs/src/core/_export.mjs';
+import {test, expect}              from '@playwright/test';
+import Neo                         from 'neo.mjs/src/Neo.mjs';
+import * as core                   from 'neo.mjs/src/core/_export.mjs';
 import fs                          from 'fs-extra';
 import os                          from 'os';
 import path                        from 'path';
 import {fileURLToPath}             from 'url';
 import {findSharedConfigMutations} from '../../../../../../ai/scripts/lint/check-aiconfig-test-mutation.mjs';
+import {snapshotAiConfig}          from '../memory-core/util.mjs';
 
 /**
  * The undeliverable-at-geometry production-path proof, driven through `VectorService.embed()` — NOT
@@ -59,9 +60,9 @@ function createSpyCollection() {
 }
 
 test.describe('VectorService.embed — undeliverable-at-geometry through the production path (#17129)', () => {
-    let SDK, KB_VectorService, TextEmbeddingService, ChromaManager;
+    let SDK, KB_Config, Memory_Config, KB_VectorService, TextEmbeddingService, ChromaManager;
     let originalEmbedTexts, originalGetCollection, originalResumeStateDir, originalCeiling;
-    let kbConfigSnapshot, tmpDir, corpusFile;
+    let restoreKbConfig, restoreMemoryConfig, tmpDir, corpusFile;
 
     const isMonsterText = text => text.includes('monster body');
 
@@ -75,6 +76,8 @@ test.describe('VectorService.embed — undeliverable-at-geometry through the pro
 
     test.beforeAll(async () => {
         SDK                  = await import('../../../../../../ai/services.mjs');
+        KB_Config            = SDK.KB_Config;
+        Memory_Config        = SDK.Memory_Config;
         TextEmbeddingService = SDK.Memory_TextEmbeddingService;
 
         const VectorServiceModule = await import('../../../../../../ai/services/knowledge-base/VectorService.mjs');
@@ -86,10 +89,9 @@ test.describe('VectorService.embed — undeliverable-at-geometry through the pro
         originalEmbedTexts     = TextEmbeddingService.embedTexts.bind(TextEmbeddingService);
         originalGetCollection  = ChromaManager.getKnowledgeBaseCollection;
         originalResumeStateDir = KB_VectorService.resumeStateDir;
-        kbConfigSnapshot       = KB_VectorService.createConfigSnapshot();
-        originalCeiling        = kbConfigSnapshot.embeddingProvider === 'ollama'
-            ? kbConfigSnapshot.ollama.embeddingTimeoutMs
-            : kbConfigSnapshot.openAiCompatible.batchEmbeddingTimeoutMs;
+        originalCeiling        = Memory_Config.embeddingProvider === 'ollama'
+            ? Memory_Config.ollama.embeddingTimeoutMs
+            : Memory_Config.openAiCompatible.batchEmbeddingTimeoutMs;
 
         tmpDir     = await fs.mkdtemp(path.join(os.tmpdir(), 'neo-kb-undeliverable-'));
         corpusFile = path.join(tmpDir, 'corpus.jsonl');
@@ -97,15 +99,28 @@ test.describe('VectorService.embed — undeliverable-at-geometry through the pro
         await fs.writeFile(corpusFile, chunks.map(chunk => JSON.stringify(chunk)).join('\n') + '\n');
 
         KB_VectorService.resumeStateDir = path.join(tmpDir, 'state');
-        Object.assign(kbConfigSnapshot, {batchSize: 50, batchDelay: 0, maxRetries: 3});
-        KB_VectorService.configSnapshot = kbConfigSnapshot;
+    });
+
+    test.beforeEach(() => {
+        restoreMemoryConfig?.();
+        restoreKbConfig?.();
+        restoreMemoryConfig = snapshotAiConfig(Memory_Config);
+        restoreKbConfig     = snapshotAiConfig(KB_Config, {batchSize: 50, batchDelay: 0, maxRetries: 3});
+    });
+
+    test.afterEach(() => {
+        restoreKbConfig?.();
+        restoreMemoryConfig?.();
+        restoreKbConfig     = null;
+        restoreMemoryConfig = null;
     });
 
     test.afterAll(async () => {
         TextEmbeddingService.embedTexts           = originalEmbedTexts;
         ChromaManager.getKnowledgeBaseCollection  = originalGetCollection;
         KB_VectorService.resumeStateDir           = originalResumeStateDir;
-        KB_VectorService.configSnapshot           = null;
+        restoreKbConfig?.();
+        restoreMemoryConfig?.();
 
         await fs.remove(tmpDir);
     });
@@ -190,10 +205,10 @@ test.describe('VectorService.embed — undeliverable-at-geometry through the pro
 
         // Operator ceiling raise: the effective call ceiling is part of the poison GENERATION, so the
         // stored disposition goes stale and the monster is re-offered automatically — no replay flag.
-        if (kbConfigSnapshot.embeddingProvider === 'ollama') {
-            kbConfigSnapshot.ollama.embeddingTimeoutMs = Number(originalCeiling) + 60_000;
+        if (Memory_Config.embeddingProvider === 'ollama') {
+            snapshotAiConfig(Memory_Config, {'ollama.embeddingTimeoutMs': Number(originalCeiling) + 60_000});
         } else {
-            kbConfigSnapshot.openAiCompatible.batchEmbeddingTimeoutMs = Number(originalCeiling) + 60_000;
+            snapshotAiConfig(Memory_Config, {'openAiCompatible.batchEmbeddingTimeoutMs': Number(originalCeiling) + 60_000});
         }
 
         const sixth = await runSweep();
@@ -207,9 +222,9 @@ test.describe('VectorService.embed — undeliverable-at-geometry through the pro
 });
 
 test.describe('VectorService.embed — DEATH-class graduation through the production path (#17336)', () => {
-    let SDK, KB_VectorService, TextEmbeddingService, ChromaManager;
-    let originalEmbedTexts, originalGetCollection, originalResumeStateDir;
-    let kbConfigSnapshot, tmpDir, corpusFile;
+    let SDK, KB_Config, Memory_Config, KB_VectorService, TextEmbeddingService, ChromaManager;
+    let originalEmbedTexts, originalGetCollection, originalResumeStateDir, originalCeiling;
+    let restoreKbConfig, restoreMemoryConfig, tmpDir, corpusFile;
 
     const isKillerText = text => text.includes('killer body');
 
@@ -223,6 +238,8 @@ test.describe('VectorService.embed — DEATH-class graduation through the produc
 
     test.beforeAll(async () => {
         SDK                  = await import('../../../../../../ai/services.mjs');
+        KB_Config            = SDK.KB_Config;
+        Memory_Config        = SDK.Memory_Config;
         TextEmbeddingService = SDK.Memory_TextEmbeddingService;
 
         const VectorServiceModule = await import('../../../../../../ai/services/knowledge-base/VectorService.mjs');
@@ -234,7 +251,9 @@ test.describe('VectorService.embed — DEATH-class graduation through the produc
         originalEmbedTexts     = TextEmbeddingService.embedTexts.bind(TextEmbeddingService);
         originalGetCollection  = ChromaManager.getKnowledgeBaseCollection;
         originalResumeStateDir = KB_VectorService.resumeStateDir;
-        kbConfigSnapshot       = KB_VectorService.createConfigSnapshot();
+        originalCeiling        = Memory_Config.embeddingProvider === 'ollama'
+            ? Memory_Config.ollama.embeddingTimeoutMs
+            : Memory_Config.openAiCompatible.batchEmbeddingTimeoutMs;
 
         tmpDir     = await fs.mkdtemp(path.join(os.tmpdir(), 'neo-kb-death-'));
         corpusFile = path.join(tmpDir, 'corpus.jsonl');
@@ -242,15 +261,28 @@ test.describe('VectorService.embed — DEATH-class graduation through the produc
         await fs.writeFile(corpusFile, chunks.map(chunk => JSON.stringify(chunk)).join('\n') + '\n');
 
         KB_VectorService.resumeStateDir = path.join(tmpDir, 'state');
-        Object.assign(kbConfigSnapshot, {batchSize: 50, batchDelay: 0, maxRetries: 3});
-        KB_VectorService.configSnapshot = kbConfigSnapshot;
+    });
+
+    test.beforeEach(() => {
+        restoreMemoryConfig?.();
+        restoreKbConfig?.();
+        restoreMemoryConfig = snapshotAiConfig(Memory_Config);
+        restoreKbConfig     = snapshotAiConfig(KB_Config, {batchSize: 50, batchDelay: 0, maxRetries: 3});
+    });
+
+    test.afterEach(() => {
+        restoreKbConfig?.();
+        restoreMemoryConfig?.();
+        restoreKbConfig     = null;
+        restoreMemoryConfig = null;
     });
 
     test.afterAll(async () => {
         TextEmbeddingService.embedTexts           = originalEmbedTexts;
         ChromaManager.getKnowledgeBaseCollection  = originalGetCollection;
         KB_VectorService.resumeStateDir           = originalResumeStateDir;
-        KB_VectorService.configSnapshot           = null;
+        restoreKbConfig?.();
+        restoreMemoryConfig?.();
 
         await fs.remove(tmpDir);
     });
@@ -339,18 +371,12 @@ test.describe('VectorService.embed — DEATH-class graduation through the produc
     /**
      * @summary Moves the effective call ceiling, which is part of the poison generation coordinate.
      * @param {Number} deltaMs Offset from the process default.
-     * @returns {void}
+     * @returns {Function} Restore thunk from `snapshotAiConfig`.
      */
     function shiftGeneration(deltaMs) {
-        const base = kbConfigSnapshot.embeddingProvider === 'ollama'
-            ? kbConfigSnapshot.ollama.embeddingTimeoutMs
-            : kbConfigSnapshot.openAiCompatible.batchEmbeddingTimeoutMs;
-
-        if (kbConfigSnapshot.embeddingProvider === 'ollama') {
-            kbConfigSnapshot.ollama.embeddingTimeoutMs = Number(base) + deltaMs
-        } else {
-            kbConfigSnapshot.openAiCompatible.batchEmbeddingTimeoutMs = Number(base) + deltaMs
-        }
+        return Memory_Config.embeddingProvider === 'ollama'
+            ? snapshotAiConfig(Memory_Config, {'ollama.embeddingTimeoutMs': Number(originalCeiling) + deltaMs})
+            : snapshotAiConfig(Memory_Config, {'openAiCompatible.batchEmbeddingTimeoutMs': Number(originalCeiling) + deltaMs})
     }
 
     /**
@@ -600,16 +626,16 @@ test.describe('VectorService.embed — DEATH-class graduation through the produc
         const sweep = () => KB_VectorService.embed(armCorpus, {deleteStale: false, tenantContext: scoped})
             .then(result => result, error => error);
 
-        try {
-            // Narrow enough that the killer is dispatched alone and no healthy input has run yet.
-            Object.assign(kbConfigSnapshot, {batchSize: 1, maxRetries: 1});
+        // Narrow enough that the killer is dispatched alone and no healthy input has run yet.
+        const restoreInnerKb = snapshotAiConfig(KB_Config, {batchSize: 1, maxRetries: 1});
 
+        try {
             const seeded = await sweep();
 
             expect(seeded, 'the seeding sweep ends on the refusal').toBeInstanceOf(Error);
 
             // Suspicion now isolates the killer, so the first dispatch is single-input.
-            Object.assign(kbConfigSnapshot, {batchSize: 2, maxRetries: 2});
+            snapshotAiConfig(KB_Config, {batchSize: 2, maxRetries: 2});
             phase = 'failure-carry';
 
             let summary = await sweep();
@@ -619,7 +645,7 @@ test.describe('VectorService.embed — DEATH-class graduation through the produc
             expect(summary, 'the healthy stride completes the sweep and returns its census').not.toBeInstanceOf(Error);
             expect(summary.deathStrikeProgress, 'the failure-carry reset cleared the pending death').toEqual([]);
         } finally {
-            Object.assign(kbConfigSnapshot, {batchSize: 50, maxRetries: 3});
+            restoreInnerKb();
         }
     });
 

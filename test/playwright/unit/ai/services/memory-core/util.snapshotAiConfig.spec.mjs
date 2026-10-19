@@ -51,6 +51,34 @@ test.describe('Neo.ai test-isolation — snapshotAiConfig (#12435)', () => {
 
         expect(() => snapshotAiConfig(cfg, ['engines.chroma.database'])).toThrow(/does not resolve to a value/);
     });
+
+    test('atomically captures, applies overrides, and restores when given an override map (#1150)', () => {
+        const cfg = {storagePaths: {graph: '/orig/graph.sqlite'}, handoffFilePath: '/orig/handoff.md'};
+
+        const restore = snapshotAiConfig(cfg, {
+            'storagePaths.graph': '/tmp/override.sqlite',
+            handoffFilePath     : '/tmp/override-handoff.md'
+        });
+
+        expect(cfg.storagePaths.graph).toBe('/tmp/override.sqlite');
+        expect(cfg.handoffFilePath).toBe('/tmp/override-handoff.md');
+
+        restore();
+
+        expect(cfg.storagePaths.graph).toBe('/orig/graph.sqlite');
+        expect(cfg.handoffFilePath).toBe('/orig/handoff.md');
+    });
+
+    test('validates all override map paths before mutating any leaf (#1150)', () => {
+        const cfg = {storagePaths: {graph: '/orig/graph.sqlite'}};
+
+        expect(() => snapshotAiConfig(cfg, {
+            'storagePaths.graph': '/tmp/never-written.sqlite',
+            absentLeaf          : 'bad'
+        })).toThrow(/does not resolve to a value/);
+
+        expect(cfg.storagePaths.graph).toBe('/orig/graph.sqlite');
+    });
 });
 
 test.describe('Neo.ai test-isolation — snapshotAiConfig on the real aiConfig Provider', () => {
@@ -86,5 +114,23 @@ test.describe('Neo.ai test-isolation — snapshotAiConfig on the real aiConfig P
 
         expect(aiConfig[probe]).toBeUndefined(); // absent on the real Provider
         expect(() => snapshotAiConfig(aiConfig, [probe])).toThrow(/does not resolve to a value/)
+    });
+
+    test('restores nested override-map mutations via the active root snapshot baseline (#1150)', () => {
+        const original    = aiConfig.handoffFilePathProd,
+              rootRestore = snapshotAiConfig(aiConfig);
+
+        try {
+            snapshotAiConfig(aiConfig, {handoffFilePathProd: '/tmp/__neo_nested_1__.md'});
+            expect(aiConfig.handoffFilePathProd).toBe('/tmp/__neo_nested_1__.md');
+
+            snapshotAiConfig(aiConfig, {handoffFilePathProd: '/tmp/__neo_nested_2__.md'});
+            expect(aiConfig.handoffFilePathProd).toBe('/tmp/__neo_nested_2__.md');
+        } finally {
+            rootRestore();
+        }
+
+        expect(aiConfig.handoffFilePathProd).toBe(original);
+        expect(() => snapshotAiConfig(aiConfig, ['knowledgeBase.__probeNestedKey__'])).toThrow(/does not resolve to a value/);
     });
 });

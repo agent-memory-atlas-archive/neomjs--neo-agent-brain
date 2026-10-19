@@ -1,12 +1,9 @@
-import aiConfig                 from '../../mcp/server/knowledge-base/config.mjs';
-import {
-    cloneConfigSubtree,
-    validateConfigSnapshot
-}                               from '../shared/configSnapshot.mjs';
+import aiConfig             from '../../mcp/server/knowledge-base/config.mjs';
 import TextEmbeddingService, {
     getEmbeddingModel,
     isEmbeddingBatchYieldError
-}                               from '../memory-core/TextEmbeddingService.mjs';
+}                             from '../memory-core/TextEmbeddingService.mjs';
+import mcConfig                from '../../mcp/server/memory-core/config.mjs';
 import {isProviderTimeoutCode} from '../../provider/createTimeoutError.mjs';
 import Base                    from 'neo.mjs/src/core/Base.mjs';
 import {IMPLEMENTED_EMBEDDING_PROVIDERS, resolveEmbeddingProviderModel}
@@ -222,12 +219,28 @@ function resolveEmbeddingInputStrategyVersion(guardrail) {
         : `${EMBEDDING_POISON_STRATEGY_FAMILY}:band-unresolved`
 }
 
-const VECTOR_SERVICE_SNAPSHOT_SUBTREES = Object.freeze([
-    'localModels',
-    'localModels.embedding',
-    'ollama',
-    'openAiCompatible'
-]);
+/**
+ * @summary Resolves the authoritative tenant-isolation config surface from a KB config object.
+ *
+ * The portable nested tenant-shape (`config.knowledgeBase.*`) carries tenant fields when supplied by a
+ * shared config surface. Tier-1's `knowledgeBase` leaf (KB OPS config: alerting / reconciliation / GC)
+ * is inherited via the realm chain and is NOT a tenant-shape — so a naked `?? config` would wrongly
+ * select it and read tenant fields as `undefined`. Prefer the nested object only when it exposes at
+ * least one tenant field; otherwise fall through to the flat top-level config.
+ *
+ * @param {Object} [config=aiConfig] Knowledge Base config object or fixture.
+ * @returns {Object} Tenant-isolation configuration surface.
+ */
+export function resolveTenantIsolationConfig(config = aiConfig) {
+    const nested         = config?.knowledgeBase;
+    const hasTenantShape = nested != null && (
+        nested.defaultTenantId    !== undefined ||
+        nested.defaultRepoSlug    !== undefined ||
+        nested.defaultVisibility  !== undefined ||
+        nested.spoofRejectionMode !== undefined
+    );
+    return hasTenantShape ? nested : config;
+}
 
 /**
  * @summary Manages vector database operations including embedding generation and storage.
@@ -267,85 +280,6 @@ class VectorService extends Base {
          * @protected
          */
         singleton: true
-    }
-
-    #configSnapshot = null;
-
-    /**
-     * @summary Returns the isolated configuration snapshot injected by unit tests, or `null` when
-     * the service reads the canonical `aiConfig` singleton.
-     * @returns {Object|null}
-     */
-    get configSnapshot() {
-        return this.#configSnapshot;
-    }
-
-    /**
-     * @summary Injects an isolated configuration snapshot for unit testing, or `null` to restore
-     * the canonical `aiConfig` singleton.
-     * @param {Object|null} value Candidate snapshot or `null`.
-     */
-    set configSnapshot(value) {
-        this.#configSnapshot = this.beforeSetConfigSnapshot(value);
-    }
-
-    /**
-     * @summary Rejects non-isolated config snapshots so `VectorService.configSnapshot` cannot be
-     * pointed at the shared `aiConfig` singleton or any of its live subtrees.
-     * @param {Object|null} value Candidate snapshot or `null` to restore canonical `aiConfig`.
-     * @returns {Object|null}
-     * @protected
-     */
-    beforeSetConfigSnapshot(value) {
-        return validateConfigSnapshot(value, {
-            serviceName     : 'VectorService',
-            requiredSubtrees: VECTOR_SERVICE_SNAPSHOT_SUBTREES
-        });
-    }
-
-    /**
-     * @summary Builds a deep, isolated plain-object snapshot of the resolved `aiConfig` leaves
-     * and subtrees consumed by `VectorService`.
-     *
-     * Tests inject the returned snapshot into `VectorService.configSnapshot` and mutate its
-     * leaves freely without touching the shared `aiConfig` / `KB_Config` / `MC_Config` singletons.
-     *
-     * @returns {Object}
-     */
-    createConfigSnapshot() {
-        return {
-            backoffBaseMs    : aiConfig.backoffBaseMs,
-            batchDelay       : aiConfig.batchDelay,
-            batchSize        : aiConfig.batchSize,
-            defaultRepoSlug  : aiConfig.defaultRepoSlug,
-            defaultTenantId  : aiConfig.defaultTenantId,
-            defaultVisibility: aiConfig.defaultVisibility,
-            embeddingModel   : aiConfig.embeddingModel,
-            embeddingProvider: aiConfig.embeddingProvider,
-            knowledgeBase    : null,
-            localModels      : {
-                embedding: cloneConfigSubtree(aiConfig, ['localModels', 'embedding'])
-            },
-            logPath                    : aiConfig.logPath,
-            maxRetries                 : aiConfig.maxRetries,
-            mcpSyncMaxChunks           : aiConfig.mcpSyncMaxChunks,
-            ollama                     : cloneConfigSubtree(aiConfig, ['ollama']),
-            openAiCompatible           : cloneConfigSubtree(aiConfig, ['openAiCompatible']),
-            spoofRejectionMode         : aiConfig.spoofRejectionMode,
-            undeliverableTimeoutStrikes: aiConfig.undeliverableTimeoutStrikes,
-            vectorDimension            : aiConfig.vectorDimension
-        };
-    }
-
-    /**
-     * @summary Returns the active configuration source (`#configSnapshot` when injected,
-     * otherwise `aiConfig`).
-     *
-     * @returns {Object}
-     * @private
-     */
-    #getConfig() {
-        return this.#configSnapshot || aiConfig;
     }
 
     /**
@@ -401,20 +335,7 @@ class VectorService extends Base {
      * @returns {Object} Tenant-isolation configuration object.
      */
     getTenantIsolationConfig() {
-        const cfg    = this.#getConfig();
-        const nested = cfg.knowledgeBase;
-        // The portable nested tenant-shape carries tenant fields. Tier-1's
-        // `knowledgeBase` leaf (KB OPS config: alerting / reconciliation / GC) is inherited here via
-        // the realm chain and is NOT a tenant-shape — so a naked `?? aiConfig` would wrongly select
-        // it (security regression: tenant fields read as undefined). Prefer the nested object only
-        // when it actually exposes a tenant field; otherwise fall through to the flat top-level config.
-        const hasTenantShape = nested != null && (
-            nested.defaultTenantId    !== undefined ||
-            nested.defaultRepoSlug    !== undefined ||
-            nested.defaultVisibility  !== undefined ||
-            nested.spoofRejectionMode !== undefined
-        );
-        return hasTenantShape ? nested : cfg;
+        return resolveTenantIsolationConfig(aiConfig);
     }
 
     /**
@@ -605,44 +526,46 @@ class VectorService extends Base {
      * @returns {{recognized: Boolean, contextLimitTokens: Number, safeProcessingLimitTokens: Number, model: String}}
      */
     resolveEmbeddingGuardrail() {
-        const cfg                       = this.#getConfig();
-        const embeddingProvider         = cfg.embeddingProvider;
-        const contextLimitTokens        = Number(cfg.localModels.embedding.contextLimitTokens);
-        const safeProcessingLimitTokens = Number(cfg.localModels.embedding.safeProcessingLimitTokens);
+        const embeddingProvider         = mcConfig.embeddingProvider;
+        const contextLimitTokens        = Number(aiConfig.localModels.embedding.contextLimitTokens);
+        const safeProcessingLimitTokens = Number(aiConfig.localModels.embedding.safeProcessingLimitTokens);
 
         return {
             recognized: IMPLEMENTED_EMBEDDING_PROVIDERS.includes(embeddingProvider),
             contextLimitTokens,
             safeProcessingLimitTokens,
-            model     : resolveEmbeddingProviderModel({embeddingProvider, aiConfig: cfg})
+            model     : resolveEmbeddingProviderModel({embeddingProvider, aiConfig})
         };
     }
 
     /**
      * @summary Resolves the exact embedding-generation coordinate used by the poison retry fence.
      *
-     * Provider selection remains owned by `TextEmbeddingService`; this method reads the same resolved
-     * AiConfig leaves at the disposition boundary so a provider, model, vector-schema, or input-strategy
-     * change invalidates prior poison evidence instead of silently suppressing work under a new route.
+     * Provider selection and transport timeout enforcement remain owned by `TextEmbeddingService`,
+     * which reads `mcConfig.embeddingProvider`, `mcConfig.ollama.embeddingTimeoutMs`, and
+     * `mcConfig.openAiCompatible.batchEmbeddingTimeoutMs` at call time. Reading those leaves directly
+     * from `mcConfig` here ensures the poison generation records the exact ceiling `TextEmbeddingService`
+     * enforces rather than a KB-tree copy that could diverge under an overlay, so a provider, model,
+     * vector-schema, call-ceiling, or input-strategy change invalidates prior poison evidence instead
+     * of silently suppressing work under a new route.
      *
      * @returns {{provider: String, model: String, vectorDimension: Number, strategyVersion: String}}
      */
     resolveEmbeddingPoisonGeneration() {
-        const cfg      = this.#getConfig();
-        const provider = cfg.embeddingProvider;
+        const provider = mcConfig.embeddingProvider;
 
         return {
             provider,
-            model          : getEmbeddingModel(provider, cfg),
-            vectorDimension: Number(cfg.vectorDimension),
+            model          : getEmbeddingModel(provider),
+            vectorDimension: Number(aiConfig.vectorDimension),
             // The effective per-call ceiling is part of the evidence conditions: an
             // undeliverable-at-geometry disposition proven under a 30-minute ceiling is void under a
             // 60-minute one. Folding it into the generation invalidates ALL suppression evidence on a
             // ceiling change — including content-poison, which then costs one isolation re-proof
             // cycle. Correctness over thrift: stale suppression silently withholds documents.
             embedCallCeilingMs: provider === 'ollama'
-                ? Number(cfg.ollama.embeddingTimeoutMs)
-                : Number(cfg.openAiCompatible.batchEmbeddingTimeoutMs),
+                ? Number(mcConfig.ollama.embeddingTimeoutMs)
+                : Number(mcConfig.openAiCompatible.batchEmbeddingTimeoutMs),
             // Derived from the resolved admission band rather than a literal, so the commonest repair
             // — moving the band — is a change this generation can see. See
             // {@link resolveEmbeddingInputStrategyVersion} for why a frozen value silently outlived
@@ -1089,7 +1012,7 @@ class VectorService extends Base {
     generateIsolationEmbeddings({inputs, shouldYield, signal, onProviderTimeout}) {
         return TextEmbeddingService.embedTexts(
             inputs.map(input => input.text),
-            this.#getConfig().embeddingProvider,
+            mcConfig.embeddingProvider,
             {
                 operationLabel          : 'knowledge base tenant ingestion poison isolation',
                 operationStage          : 'kb-tenant-ingestion-embedding',
@@ -1370,20 +1293,12 @@ class VectorService extends Base {
             };
         }
 
-        const {
-            backoffBaseMs,
-            batchSize,
-            batchDelay,
-            embeddingProvider,
-            maxRetries,
-            undeliverableTimeoutStrikes
-        } = this.#getConfig();
-
-        logger.log(`Using TextEmbeddingService with provider: ${embeddingProvider}.`);
+        logger.log(`Using TextEmbeddingService with provider: ${mcConfig.embeddingProvider}.`);
         logger.log('Embedding chunks...');
 
-        const guardrail     = this.resolveEmbeddingGuardrail();
-        const failedBatches = [];
+        const {backoffBaseMs, batchSize, batchDelay, maxRetries, undeliverableTimeoutStrikes} = aiConfig;
+        const guardrail                                                                       = this.resolveEmbeddingGuardrail();
+        const failedBatches                                                                   = [];
         // Death-class graduation receipts for this sweep. Separate from
         // `poisonedChunks`, which reports what was ALREADY fenced when the sweep started: this reports
         // what this sweep fenced and on what evidence, so convergence is visible in the summary instead
@@ -1604,7 +1519,7 @@ class VectorService extends Base {
                 const dispatchSeq = evidence.seq;
 
                 try {
-                    embeddings ??= await TextEmbeddingService.embedTexts(textsToEmbed, embeddingProvider, {
+                    embeddings ??= await TextEmbeddingService.embedTexts(textsToEmbed, mcConfig.embeddingProvider, {
                         operationLabel          : 'knowledge base tenant ingestion embedding',
                         operationStage          : 'kb-tenant-ingestion-embedding',
                         providerActivityRecorder: KBRecorderService,
@@ -2707,12 +2622,11 @@ class VectorService extends Base {
         // deleting 60,000 presented to the gate as "3"; and the no-adds branch deleted and
         // returned before the gate was ever evaluated, which made the largest possible
         // deletion the one case no guard saw. A mass delete is work.
-        const cfg          = this.#getConfig();
-        const mcpThreshold = cfg.mcpSyncMaxChunks;
+        const mcpThreshold = aiConfig.mcpSyncMaxChunks;
         if (viaMcp && Math.max(workVolume, idsToDelete.length + idsToReplace.length) > mcpThreshold) {
             // `logPath` is a Provider-owned leaf; read it directly so malformed config
             // shape fails loud instead of silently re-deriving a local default.
-            const logDir       = cfg.logPath;
+            const logDir       = aiConfig.logPath;
             const errorPayload = {
                 error  : `KB sync work volume exceeds MCP-callable threshold`,
                 message: `${workVolume} chunks need re-embedding and ${idsToDelete.length + idsToReplace.length} need deleting ` +

@@ -153,12 +153,13 @@ export async function drainMemoryWal({ids, collection, SDK} = {}) {
 }
 
 /**
- * @summary Snapshots the given dot-path `aiConfig` leaves and returns a `restore()` thunk.
+ * @summary Snapshots the given dot-path `aiConfig` leaves, optionally applies overrides, and returns a `restore()` thunk.
  *
  * `aiConfig` is a Provider singleton imported once per module graph; a spec that writes its leaves
  * in setup (e.g. `storagePaths.graph`, `autoIngestFileSystem`) without restoring leaks that state
  * into the next `--workers=1` spec — the shared-singleton mutation hazard (B4) this isolation helper
- * targets. Capture BEFORE the first mutation; call the returned thunk in `afterAll`/`afterEach`.
+ * targets. Capture BEFORE the first mutation (or pass an override map to capture and apply atomically);
+ * call the returned thunk in `afterAll`/`afterEach`/`finally`.
  *
  * **Contract — existing leaves only.** `restore()` reassigns each captured leaf via the proxy set
  * trap (routed to the owning provider's `setData`), which faithfully restores a leaf that EXISTED at
@@ -166,16 +167,30 @@ export async function drainMemoryWal({ids, collection, SDK} = {}) {
  * has no `deleteProperty` trap, so neither `delete` nor a re-set to `undefined` removes the path a
  * test added — the written value keeps resolving via the get trap. Rather than hand back a
  * `restore()` that silently leaks, the helper throws on a path that does not already resolve to a
- * leaf. Isolate leaves you ADD during a test by construction (`unitTestMode`), not with this helper.
+ * leaf before applying any override. Isolate leaves you ADD during a test by construction (`unitTestMode`),
+ * not with this helper.
  *
- * @param {Object} aiConfig The memory-core `aiConfig` Provider singleton (or a plain fixture).
- * @param {String[]} paths Dot-paths to scalar leaves that EXIST at capture, e.g.
- *     `['storagePaths.graph', 'handoffFilePath']`.
+ * **Root vs. nested snapshot semantics (`activeSnapshots`):**
+ * The first `snapshotAiConfig(aiConfig, ...)` call on a given config instance opens a root baseline
+ * map tracked in `activeSnapshots`. Any nested `snapshotAiConfig(aiConfig, overrides)` calls made while
+ * that root snapshot is active record their pre-mutation values into the root baseline (first-seen wins)
+ * so that invoking the root `restore()` in `afterEach`/`afterAll` restores every leaf mutated during the
+ * test — even when an inner test call applied overrides without retaining the inner restore thunk.
+ * Invoking a nested restore thunk early restores only the leaves captured by that nested call.
+ *
+ * @param {Object} aiConfig The `aiConfig` Provider singleton (or a plain fixture).
+ * @param {String[]|Object} pathsOrOverrides Either dot-paths to scalar leaves that EXIST at capture
+ *     (`['storagePaths.graph', 'handoffFilePath']`) or a plain `{ 'dot.path': nextValue }` override map.
  * @returns {Function} `restore()` — reassigns each captured leaf to its original value.
  * @throws {Error} If any path does not resolve to an existing leaf at capture time.
  * @see learn/agentos/decisions/0019-aiconfig-reactive-provider-ssot.md
  */
-export function snapshotAiConfig(aiConfig, paths) {
+const activeSnapshots = new WeakMap();
+
+export function snapshotAiConfig(aiConfig, pathsOrOverrides = []) {
+    const isOverrideMap = !Array.isArray(pathsOrOverrides) && Boolean(pathsOrOverrides) && typeof pathsOrOverrides === 'object',
+          paths         = isOverrideMap ? Object.keys(pathsOrOverrides) : pathsOrOverrides;
+
     const captured = paths.map(dotPath => {
         const segments = dotPath.split('.'),
               key      = segments.pop(),
@@ -193,14 +208,46 @@ export function snapshotAiConfig(aiConfig, paths) {
             );
         }
 
-        return {parent, key, value};
+        return {dotPath, key, parent, value};
     });
 
-    return function restore() {
-        captured.forEach(({parent, key, value}) => {
-            parent[key] = value
+    let   baselineMap = activeSnapshots.get(aiConfig);
+    const isRoot      = !baselineMap;
+
+    if (isRoot) {
+        baselineMap = new Map();
+        activeSnapshots.set(aiConfig, baselineMap);
+    }
+
+    captured.forEach(entry => {
+        if (!baselineMap.has(entry.dotPath)) {
+            baselineMap.set(entry.dotPath, entry);
+        }
+    });
+
+    if (isOverrideMap) {
+        captured.forEach(({dotPath, key, parent}) => {
+            parent[key] = pathsOrOverrides[dotPath];
         });
+    }
+
+    const restoreEntry = ({key, parent, value}) => {
+        parent[key] = value;
     };
+
+    function restore() {
+        if (isRoot) {
+            for (const entry of baselineMap.values()) {
+                restoreEntry(entry);
+            }
+            baselineMap.clear();
+            activeSnapshots.delete(aiConfig);
+        } else {
+            captured.forEach(restoreEntry);
+        }
+    }
+
+    return restore;
 }
 
 export class TestLifecycleHelper {
