@@ -53,7 +53,7 @@ import RequestContextService                                           from '../
 import FleetControlBridge                                              from './FleetControlBridge.mjs';
 import FleetManager                                                    from './FleetManager.mjs';
 import FleetRegistryService                                            from './FleetRegistryService.mjs';
-import {FLEET_BRIDGE_STATES, settleFleetBridge}                        from './settleFleetBridge.mjs';
+import {FLEET_BRIDGE_STATES, settleFleetBridge, superviseFleetBridge}  from './settleFleetBridge.mjs';
 import {detectMemoryCandidates}                                        from './seatMemoryImport.mjs';
 import {readGithubToken}                                               from '../ingestion/githubActions.mjs';
 import {describeOperatorSeatConflation, operatorSeatConflationWarning} from './operatorSeatConflation.mjs';
@@ -650,12 +650,30 @@ async function boot() {
             ? '[fleet] open-work wakes wired; rounds stay quiet until measured admission holds'
             : '[fleet] open-work wakes requested but unwired: a plane-verified viewer is required');
 
+        const bridgeSupervisor = superviseFleetBridge({
+            port             : neuralLinkConfig.port,
+            registry         : FleetRegistryService,
+            initialSettlement: bridgeState,
+            onStateChange(settlement, previousSettlement) {
+                if (settlement?.state !== FLEET_BRIDGE_STATES.READY) {
+                    console.warn(`[fleet] Neural Link Bridge ${settlement?.state} on port ${settlement?.port} (${settlement?.reason}): ${settlement?.summary} Next step: ${settlement?.nextStep}`);
+                } else if (
+                    settlement.action === 'started'
+                    || settlement.action === 'replaced'
+                    || previousSettlement?.state !== FLEET_BRIDGE_STATES.READY
+                ) {
+                    console.log(`[fleet] Neural Link Bridge ${settlement.state} on port ${settlement.port} (${settlement.action}; key sha256 ${settlement.publicKeySha256?.slice(0, 12)}…)`);
+                }
+            }
+        });
+
         // AWAITED plane teardown before every exit: an un-awaited close races process death, which
         // leaks the proven plane session (the server reaps it only on its own timeline).
         let shutdown;
         const cleanShutdown = signal => shutdown ??= (async () => {
             const startedAt = Date.now(), elapsed = () => Date.now() - startedAt;
             console.log(`[fleet] received ${signal}; stopping.`);
+            bridgeSupervisor?.stop();
             try {
                 // The first line lands before the first await: a handoff the host kills mid-way still leaves its trace.
                 if (runtime.generation) {
