@@ -3026,8 +3026,9 @@ class MailboxService extends Base {
         });
 
         await appendWalMessage(walRecord, {
-            dir    : aiConfig.messageWal.dir,
-            planeId: aiConfig.plane.id
+            dir           : aiConfig.messageWal.dir,
+            planeId       : aiConfig.plane.id,
+            retentionLimit: aiConfig.memoryWal.retentionLimit
         });
 
         if (deferProjection) {
