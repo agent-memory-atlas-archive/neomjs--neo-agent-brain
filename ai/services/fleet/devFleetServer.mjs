@@ -30,6 +30,12 @@
  *    MCP client — the bearer's plane-side subject must BE the boot-resolved viewer, else startup
  *    refuses plane mode fail-closed; an empty base keeps the in-process singletons. All-or-nothing
  *    per boot, logged either way — the operator can always trust which plane the cockpit shows.
+ * 6. binds the packaged runtime by its sealed record (`bindCurrentRuntime`), opens runtime custody
+ *    in `'pending-recovery'` (`awaitRecovery: true`) so Starts are excluded, and starts
+ *    `startFleetBridgeServer` listening before timing payload inventory (`runtime verify`) and
+ *    continuity recovery (`recovery`) as separate post-transport boot phases, keeping transport
+ *    readiness inside the shell's 15 s window while Starts remain gated until verification and
+ *    recovery settle.
  *
  * Invocation: `node ai/services/fleet/devFleetServer.mjs` (or `npm run ai:fleet-server`). Loopback
  * only; the port is `NEO_FLEET_PORT` (default 8083) and must match the URL the App Worker's
@@ -97,8 +103,9 @@ export const FLEET_BOOT_PHASES = Object.freeze([
     'runtime bind',
     'viewer claim',
     'plane init',
-    'recovery',
-    'transport'
+    'transport',
+    'runtime verify',
+    'recovery'
 ]);
 
 /**
@@ -213,18 +220,10 @@ async function boot() {
     try {
 
     if (runtime.generation) {
-        const recoveryStartedAt = Date.now();
-        lifecycle.openRuntimeCustody({directory: lifecycle.getRegistry().admissionDirectory()});
-        const dispositions = await lifecycle.recoverRuntimeCustody({tenantService: await FleetManager.getTenantService()});
-        const recoveryMs   = Date.now() - recoveryStartedAt;
-        const record       = lifecycle.getLaunchAdmission().continuityRecord;
-        // The successor says what it inherited: a lost handoff is the one fact the roster line cannot name by itself.
-        console.log(`[fleet] continuity recovery: previous issuer ${record?.previousReason ?? (record?.handoffProved ? 'handed-off' : 'none')}` +
-            (record?.origin ? ` at ${record.origin}` : '') + `; ${dispositions.length} retained generation(s)` +
-            (dispositions.length ? ': ' + dispositions.map(row => `${row.agentId} ${row.state}${row.detail ? ` (${row.detail})` : ''}`).join(', ') : ''));
-        console.log(formatFleetBootPhaseLine('recovery', recoveryMs, `${dispositions.length} retained generation(s)`));
-    } else {
-        console.log(formatFleetBootPhaseLine('recovery', 0, 'skipped: no runtime generation'));
+        lifecycle.openRuntimeCustody({
+            directory    : lifecycle.getRegistry().admissionDirectory(),
+            awaitRecovery: true
+        });
     }
 
     // Wire the cross-process boot-identity reader BEFORE serving: getBootIdentity() then serves the
@@ -718,6 +717,39 @@ async function boot() {
         // process emits; the launcher that supplied (or will inject) it owns the hand-off.
         console.log(`[fleet] authenticated app<->fleet transport listening on http://127.0.0.1:${server.address().port}/fleet (viewer: ${viewer.agentIdentityNodeId}, bearer: ${AiConfig.fleet.bearer ? 'supplied' : 'generated'})`);
         console.log(formatFleetBootPhaseLine('transport', Date.now() - transportStartedAt, `port: ${server.address().port}`));
+
+        if (runtime.generation) {
+            const runtimeVerifyStartedAt = Date.now();
+            let   runtimeVerified        = false;
+            try {
+                await runtime.verify();
+                runtimeVerified = true;
+                console.log(formatFleetBootPhaseLine('runtime verify', Date.now() - runtimeVerifyStartedAt,
+                    `generation ${runtime.generation.id.slice(0, 12)}`));
+                const recoveryStartedAt = Date.now();
+                const dispositions      = await lifecycle.recoverRuntimeCustody({tenantService: await FleetManager.getTenantService()});
+                const recoveryMs        = Date.now() - recoveryStartedAt;
+                const record            = lifecycle.getLaunchAdmission().continuityRecord;
+                // The successor says what it inherited: a lost handoff is the one fact the roster line cannot name by itself.
+                console.log(`[fleet] continuity recovery: previous issuer ${record?.previousReason ?? (record?.handoffProved ? 'handed-off' : 'none')}` +
+                    (record?.origin ? ` at ${record.origin}` : '') + `; ${dispositions.length} retained generation(s)` +
+                    (dispositions.length ? ': ' + dispositions.map(row => `${row.agentId} ${row.state}${row.detail ? ` (${row.detail})` : ''}`).join(', ') : ''));
+                console.log(formatFleetBootPhaseLine('recovery', recoveryMs, `${dispositions.length} retained generation(s)`));
+            } catch (error) {
+                if (!runtimeVerified) {
+                    lifecycle.getLaunchAdmission().failRuntimeVerification();
+                    console.error(`[fleet] runtime verification failed; Starts remain refused: ${error?.message ?? error}`);
+                    console.log(formatFleetBootPhaseLine('runtime verify', Date.now() - runtimeVerifyStartedAt,
+                        `failed: ${error?.code || 'runtime-integrity-failed'}`));
+                    console.log(formatFleetBootPhaseLine('recovery', 0, 'skipped: runtime verification failed'));
+                } else {
+                    throw error;
+                }
+            }
+        } else {
+            console.log(formatFleetBootPhaseLine('runtime verify', 0, 'skipped: no runtime generation'));
+            console.log(formatFleetBootPhaseLine('recovery', 0, 'skipped: no runtime generation'));
+        }
 
         // Seat-conflation honesty at boot: a viewer claim that IS a registered agent identity
         // means every operator action through this transport inherits agent attribution — the

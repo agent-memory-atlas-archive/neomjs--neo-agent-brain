@@ -11,21 +11,21 @@ setup({
     }
 });
 
-import {test, expect}                                                             from '@playwright/test';
-import {execFile, execFileSync, spawn}                                            from 'child_process';
-import {EventEmitter}                                                             from 'events';
-import fs                                                                         from 'fs';
-import os                                                                         from 'os';
-import path                                                                       from 'path';
-import {WebSocketServer}                                                          from 'ws';
-import {once}                                                                     from 'node:events';
-import {createHash, generateKeyPairSync, sign as cryptoSign}                      from 'node:crypto';
-import {verifyBridgeToken}                                                        from '../../../../ai/mcp/server/neural-link/verifyBridgeToken.mjs';
-import {generateAntigravityMcpFiles}                                              from '../../../../ai/services/fleet/generateAntigravityMcpFiles.mjs';
-import {createBridgeVerifierPayload}                                              from '../../../../ai/mcp/server/neural-link/BridgeProtocol.mjs';
-import {holdRuntimeGenerationReferences}                                          from '../../../../ai/services/fleet/runtimeGenerationLease.mjs';
-import {readRuntimeGeneration, runtimeGenerationPin}                              from '../../../../ai/services/fleet/runtimeGeneration.mjs';
-import {addEscapingLink, changePayloadBytes, removeSealed, sealRuntimeGeneration} from './services/fleet/fixtures/sealedRuntimeGeneration.mjs';
+import {test, expect}                                                                                from '@playwright/test';
+import {execFile, execFileSync, spawn}                                                               from 'child_process';
+import {EventEmitter}                                                                                from 'events';
+import fs                                                                                            from 'fs';
+import os                                                                                            from 'os';
+import path                                                                                          from 'path';
+import {WebSocketServer}                                                                             from 'ws';
+import {once}                                                                                        from 'node:events';
+import {createHash, generateKeyPairSync, sign as cryptoSign}                                         from 'node:crypto';
+import {verifyBridgeToken}                                                                           from '../../../../ai/mcp/server/neural-link/verifyBridgeToken.mjs';
+import {generateAntigravityMcpFiles}                                                                 from '../../../../ai/services/fleet/generateAntigravityMcpFiles.mjs';
+import {createBridgeVerifierPayload}                                                                 from '../../../../ai/mcp/server/neural-link/BridgeProtocol.mjs';
+import {holdRuntimeGenerationReferences}                                                             from '../../../../ai/services/fleet/runtimeGenerationLease.mjs';
+import {bindCurrentRuntime, readRuntimeGeneration, runtimeGenerationArguments, runtimeGenerationPin} from '../../../../ai/services/fleet/runtimeGeneration.mjs';
+import {addEscapingLink, changePayloadBytes, removeSealed, sealRuntimeGeneration}                    from './services/fleet/fixtures/sealedRuntimeGeneration.mjs';
 
 
 import Neo                                                                                    from 'neo.mjs/src/Neo.mjs';
@@ -2866,14 +2866,14 @@ test.describe('Neo.ai.services.fleet.FleetLifecycleService — seat survival', (
         FleetLifecycleService.registry.renewBridgeToken          = () => ({token: 'renewed-fixture-token'});
 
         return {
-            seats, spawn, runtime, answers, sealedGenerations,
+            seats, spawn, runtime, answers, sealedGenerations, directory,
             sealed: () => JSON.parse(fs.readFileSync(path.join(directory, 'issuer.json'), 'utf8')).snapshot,
             /** The next Fleet boot, recovering from what the handoff sealed; `{}` recovers with the default verifier. */
             async reboot(options = {verifyRuntime: runtime}) {
                 service.issuerOrigin = null; service.continuityPhase = 'ready'; service.handoffPromise = null;
                 service.journal = null; service.generations.clear(); service.grants.clear();
                 FleetLifecycleService.processes.clear(); FleetLifecycleService.leasesAdopted = false;
-                FleetLifecycleService.openRuntimeCustody({directory});
+                FleetLifecycleService.openRuntimeCustody({directory, awaitRecovery: true});
                 return FleetLifecycleService.recoverRuntimeCustody(options)
             },
             /** What a launch with this seat's Start-time grant receives now: the verified answer, else the unattributed refusal. */
@@ -2923,6 +2923,93 @@ test.describe('Neo.ai.services.fleet.FleetLifecycleService — seat survival', (
             }
         });
     }
+
+    test('after an unclean issuer exit, recovery runs no payload inventory and a verifyRuntime spy sees zero full reads (#1198 AC-1)', async () => {
+        const fixture = await admittedDesktopSeats(['seat', 'peer'], {sealed: true}), fullReads = [];
+        try {
+            McpLaunchAdmissionService.journal.close();
+            if (McpLaunchAdmissionService.httpServer) {
+                await new Promise(resolve => McpLaunchAdmissionService.httpServer.close(resolve));
+            }
+            McpLaunchAdmissionService.httpServer = McpLaunchAdmissionService.listening = null;
+            const verifyRuntime = options => {
+                fullReads.push(options.directory);
+                return readRuntimeGeneration(options)
+            };
+            const recovered = await fixture.reboot({verifyRuntime});
+            expect(recovered.map(row => [row.agentId, row.state])).toEqual([['seat', 'stale'], ['peer', 'stale']]);
+            expect(fullReads).toEqual([]);
+            expect(FleetLifecycleService.processes.get('seat').runtimeUnresolved).toBe(false);
+            expect(FleetLifecycleService.processes.get('peer').runtimeUnresolved).toBe(false)
+        } finally {
+            await fixture.teardown()
+        }
+    });
+
+    test('a seat pinned to the running generation causes no second inventory of it, and Start is refused until verification settles (#1198 AC-3, AC-4)', async () => {
+        const fixture = await admittedDesktopSeats(['seat', 'peer'], {sealed: true}), fullReads = [];
+        try {
+            expect(await FleetLifecycleService.handoffRuntimeCustody()).toEqual({state: 'handed-off'});
+            const verifyRuntime = options => {
+                fullReads.push(options.directory);
+                return readRuntimeGeneration(options)
+            };
+            FleetLifecycleService.installedRuntime = await bindCurrentRuntime({
+                args       : runtimeGenerationArguments(fixture.sealedGenerations.seat),
+                runtimeRoot: fixture.sealedGenerations.seat.runtimeRoot,
+                executable : fixture.sealedGenerations.seat.executable,
+                verifyRuntime
+            });
+            expect(fullReads, 'record bind at boot performs zero full reads').toEqual([]);
+            expect(() => FleetLifecycleService.start('seat', {
+                cwd              : CHECKOUT,
+                runtimeGeneration: FleetLifecycleService.installedRuntime.generation
+            })).toThrow('Fleet Start refused: running runtime generation is not verified.');
+
+            await FleetLifecycleService.installedRuntime.verify();
+            expect(fullReads).toEqual([fixture.sealedGenerations.seat.directory]);
+
+            McpLaunchAdmissionService.journal?.close();
+            McpLaunchAdmissionService.journal = null;
+            McpLaunchAdmissionService.generations.clear();
+            McpLaunchAdmissionService.grants.clear();
+            FleetLifecycleService.processes.clear();
+            FleetLifecycleService.leasesAdopted = false;
+            FleetLifecycleService.openRuntimeCustody({directory: fixture.directory, awaitRecovery: true});
+            expect(McpLaunchAdmissionService.continuityPhase).toBe('pending-recovery');
+            expect(() => FleetLifecycleService.start('seat', {
+                cwd              : CHECKOUT,
+                runtimeGeneration: FleetLifecycleService.installedRuntime.generation
+            })).toThrow('Fleet Start refused: launch continuity is not ready.');
+
+            const recovered = await FleetLifecycleService.recoverRuntimeCustody({verifyRuntime});
+            expect(McpLaunchAdmissionService.continuityPhase).toBe('ready');
+            expect(recovered.map(row => [row.agentId, row.state])).toEqual([['seat', 'active'], ['peer', 'active']]);
+            expect(fullReads, 'running generation is not inventoried a second time during recovery').toEqual([
+                fixture.sealedGenerations.seat.directory,
+                fixture.sealedGenerations.peer.directory
+            ]);
+
+            const brokenRuntime = await bindCurrentRuntime({
+                args         : runtimeGenerationArguments(fixture.sealedGenerations.seat),
+                runtimeRoot  : fixture.sealedGenerations.seat.runtimeRoot,
+                executable   : fixture.sealedGenerations.seat.executable,
+                verifyRuntime: async () => {
+                    throw Object.assign(new Error('digest mismatch'), {code: 'runtime-integrity-failed'});
+                }
+            });
+            FleetLifecycleService.installedRuntime = brokenRuntime;
+            await expect(brokenRuntime.verify()).rejects.toMatchObject({code: 'runtime-integrity-failed'});
+            McpLaunchAdmissionService.failRuntimeVerification();
+            expect(McpLaunchAdmissionService.continuityPhase).toBe('unavailable');
+            expect(() => FleetLifecycleService.start('seat', {
+                cwd              : CHECKOUT,
+                runtimeGeneration: brokenRuntime.generation
+            })).toThrow('Fleet Start refused: running runtime generation failed verification (runtime-integrity-failed).')
+        } finally {
+            await fixture.teardown()
+        }
+    });
 
     test('a survivor that plans every server but was admitted only Neural Link seals and recovers active', async () => {
         const fixture = await admittedDesktopSeats(['seat'], {remote: true}), stages = [];
