@@ -5,62 +5,102 @@ import Base                                                                     
 import {Memory_GraphService as GraphService, Memory_StorageRouter as StorageRouter} from '../../services.mjs';
 import logger                                                                       from '../../mcp/server/memory-core/logger.mjs';
 import {canonicalizeConceptId}                                                      from '../graph/conceptSpineCanonicalization.mjs';
+import {CORPUS_GRAPH_ORIGIN, qualifyOriginId}                                       from '../graph/corpusProjectionContract.mjs';
 import {isAdrRedirect}                                                              from '../shared/adrRedirect.mjs';
+import {
+    ADR_FILE_REGEX,
+    ADR_NUMBER_REGEX,
+    ADR_SLUG_REGEX,
+    FORGE_AUTHORITY_REGEX,
+    FULL_NAMESPACE_REGEX,
+    KNOWN_CUT_REPOSITORIES,
+    buildCanonicalAdrKey,
+    createCodedError,
+    decodeAdrKeyField,
+    encodeAdrKeyField,
+    parseCanonicalAdrKey,
+    validateAdrIdentityFields
+} from '../shared/adrIdentityCodec.mjs';
+import {
+    buildAdmittedAdrRecord,
+    computeAdrPayloadHash,
+    evaluateAdrCandidateConflicts,
+    extractAdrTitleAndStatus,
+    extractCitationSurfaceContext,
+    measureAdrAuthorActions,
+    observeAdrCandidateAllocationFloor,
+    parseAdrFilename,
+    parseAdrOpeningAliases,
+    parseAdrSupersedes,
+    parseHumanOrNumericAdrReference,
+    resolveAdrCandidateIdentity,
+    stripMarkdownFences
+} from '../shared/adrDocumentParser.mjs';
+
+export {
+    ADR_SLUG_REGEX,
+    KNOWN_CUT_REPOSITORIES,
+    buildCanonicalAdrKey,
+    decodeAdrKeyField,
+    encodeAdrKeyField,
+    measureAdrAuthorActions,
+    parseAdrFilename,
+    parseAdrOpeningAliases,
+    parseCanonicalAdrKey,
+    validateAdrIdentityFields
+};
+
+export const ADR_EDGE_TYPES = Object.freeze({
+    CITES_AUTHORITY    : 'CITES_AUTHORITY',
+    CODIFIES_CONCEPT   : 'CODIFIES_CONCEPT',
+    GOVERNS            : 'GOVERNS',
+    GRADUATED_FROM     : 'GRADUATED_FROM',
+    IMPLEMENTS_DECISION: 'IMPLEMENTS_DECISION'
+});
 
 const
-    ADR_EDGE_TYPES = Object.freeze({
-        CITES_AUTHORITY    : 'CITES_AUTHORITY',
-        CODIFIES_CONCEPT   : 'CODIFIES_CONCEPT',
-        GOVERNS            : 'GOVERNS',
-        GRADUATED_FROM     : 'GRADUATED_FROM',
-        IMPLEMENTS_DECISION: 'IMPLEMENTS_DECISION'
-    }),
-    ADR_FILE_REGEX     = /^(\d{4})-.*\.md$/,
-    ISSUE_REF_REGEX    = /\b(?:Epic|Issue|Ticket)\s+#(\d+)\b/gi,
-    PR_REF_REGEX       = /\bPR\s+#(\d+)\b/gi,
-    CONCEPT_REF_REGEX  = /\bCONCEPT:([A-Za-z0-9_.:-]+)\b/g,
-    SESSION_REF_REGEX  = /\bOrigin Session ID:\s*`?([A-Za-z0-9_.:-]+)`?/gi,
-    STATUS_ROW_REGEX   = /^\|\s*\*\*Status\*\*\s*\|\s*([^|]+?)\s*\|/mi,
-    STATUS_BOLD_REGEX  = /^\s*\*\*Status\*\*:\s*(.+)$/mi,
-    // Third spelling, colon inside the bold. Without it the composition record's status matched
-    // nothing and the `|| 'Draft'` fallback below turned a parse failure into a status claim — a
-    // record the graph then reported as pending for weeks on the strength of a regex that missed it.
-    STATUS_INNER_REGEX = /^\s*\*\*Status:\*\*\s*(.+)$/mi,
-    SUPERSEDES_ROW_REGEX = /^\|\s*\*\*Supersedes\*\*\s*\|\s*([^|]+?)\s*\|/mi;
+    ISSUE_KEYWORD_REF_REGEX  = /\b(?:Epic|Issue|Ticket)\s+(?:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)|#(\d+))\b/gi,
+    ISSUE_LINK_REF_REGEX     = /\[[^\]]*\]\(https?:\/\/[^/\s]+\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/issues\/(\d+)(?:[?#][^\s)]*)?\)/gi,
+    PR_KEYWORD_REF_REGEX     = /\bPR\s+(?:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)|#(\d+))\b/gi,
+    PR_LINK_REF_REGEX        = /\[[^\]]*\]\(https?:\/\/[^/\s]+\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)(?:[?#][^\s)]*)?\)/gi,
+    CONCEPT_REF_REGEX        = /\bCONCEPT:([A-Za-z0-9_.:-]+)\b/g,
+    SESSION_REF_REGEX        = /\bOrigin Session ID:\s*`?([A-Za-z0-9_.:-]+)`?/gi,
+    QUALIFIED_ISSUE_NODE_REX = /^(?:[a-z0-9_.-]+#)?issue-\d+$/i,
+    QUALIFIED_PR_NODE_REX    = /^(?:[a-z0-9_.-]+#)?pr-\d+$/i,
+    QUALIFIED_DISC_NODE_REX  = /^(?:[a-z0-9_.-]+#)?discussion-\d+$/i,
+    SESSION_NODE_REGEX       = /^session:[A-Za-z0-9_.:-]+$/,
+    ADR_SHAPED_ID_REGEX      = /^(?:adr[-:]|.*#adr[-:])/i;
 
-/**
- * Stable deep-stringify for ADR payload hashing. Sorts object keys recursively so
- * logically-identical metadata emits the same hash regardless of parser order.
- * @param {*} value
- * @returns {String}
- * @private
- */
-function stableStringify(value) {
-    if (value === null || typeof value !== 'object') {
-        return JSON.stringify(value);
-    }
+function unresolvedResult(reasonCode, candidates = []) {
+    return {
+        status           : candidates.length > 1 ? 'ambiguous' : 'unresolved',
+        resolved         : false,
+        canonicalKey     : null,
+        identityResolved : false,
+        documentAvailable: false,
+        candidates,
+        reasonCode
+    };
+}
 
-    if (Array.isArray(value)) {
-        return '[' + value.map(stableStringify).join(',') + ']';
-    }
-
-    const keys = Object.keys(value).sort();
-
-    return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(value[k])).join(',') + '}';
+function resolvedResult(record) {
+    return {
+        status           : 'resolved',
+        resolved         : true,
+        canonicalKey     : record.canonicalKey,
+        identityResolved : true,
+        documentAvailable: Boolean(record.documentAvailable),
+        kbAvailable      : Boolean(record.kbAvailable),
+        stale            : Boolean(record.stale),
+        record,
+        candidates       : [record.canonicalKey]
+    };
 }
 
 /**
  * @summary Deterministically ingests Architecture Decision Records into the Native Edge Graph as
- * first-class `ADR` nodes with consumer-backed relationship edges.
- *
- * The ADR-node contract makes decision records graph-queryable without widening the REM LLM
- * extractor's `VALID_TYPES` enum. This service mirrors the `ConceptIngestor` pattern: scan the
- * version-controlled ADR corpus, parse stable metadata, upsert `ADR` nodes, and replace only
- * ADR-owned edge taxonomy rows. It is intentionally deterministic and filesystem-backed; no LLM
- * inference is involved, and no speculative edges are emitted.
- *
- * Non-Accepted ADR status values in the current corpus normalize to `Draft` for the pinned
- * ADR-node contract while preserving the source value as `rawStatus`.
+ * first-class `ADR` nodes with repository-qualified identities, scoped slug/numeric aliases,
+ * and consumer-backed relationship edges.
  *
  * @class Neo.ai.daemons.services.AdrIngestor
  * @extends Neo.core.Base
@@ -82,112 +122,504 @@ class AdrIngestor extends Base {
         singleton: true
     }
 
+    admissionCatalog       = new Map()
+    repositoryReservations = new Map()
+    forgeDirectory         = new Map()
+
+    construct(config) {
+        super.construct(config);
+        this.resetCatalog();
+    }
+
     /**
-     * Computes the differential-sync hash stored under `properties.payloadHash`.
+     * @summary Resets the in-memory admission catalog and seeds the default cut repositories.
+     */
+    resetCatalog() {
+        this.admissionCatalog.clear();
+        this.repositoryReservations.clear();
+        this.forgeDirectory.clear();
+        for (const repo of KNOWN_CUT_REPOSITORIES) {
+            this.registerForgeRepository(repo);
+        }
+    }
+
+    /**
+     * @summary Rehydrates `admissionCatalog`, `repositoryReservations`, and `forgeDirectory` from
+     * persisted `ADR` nodes in `GraphService.db` so admitted aliases, numeric reservations, and
+     * repository rename provenance survive process restarts or in-memory catalog resets.
+     */
+    rehydrateCatalogFromGraph() {
+        const records = [];
+
+        if (GraphService.db?.nodes?.items) {
+            for (const node of GraphService.db.nodes.items) {
+                const
+                    label = node.isRecord ? node.get('label') : node.label,
+                    props = (node.isRecord ? node.get('properties') : node.properties) || {};
+                if (label === 'ADR' && props.adrAuthority?.admitted === true && props.adrAdmissionRecord) {
+                    records.push(props.adrAdmissionRecord);
+                }
+            }
+        }
+
+        const sqlite = GraphService.db?.storage?.db;
+        if (sqlite) {
+            try {
+                const rows = sqlite.prepare(`
+                    SELECT id, data FROM Nodes WHERE json_extract(data, '$.label') = 'ADR'
+                `).all();
+                for (const row of rows) {
+                    if (GraphService.db?.nodes?.has(row.id)) continue;
+                    try {
+                        const parsed = JSON.parse(row.data);
+                        if (parsed?.properties?.adrAuthority?.admitted === true && parsed.properties.adrAdmissionRecord) {
+                            records.push(parsed.properties.adrAdmissionRecord);
+                        }
+                    } catch {}
+                }
+            } catch {}
+        }
+
+        for (const rawRecord of records) {
+            if (!rawRecord?.canonicalKey || this.admissionCatalog.has(rawRecord.canonicalKey)) continue;
+
+            const record = {
+                ...rawRecord,
+                historicalAliases: [...(rawRecord.historicalAliases || [])],
+                aliasBindings    : (rawRecord.aliasBindings || []).map(b => ({...b})),
+                reservations     : (rawRecord.reservations || []).map(r => ({...r})),
+                provenance       : {
+                    ...(rawRecord.provenance || {}),
+                    custodyTransitions: [...(rawRecord.provenance?.custodyTransitions || [])],
+                    repositoryRenames : [...(rawRecord.provenance?.repositoryRenames || [])],
+                    sourceLineage     : [...(rawRecord.provenance?.sourceLineage || [])]
+                }
+            };
+
+            for (const tuple of [record.sourceTuple, record.assignmentEvidence]) {
+                if (tuple?.repositoryId && tuple?.namespace) {
+                    const forge = tuple.forge || 'github.com';
+                    this.registerForgeRepository({forge, repositoryId: tuple.repositoryId, namespace: tuple.namespace});
+                    this.#ensureReservationBucket(forge, tuple.repositoryId).numbers.add(record.adrNumber);
+                }
+            }
+
+            for (const rename of record.provenance.repositoryRenames) {
+                if (rename?.repositoryId && rename?.currentNamespace && rename?.previousNamespace) {
+                    this.registerForgeRepository({
+                        forge       : rename.forge || 'github.com',
+                        repositoryId: rename.repositoryId,
+                        namespace   : rename.currentNamespace,
+                        aliases     : [rename.previousNamespace]
+                    });
+                }
+            }
+
+            for (const binding of record.aliasBindings) {
+                const bucket = binding.repositoryId
+                    ? this.#ensureReservationBucket(binding.forge || 'github.com', binding.repositoryId)
+                    : null;
+                if (bucket && binding.kind === 'legacy-number') bucket.numbers.add(binding.value);
+                if (bucket && binding.namespace) {
+                    bucket.aliases.set(`${binding.kind}:${binding.namespace.toLowerCase()}:${binding.value}`, {
+                        ...binding,
+                        targetKey: record.canonicalKey
+                    });
+                }
+            }
+
+            this.admissionCatalog.set(record.canonicalKey, record);
+        }
+    }
+
+    /**
+     * @summary Registers a repository's current namespace occupancy in the forge provider directory.
+     * @param {Object} repo
+     */
+    registerForgeRepository({forge = 'github.com', repositoryId, namespace, aliases = []} = {}) {
+        validateAdrIdentityFields({forge, repositoryId, namespace, number: '0001'});
+        if (!this.forgeDirectory.has(forge)) this.forgeDirectory.set(forge, new Map());
+
+        const dir = this.forgeDirectory.get(forge);
+        dir.set(namespace.toLowerCase(), {forge, repositoryId, currentNamespace: namespace});
+
+        for (const aliasNs of aliases) {
+            if (typeof aliasNs === 'string' && FULL_NAMESPACE_REGEX.test(aliasNs)) {
+                const existing = dir.get(aliasNs.toLowerCase());
+                if (!existing || existing.repositoryId === repositoryId) {
+                    dir.set(aliasNs.toLowerCase(), {forge, repositoryId, currentNamespace: namespace});
+                }
+            }
+        }
+
+        this.#ensureReservationBucket(forge, repositoryId);
+    }
+
+    /**
+     * @summary Records a proved repository rename without rekeying existing decisions.
+     * @param {Object} params
+     * @returns {Object}
+     */
+    recordRepositoryRename({forge = 'github.com', repositoryId, previousNamespace, currentNamespace, proof} = {}) {
+        this.rehydrateCatalogFromGraph();
+        if (!proof) {
+            throw createCodedError(
+                'ADR_UNPROVED_REPOSITORY_IDENTITY_CHANGE',
+                `Repository rename '${previousNamespace}' -> '${currentNamespace}' requires continuity proof.`
+            );
+        }
+
+        validateAdrIdentityFields({forge, repositoryId, namespace: previousNamespace, number: '0001'});
+        validateAdrIdentityFields({forge, repositoryId, namespace: currentNamespace, number: '0001'});
+        this.registerForgeRepository({forge, repositoryId, namespace: currentNamespace, aliases: [previousNamespace]});
+
+        const bucket = this.#ensureReservationBucket(forge, repositoryId);
+
+        for (const record of this.admissionCatalog.values()) {
+            const touchesRepo = record.assignmentEvidence?.forge === forge && (
+                record.assignmentEvidence?.repositoryId === repositoryId ||
+                record.sourceTuple?.repositoryId === repositoryId ||
+                record.aliasBindings.some(b => b.forge === forge && b.repositoryId === repositoryId)
+            );
+            if (!touchesRepo) continue;
+
+            record.provenance.repositoryRenames.push({forge, repositoryId, previousNamespace, currentNamespace, proof});
+
+            const existingForRepo = record.aliasBindings.filter(
+                b => b.forge === forge && b.repositoryId === repositoryId && b.namespace.toLowerCase() === previousNamespace.toLowerCase()
+            );
+
+            for (const binding of existingForRepo) {
+                this.#addAliasBinding(record, bucket, {
+                    kind     : binding.kind,
+                    value    : binding.value,
+                    forge,
+                    repositoryId,
+                    namespace: currentNamespace,
+                    targetKey: record.canonicalKey,
+                    current  : binding.current
+                });
+            }
+
+            const existingNode = GraphService.db?.nodes?.get(record.canonicalKey);
+            if (existingNode) {
+                const props = (existingNode.isRecord ? existingNode.get('properties') : existingNode.properties) || {};
+                GraphService.upsertNode({
+                    id        : record.canonicalKey,
+                    type      : 'ADR',
+                    name      : props.title || record.title,
+                    properties: {
+                        ...props,
+                        adrAdmissionRecord: record,
+                        adrAuthority      : {...(props.adrAuthority || {}), admitted: true, canonicalKey: record.canonicalKey, renameVerified: true}
+                    }
+                });
+            }
+        }
+
+        return {forge, repositoryId, previousNamespace, currentNamespace};
+    }
+
+    #ensureReservationBucket(forge, repositoryId) {
+        const key = `${forge}:${repositoryId}`;
+        if (!this.repositoryReservations.has(key)) {
+            this.repositoryReservations.set(key, {forge, repositoryId, numbers: new Set(), aliases: new Map()});
+        }
+        return this.repositoryReservations.get(key);
+    }
+
+    #addAliasBinding(record, bucket, binding) {
+        const
+            normalizedNs = binding.namespace.toLowerCase(),
+            matches      = item => item.kind === binding.kind && item.value === binding.value &&
+                                   item.forge === binding.forge && item.repositoryId === binding.repositoryId &&
+                                   item.namespace.toLowerCase() === normalizedNs,
+            existing     = record.aliasBindings.find(matches);
+
+        if (existing) {
+            existing.current = Boolean(binding.current);
+        } else {
+            record.aliasBindings.push({...binding});
+        }
+
+        if (!record.reservations.some(matches)) {
+            record.reservations.push({
+                kind        : binding.kind,
+                value       : binding.value,
+                forge       : binding.forge,
+                repositoryId: binding.repositoryId,
+                namespace   : binding.namespace,
+                targetKey   : record.canonicalKey
+            });
+        }
+
+        if (bucket) {
+            bucket.aliases.set(`${binding.kind}:${normalizedNs}:${binding.value}`, {...binding, targetKey: record.canonicalKey});
+        }
+    }
+
+    /**
+     * @summary Reserves historical ADR numbers (and optional slug/legacy-number locators) in a source
+     * repository so move-outs and extractions never lower its local allocation floor.
+     * @param {Object} params
+     */
+    reserveHistoricalNumbers({forge = 'github.com', repositoryId, namespace, reservations = []} = {}) {
+        this.rehydrateCatalogFromGraph();
+        validateAdrIdentityFields({forge, repositoryId, namespace, number: '0001'});
+        const bucket = this.#ensureReservationBucket(forge, repositoryId);
+
+        for (const item of reservations) {
+            const
+                number    = typeof item === 'string' ? item : item?.number,
+                slug      = typeof item === 'object' ? item?.slug : null,
+                targetKey = (typeof item === 'object' && item?.targetKey) || buildCanonicalAdrKey({forge, repositoryId, namespace, number});
+
+            if (!ADR_NUMBER_REGEX.test(String(number || ''))) {
+                throw createCodedError('ADR_INVALID_IDENTITY_FIELD', `Invalid reserved ADR number: '${String(number)}'`);
+            }
+
+            bucket.numbers.add(number);
+            bucket.aliases.set(`legacy-number:${namespace.toLowerCase()}:${number}`, {
+                kind: 'legacy-number', value: number, forge, repositoryId, namespace, targetKey
+            });
+
+            if (slug) {
+                if (!ADR_SLUG_REGEX.test(slug)) {
+                    throw createCodedError('ADR_INVALID_ALIAS_TOKEN', `Invalid reserved ADR slug: '${slug}'`);
+                }
+                bucket.aliases.set(`slug:${namespace.toLowerCase()}:${slug}`, {
+                    kind: 'slug', value: slug, forge, repositoryId, namespace, targetKey
+                });
+            }
+        }
+    }
+
+    /**
+     * @summary Computes the next local ADR number (`0001`..`9999`) for `(forge, repositoryId)` as one
+     * above the greatest admitted or reserved decision number in that repository.
+     * @param {Object} params
+     * @returns {String}
+     */
+    allocateNextAdrNumber({forge = 'github.com', repositoryId} = {}) {
+        this.rehydrateCatalogFromGraph();
+        if (typeof forge !== 'string' || !FORGE_AUTHORITY_REGEX.test(forge) ||
+            typeof repositoryId !== 'string' || !repositoryId.trim()) {
+            throw createCodedError('ADR_INVALID_IDENTITY_FIELD', 'allocateNextAdrNumber requires valid forge and repositoryId.');
+        }
+
+        const bucket = this.repositoryReservations.get(`${forge}:${repositoryId}`);
+        let   max    = 0;
+
+        if (bucket) {
+            for (const num of bucket.numbers) {
+                const val = Number(num);
+                if (Number.isFinite(val) && val > max) max = val;
+            }
+        }
+
+        for (const record of this.admissionCatalog.values()) {
+            const matchesRepo =
+                (record.assignmentEvidence?.forge === forge && record.assignmentEvidence?.repositoryId === repositoryId) ||
+                (record.sourceTuple?.forge === forge && record.sourceTuple?.repositoryId === repositoryId) ||
+                record.reservations?.some(r => r.forge === forge && r.repositoryId === repositoryId);
+            if (matchesRepo) {
+                const val = Number(record.adrNumber);
+                if (Number.isFinite(val) && val > max) max = val;
+            }
+        }
+
+        if (max >= 9999) {
+            throw createCodedError('ADR_ALLOCATION_EXHAUSTED', `Four-digit ADR range (0001..9999) is exhausted for ${forge}:${repositoryId}.`);
+        }
+
+        return String(max + 1).padStart(4, '0');
+    }
+
+    /**
+     * @summary Exposes present-file and unfiltered-history observations as an advisory candidate floor,
+     * while keeping admission's proved population as the sole certifier.
+     * @param {Object} [options={}]
+     * @returns {Object}
+     */
+    observeCandidateAllocationFloor(options = {}) {
+        this.rehydrateCatalogFromGraph();
+        const
+            {forge = 'github.com', repositoryId = null} = options,
+            certifiedEligibleNumber                     = repositoryId ? this.allocateNextAdrNumber({forge, repositoryId}) : null;
+        return observeAdrCandidateAllocationFloor(options, certifiedEligibleNumber);
+    }
+
+    /**
+     * @summary Measures normal author actions for creation or rename.
+     * @param {Object} scenario
+     * @returns {Object}
+     */
+    measureAuthorActions(scenario) {
+        return measureAdrAuthorActions(scenario);
+    }
+
+    /**
+     * @summary Computes the differential-sync hash stored under `properties.payloadHash`.
      * @param {Object} adr Parsed ADR metadata.
      * @returns {String}
      * @protected
      */
     computePayloadHash(adr) {
-        const payload = {
-            adrNumber : adr.adrNumber,
-            rawStatus : adr.rawStatus,
-            source    : adr.source,
-            status    : adr.status,
-            supersedes: adr.supersedes,
-            title     : adr.title
-        };
-
-        return crypto.createHash('sha256').update(stableStringify(payload)).digest('hex');
+        return computeAdrPayloadHash(adr);
     }
 
     /**
-     * @summary Parses a markdown ADR file into graph-node metadata and deterministic edge rows.
+     * @summary Parses a markdown ADR file into graph-node metadata, slug history, and deterministic edge rows.
      * @param {String} fileName ADR markdown file name.
      * @param {String} content ADR markdown body.
      * @param {String} source Repo-relative source path.
+     * @param {Object} [options={}] Optional repository/assignment/citation context.
      * @returns {Object}
      * @protected
      */
-    parseAdr(fileName, content, source) {
-        const fileMatch = fileName.match(ADR_FILE_REGEX);
-        if (!fileMatch) {
-            throw new Error(`Invalid ADR file name: ${fileName}`);
+    parseAdr(fileName, content, source, options = {}) {
+        const
+            {adrNumber, slug: currentSlug} = parseAdrFilename(fileName),
+            aliasResult                    = parseAdrOpeningAliases(content),
+            historicalAliases              = aliasResult.aliases,
+            repository                     = options.repository || null,
+            assignedIdentity               = options.assignedIdentity || repository;
+
+        let canonicalKey = `adr-${adrNumber}`,
+            id           = canonicalKey;
+
+        if (options.canonicalKey) {
+            const parsedKey = parseCanonicalAdrKey(options.canonicalKey);
+            if (parsedKey.number !== adrNumber) {
+                throw createCodedError('ADR_NUMBER_MISMATCH', `Canonical key number '${parsedKey.number}' does not match filename number '${adrNumber}'.`);
+            }
+            canonicalKey = parsedKey.canonicalKey;
+            id           = canonicalKey;
+        } else if (assignedIdentity) {
+            canonicalKey = buildCanonicalAdrKey({
+                forge       : assignedIdentity.forge || 'github.com',
+                repositoryId: assignedIdentity.repositoryId,
+                namespace   : assignedIdentity.namespace,
+                number      : adrNumber
+            });
+            id = canonicalKey;
         }
 
         const
-            adrNumber    = fileMatch[1],
-            id           = `adr-${adrNumber}`,
-            headingMatch = content.match(/^#\s+ADR\s+\d{4}:?\s*(.+)$/mi),
-            title        = headingMatch?.[1]?.trim() || path.basename(fileName, '.md'),
-            statusMatch  = content.match(STATUS_ROW_REGEX) || content.match(STATUS_BOLD_REGEX) || content.match(STATUS_INNER_REGEX),
-            rawStatus    = (statusMatch?.[1] || 'Draft').replace(/\s+/g, ' ').trim(),
-            status       = /^Accepted\b/i.test(rawStatus) ? 'Accepted' : 'Draft',
-            supersedes   = this.parseSupersedes(content);
+            {title, rawStatus, status} = extractAdrTitleAndStatus(fileName, content),
+            supersedes                 = this.parseSupersedes(content),
+            unresolvedReferences       = [],
+            edges                      = this.parseEdges(id, content, {...options, unresolvedReferences});
 
         return {
             adrNumber,
+            canonicalKey,
+            currentSlug,
+            hasAliasesRow           : aliasResult.hasAliasesRow,
+            hasCanonicalOpeningTable: aliasResult.hasCanonicalOpeningTable,
+            historicalAliases,
             id,
             rawStatus,
             source,
             status,
             supersedes,
             title,
-            edges: this.parseEdges(id, content)
+            edges,
+            unresolvedReferences
         };
     }
 
     /**
-     * Parses the ADR table's Supersedes cell into a reviewable array without attempting to
-     * interpret the prose into richer graph nodes.
+     * @summary Parses the ADR table's Supersedes cell into a reviewable array.
      * @param {String} content ADR markdown body.
      * @returns {String[]}
      * @protected
      */
     parseSupersedes(content) {
-        const match = content.match(SUPERSEDES_ROW_REGEX);
-        if (!match) {
-            return [];
+        return parseAdrSupersedes(content);
+    }
+
+    #resolveConversationEndpointId(kind, number, qualifiedOrgRepo = null, options = {}) {
+        const bareId = `${kind}-${number}`;
+
+        if (qualifiedOrgRepo) {
+            if (!FULL_NAMESPACE_REGEX.test(qualifiedOrgRepo)) return null;
+            const qualifiedId = qualifyOriginId(qualifiedOrgRepo.split('/').pop(), bareId);
+            if (GraphService.db?.nodes) GraphService.db.getAdjacentNodes(qualifiedId, 'both');
+            return qualifiedId;
         }
 
-        return match[1]
-            .split(/;|\n/)
-            .map(item => item.replace(/^\s*(?:[-*]\s+|\([a-z0-9]+\)\s+|[a-z0-9]+\.\s+)/i, '').trim())
-            .filter(Boolean);
+        const
+            repository       = options.repository || null,
+            assignedIdentity = options.assignedIdentity || null,
+            citationOrigin   = options.citationOrigin !== undefined
+                ? options.citationOrigin
+                : (options.movedCustody ? null : (assignedIdentity || repository));
+
+        if (options.movedCustody && !citationOrigin) {
+            if (Array.isArray(options.unresolvedReferences)) {
+                options.unresolvedReferences.push({kind, number, raw: `#${number}`, reasonCode: 'MISSING_CITATION_ORIGIN'});
+            }
+            return null;
+        }
+
+        const
+            originNamespace = citationOrigin?.namespace || CORPUS_GRAPH_ORIGIN,
+            candidateId     = qualifyOriginId(originNamespace.split('/').pop(), bareId);
+
+        if (GraphService.db?.nodes) GraphService.db.getAdjacentNodes(candidateId, 'both');
+        return candidateId;
     }
 
     /**
-     * Extracts only the consumer-backed ADR edge taxonomy from deterministic textual anchors.
-     * @param {String} adrId Stable ADR node id (`adr-NNNN`).
+     * @summary Extracts only the consumer-backed ADR edge taxonomy from deterministic textual anchors.
+     * @param {String} adrId Stable ADR node id.
      * @param {String} content ADR markdown body.
+     * @param {Object} [options={}] Citation-origin options.
      * @returns {Object[]}
      * @protected
      */
-    parseEdges(adrId, content) {
-        const edges = new Map();
+    parseEdges(adrId, content, options = {}) {
+        const
+            edges     = new Map(),
+            cleanBody = stripMarkdownFences(content),
+            addEdge   = (source, target, type, properties = {}) => {
+                if (source && target) edges.set(`${source}|${target}|${type}`, {source, target, type, properties});
+            };
 
-        const addEdge = (source, target, type, properties = {}) => {
-            edges.set(`${source}|${target}|${type}`, {source, target, type, properties});
-        };
-
-        for (const match of content.matchAll(ISSUE_REF_REGEX)) {
-            const issueId = `issue-${match[1]}`;
-            addEdge(adrId, issueId, ADR_EDGE_TYPES.GOVERNS);
-            addEdge(issueId, adrId, ADR_EDGE_TYPES.CITES_AUTHORITY);
+        for (const match of cleanBody.matchAll(ISSUE_LINK_REF_REGEX)) {
+            const issueId = this.#resolveConversationEndpointId('issue', match[2], match[1], options);
+            if (issueId) {
+                addEdge(adrId, issueId, ADR_EDGE_TYPES.GOVERNS);
+                addEdge(issueId, adrId, ADR_EDGE_TYPES.CITES_AUTHORITY);
+            }
         }
 
-        for (const match of content.matchAll(PR_REF_REGEX)) {
-            addEdge(`pr-${match[1]}`, adrId, ADR_EDGE_TYPES.IMPLEMENTS_DECISION);
+        for (const match of cleanBody.matchAll(PR_LINK_REF_REGEX)) {
+            const prId = this.#resolveConversationEndpointId('pr', match[2], match[1], options);
+            if (prId) addEdge(prId, adrId, ADR_EDGE_TYPES.IMPLEMENTS_DECISION);
         }
 
-        for (const match of content.matchAll(SESSION_REF_REGEX)) {
+        const proseWithoutRepoLinks = cleanBody.replace(ISSUE_LINK_REF_REGEX, ' ').replace(PR_LINK_REF_REGEX, ' ');
+
+        for (const match of proseWithoutRepoLinks.matchAll(ISSUE_KEYWORD_REF_REGEX)) {
+            const issueId = this.#resolveConversationEndpointId('issue', match[2] || match[3], match[1] || null, options);
+            if (issueId) {
+                addEdge(adrId, issueId, ADR_EDGE_TYPES.GOVERNS);
+                addEdge(issueId, adrId, ADR_EDGE_TYPES.CITES_AUTHORITY);
+            }
+        }
+
+        for (const match of proseWithoutRepoLinks.matchAll(PR_KEYWORD_REF_REGEX)) {
+            const prId = this.#resolveConversationEndpointId('pr', match[2] || match[3], match[1] || null, options);
+            if (prId) addEdge(prId, adrId, ADR_EDGE_TYPES.IMPLEMENTS_DECISION);
+        }
+
+        for (const match of cleanBody.matchAll(SESSION_REF_REGEX)) {
             addEdge(adrId, `session:${match[1]}`, ADR_EDGE_TYPES.GRADUATED_FROM);
         }
 
-        for (const match of content.matchAll(CONCEPT_REF_REGEX)) {
-            // Route through the concept-spine SSOT so ADR CODIFIES_CONCEPT edges target the same canonical
-            // node the session/mailbox mints do (`GoldenPath` → `golden-path`); keep the raw ref if the
-            // canonicalization comes back empty — never drop the edge (Contract Ledger fallback).
+        for (const match of cleanBody.matchAll(CONCEPT_REF_REGEX)) {
             addEdge(adrId, canonicalizeConceptId(match[1]) || match[1], ADR_EDGE_TYPES.CODIFIES_CONCEPT);
         }
 
@@ -195,140 +627,533 @@ class AdrIngestor extends Base {
     }
 
     /**
-     * Ensures edge endpoints exist before insertion. The graph storage layer enforces foreign
-     * keys for both endpoint columns, so deterministic ADR edges seed only minimal stubs when
-     * the richer issue/PR/session/concept ingestors have not materialized a node yet.
-     * @param {Object[]} edges ADR edge rows to insert.
-     * @protected
+     * @summary Checks whether a candidate graph endpoint ID is an admitted `ADR` in the catalog or
+     * persisted graph with `adrAuthority.admitted === true`.
+     * @param {String} id
+     * @returns {Boolean}
      */
-    ensureEdgeEndpointsExist(edges) {
-        for (const edge of edges) {
-            this.ensureNodeExists(edge.source);
-            this.ensureNodeExists(edge.target);
+    isAdmittedAdrEndpoint(id) {
+        if (typeof id !== 'string' || !id) return false;
+        this.rehydrateCatalogFromGraph();
+        if (this.admissionCatalog.has(id)) return true;
+
+        for (const record of this.admissionCatalog.values()) {
+            if (record.aliasBindings?.some(b =>
+                `${b.namespace}#adr:${b.value}` === id ||
+                `${b.forge}/${b.namespace}#adr:${b.value}` === id ||
+                (b.kind === 'legacy-number' && (`${b.namespace}#adr-${b.value}` === id || `${b.forge}/${b.namespace}#adr-${b.value}` === id))
+            )) {
+                return true;
+            }
         }
+
+        if (GraphService.db?.nodes) {
+            GraphService.db.getAdjacentNodes(id, 'both');
+            const existing = GraphService.db.nodes.get(id);
+            if (existing) {
+                const
+                    label = existing.isRecord ? existing.get('label') : existing.label,
+                    props = existing.isRecord ? existing.get('properties') : existing.properties;
+                if (label === 'ADR' && props?.adrAuthority?.admitted === true) return true;
+            }
+        }
+
+        return false;
     }
 
     /**
-     * Creates a minimal node stub for an edge endpoint if no richer node is already present.
-     * @param {String} id Graph node id.
-     * @protected
+     * @summary Derives canonical graph endpoint typing (`ADR`, `ISSUE`, `PULL_REQUEST`, `DISCUSSION`,
+     * `SESSION`, `CONCEPT`) from admitted authority and conversation-origin grammar.
+     * @param {String} id Candidate endpoint id.
+     * @returns {String|null}
      */
+    resolveEndpointType(id) {
+        if (typeof id !== 'string' || !id) return null;
+
+        if (GraphService.db?.nodes) {
+            GraphService.db.getAdjacentNodes(id, 'both');
+            const existing = GraphService.db.nodes.get(id);
+            if (existing) return existing.isRecord ? existing.get('label') : existing.label;
+        }
+
+        if (this.isAdmittedAdrEndpoint(id))    return 'ADR';
+        if (ADR_SHAPED_ID_REGEX.test(id))      return null;
+        if (QUALIFIED_ISSUE_NODE_REX.test(id)) return 'ISSUE';
+        if (QUALIFIED_PR_NODE_REX.test(id))    return 'PULL_REQUEST';
+        if (QUALIFIED_DISC_NODE_REX.test(id))  return 'DISCUSSION';
+        if (SESSION_NODE_REGEX.test(id))       return 'SESSION';
+        if (/[#/:]/.test(id))                  return null;
+
+        return 'CONCEPT';
+    }
+
+    ensureEdgeEndpointsExist(edges) {
+        const validEdges = [];
+        for (const edge of edges) {
+            if (this.ensureNodeExists(edge.source) && this.ensureNodeExists(edge.target)) {
+                validEdges.push(edge);
+            }
+        }
+        return validEdges;
+    }
+
     ensureNodeExists(id) {
         GraphService.db.getAdjacentNodes(id, 'both');
+        const existing = GraphService.db.nodes.get(id);
+        if (existing) return existing;
 
-        if (GraphService.db.nodes.get(id)) {
-            return;
-        }
+        const type = this.resolveEndpointType(id);
+        if (!type) return null;
 
-        let type = 'CONCEPT';
-        if (id.startsWith('adr-')) {
-            type = 'ADR';
-        } else if (id.startsWith('issue-')) {
-            type = 'ISSUE';
-        } else if (id.startsWith('pr-')) {
-            type = 'PULL_REQUEST';
-        } else if (id.startsWith('discussion-')) {
-            type = 'DISCUSSION';
-        } else if (id.startsWith('session:')) {
-            type = 'SESSION';
-        }
-
-        GraphService.upsertNode({
-            id,
-            type,
-            name      : id,
-            properties: {isAdrEdgeStub: true}
-        });
+        GraphService.upsertNode({id, type, name: id, properties: {isAdrEdgeStub: true}});
+        return GraphService.db.nodes.get(id);
     }
 
-    /**
-     * Removes and replaces all ADR-taxonomy edges incident to one ADR node.
-     * @param {String} adrId Stable ADR node id.
-     * @param {Object[]} edges Replacement edge rows.
-     * @protected
-     */
     replaceAdrEdges(adrId, edges) {
         const
             db            = GraphService.db,
             adrEdgeTypes  = new Set(Object.values(ADR_EDGE_TYPES)),
-            existingEdges = db.edges.items.slice(),
-            edgesToRemove = existingEdges.filter(edge =>
+            edgesToRemove = db.edges.items.slice().filter(edge =>
                 adrEdgeTypes.has(edge.type) && (edge.source === adrId || edge.target === adrId)
             );
 
-        if (edgesToRemove.length > 0) {
-            db.edges.remove(edgesToRemove);
-        }
+        if (edgesToRemove.length > 0) db.edges.remove(edgesToRemove);
 
-        this.ensureEdgeEndpointsExist(edges);
-
-        for (const edge of edges) {
-            db.addEdge(edge);
-        }
+        const validEdges = this.ensureEdgeEndpointsExist(edges);
+        for (const edge of validEdges) db.addEdge(edge);
+        return validEdges.length;
     }
 
     /**
-     * Main entry point. Scans local ADR markdown files, upserts `ADR` nodes, and refreshes the
-     * deterministic ADR edge taxonomy. A redirect left at a moved record's old path is not a record, so
-     * it is neither ingested nor counted in `adrsProcessed`.
-     * @param {Object} [options]
-     * @param {String} [options.decisionsDir] Absolute or repo-relative ADR directory override.
-     * @param {String} [options.sourceRoot=process.cwd()] Source-root used for repo-relative paths.
-     * @returns {Promise<Object>} `{adrsProcessed, adrsUpserted, adrsSkipped, edgesReplaced, errors}`
+     * @summary Inventories every graph node that references `vectorId` as its `semanticVectorId`.
+     * @param {String} vectorId
+     * @returns {Array<{nodeId: String, label: String, isAdmittedAdr: Boolean}>}
      */
-    async syncAdrsToGraph({decisionsDir = 'learn/agentos/decisions', sourceRoot = process.cwd()} = {}) {
+    inventoryVectorOwners(vectorId) {
+        if (typeof vectorId !== 'string' || !vectorId || !GraphService.db?.nodes) return [];
+        const owners = new Map();
+
+        for (const node of GraphService.db.nodes.items) {
+            const
+                nodeId = node.isRecord ? node.get('id') : node.id,
+                label  = node.isRecord ? node.get('label') : node.label,
+                props  = (node.isRecord ? node.get('properties') : node.properties) || {};
+
+            if (props.semanticVectorId === vectorId) {
+                owners.set(nodeId, {nodeId, label, isAdmittedAdr: label === 'ADR' && props.adrAuthority?.admitted === true});
+            }
+        }
+
+        const sqlite = GraphService.db.storage?.db;
+        if (sqlite) {
+            try {
+                const rows = sqlite.prepare(`
+                    SELECT id, json_extract(data, '$.label') AS label, data
+                    FROM Nodes WHERE json_extract(data, '$.properties.semanticVectorId') = ?
+                `).all(vectorId);
+                for (const row of rows) {
+                    if (!owners.has(row.id)) {
+                        let parsed = {};
+                        try { parsed = JSON.parse(row.data); } catch {}
+                        const label = row.label || parsed.label || 'NODE';
+                        owners.set(row.id, {
+                            nodeId       : row.id,
+                            label,
+                            isAdmittedAdr: label === 'ADR' && parsed.properties?.adrAuthority?.admitted === true
+                        });
+                    }
+                }
+            } catch {}
+        }
+
+        return Array.from(owners.values());
+    }
+
+    #isReaderAuthorizedForRecord(record, context = {}) {
+        if (!record) return false;
+        if (typeof context.isAuthorized === 'function') return Boolean(context.isAuthorized(record));
+
+        if (Array.isArray(context.authorizedRepositoryIds)) {
+            const
+                allowedIds = new Set(context.authorizedRepositoryIds.map(String)),
+                repoId     = record.sourceTuple?.repositoryId || record.assignmentEvidence?.repositoryId;
+            if (!allowedIds.has(String(repoId))) return false;
+        }
+
+        if (Array.isArray(context.authorizedNamespaces)) {
+            const
+                allowedNs = new Set(context.authorizedNamespaces.map(ns => String(ns).toLowerCase())),
+                ns        = (record.sourceTuple?.namespace || record.assignmentEvidence?.namespace || '').toLowerCase();
+            if (!allowedNs.has(ns)) return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @summary Resolves a human or machine ADR citation against the admitted catalog using evidenced
+     * citation context, forge-adapter repository identity lookup, rename/reuse conflict rules, and
+     * reader authorization.
+     * @param {String} reference Raw citation string.
+     * @param {Object} [context={}] Citation context and reader authorization options.
+     * @returns {Object}
+     */
+    resolveAdrReference(reference, context = {}) {
+        this.rehydrateCatalogFromGraph();
+        const raw = typeof reference === 'string' ? reference.trim() : '';
+        if (!raw) return unresolvedResult('EMPTY_REFERENCE');
+
+        if (raw.startsWith('adr:') && raw.split(':').length === 5) {
+            let parsedKey;
+            try {
+                parsedKey = parseCanonicalAdrKey(raw);
+            } catch (e) {
+                return unresolvedResult(e.code || 'ADR_INVALID_CANONICAL_KEY');
+            }
+            const record = this.admissionCatalog.get(parsedKey.canonicalKey);
+            if (!record || !this.#isReaderAuthorizedForRecord(record, context)) {
+                return unresolvedResult('NOT_FOUND');
+            }
+            return resolvedResult(record);
+        }
+
+        const parsedRef = parseHumanOrNumericAdrReference(raw);
+        if (!parsedRef.ok) return unresolvedResult(parsedRef.reasonCode);
+
+        const
+            {explicitForge, explicitNamespace, targetKind, targetValue} = parsedRef,
+            surfaceContext                                              = extractCitationSurfaceContext(context),
+            effectiveForge                                              = explicitForge || surfaceContext.forge,
+            hasRepositoryContext                                        = Boolean(explicitNamespace || surfaceContext.repositoryId || surfaceContext.namespace);
+
+        if (!hasRepositoryContext) {
+            const matchingAuthorized = [];
+            for (const record of this.admissionCatalog.values()) {
+                if (!this.#isReaderAuthorizedForRecord(record, context)) continue;
+                const matches = record.aliasBindings?.some(
+                    b => b.kind === targetKind && b.value === targetValue && (!effectiveForge || b.forge === effectiveForge)
+                ) || (targetKind === 'legacy-number' && record.adrNumber === targetValue && !record.assignmentEvidence?.repositoryId);
+                if (matches) matchingAuthorized.push(record.canonicalKey);
+            }
+
+            if (matchingAuthorized.length === 1 &&
+                matchingAuthorized[0] === `adr-${targetValue}` &&
+                !context.surface &&
+                !context.requireRepositoryContext) {
+                return resolvedResult(this.admissionCatalog.get(matchingAuthorized[0]));
+            }
+            return unresolvedResult('MISSING_REPOSITORY_CONTEXT', matchingAuthorized);
+        }
+
+        if (!effectiveForge) return unresolvedResult('MISSING_FORGE_CONTEXT');
+
+        const
+            targetNamespace   = explicitNamespace || surfaceContext.namespace,
+            lowerTargetNs     = targetNamespace ? targetNamespace.toLowerCase() : null,
+            forgeMap          = this.forgeDirectory.get(effectiveForge),
+            adapterResolution = lowerTargetNs && forgeMap ? forgeMap.get(lowerTargetNs) : null,
+            currentOccupantId = (!explicitNamespace && surfaceContext.repositoryId)
+                ? surfaceContext.repositoryId
+                : (adapterResolution?.repositoryId || null),
+            namespaceBindings = [],
+            repoIdBindings    = [];
+
+        for (const record of this.admissionCatalog.values()) {
+            for (const binding of record.aliasBindings || []) {
+                if (binding.forge !== effectiveForge || binding.kind !== targetKind || binding.value !== targetValue) continue;
+                if (lowerTargetNs && binding.namespace.toLowerCase() === lowerTargetNs) namespaceBindings.push({binding, record});
+                if (currentOccupantId && binding.repositoryId === currentOccupantId) repoIdBindings.push({binding, record});
+            }
+        }
+
+        if (lowerTargetNs && currentOccupantId) {
+            const conflictingHistorical = namespaceBindings.filter(entry => entry.binding.repositoryId !== currentOccupantId);
+            if (conflictingHistorical.length > 0) {
+                const candidateSet = new Set();
+                for (const entry of [...conflictingHistorical, ...namespaceBindings.filter(e => e.binding.repositoryId === currentOccupantId)]) {
+                    if (this.#isReaderAuthorizedForRecord(entry.record, context)) candidateSet.add(entry.record.canonicalKey);
+                }
+                const authorizedCandidates = Array.from(candidateSet);
+                if (authorizedCandidates.length === 0) return unresolvedResult('NOT_FOUND');
+
+                return {
+                    status              : 'conflict',
+                    resolved            : false,
+                    canonicalKey        : null,
+                    identityResolved    : false,
+                    documentAvailable   : false,
+                    requiresCanonicalKey: true,
+                    candidates          : authorizedCandidates,
+                    reasonCode          : 'RESERVED_NAMESPACE_OCCUPANCY_CONFLICT'
+                };
+            }
+        }
+
+        let matchedEntries = [];
+        if (lowerTargetNs) {
+            matchedEntries = namespaceBindings;
+            if (matchedEntries.length === 0 && currentOccupantId && adapterResolution) {
+                matchedEntries = repoIdBindings.filter(entry =>
+                    entry.record.provenance?.repositoryRenames?.some(
+                        r => r.forge === effectiveForge &&
+                             r.repositoryId === currentOccupantId &&
+                             (r.currentNamespace.toLowerCase() === lowerTargetNs || r.previousNamespace.toLowerCase() === lowerTargetNs)
+                    )
+                );
+            }
+        } else if (currentOccupantId) {
+            matchedEntries = repoIdBindings;
+        }
+
+        const
+            authorizedRecords = [],
+            seenKeys          = new Set();
+
+        for (const entry of matchedEntries) {
+            if (!seenKeys.has(entry.record.canonicalKey) && this.#isReaderAuthorizedForRecord(entry.record, context)) {
+                seenKeys.add(entry.record.canonicalKey);
+                authorizedRecords.push(entry.record);
+            }
+        }
+
+        if (authorizedRecords.length === 0) return unresolvedResult('NOT_FOUND');
+        if (authorizedRecords.length > 1)   return unresolvedResult('AMBIGUOUS_REFERENCE', authorizedRecords.map(r => r.canonicalKey));
+
+        return resolvedResult(authorizedRecords[0]);
+    }
+
+    /**
+     * @summary Reconstructs or reconciles an ADR record when declared sources are lost or when
+     * rebuilding projections from source plus retained admission evidence.
+     * @param {Object} [params={}]
+     * @returns {Object}
+     */
+    reconcileSourceAndEvidence({retainedRecord = null, survivingSource = null} = {}) {
+        if (!retainedRecord || !retainedRecord.canonicalKey || !retainedRecord.assignmentEvidence?.repositoryId) {
+            throw createCodedError(
+                'ADR_ADMISSION_EVIDENCE_MISSING',
+                'Cannot reconstruct ADR authority without retained assignment and scope admission evidence.'
+            );
+        }
+
+        if (!survivingSource || !survivingSource.content) {
+            const staleRecord = {...retainedRecord, stale: true, documentAvailable: false, kbAvailable: false};
+            this.admissionCatalog.set(staleRecord.canonicalKey, staleRecord);
+
+            const existingNode = GraphService.db?.nodes?.get(staleRecord.canonicalKey);
+            if (existingNode) {
+                const props = (existingNode.isRecord ? existingNode.get('properties') : existingNode.properties) || {};
+                GraphService.upsertNode({
+                    id        : staleRecord.canonicalKey,
+                    type      : 'ADR',
+                    name      : props.title || staleRecord.title,
+                    properties: {
+                        ...props,
+                        stale             : true,
+                        documentAvailable : false,
+                        adrAdmissionRecord: staleRecord,
+                        adrAuthority      : {
+                            ...(props.adrAuthority || {}),
+                            admitted         : true,
+                            canonicalKey     : staleRecord.canonicalKey,
+                            stale            : true,
+                            documentAvailable: false
+                        }
+                    }
+                });
+            }
+
+            return {
+                status           : 'retained-stale',
+                canonicalKey     : staleRecord.canonicalKey,
+                identityResolved : true,
+                documentAvailable: false,
+                kbAvailable      : false,
+                stale            : true,
+                record           : staleRecord
+            };
+        }
+
+        return {
+            status           : 'available',
+            canonicalKey     : retainedRecord.canonicalKey,
+            identityResolved : true,
+            documentAvailable: true,
+            kbAvailable      : true,
+            stale            : false,
+            record           : retainedRecord
+        };
+    }
+
+    #resolveCandidateIdentity(params) {
+        return resolveAdrCandidateIdentity({
+            ...params,
+            admissionCatalog: this.admissionCatalog,
+            onRegisterRepo  : repo => this.registerForgeRepository(repo)
+        });
+    }
+
+    /**
+     * @summary Scans local ADR markdown files (or a multi-repository `sources` batch),
+     * rehydrates persisted admission records from the graph, validates canonical keys and
+     * opening-table `Aliases` history, enforces batch and owner conflict refusal, upserts `ADR`
+     * nodes without stealing shared summary vectors, and refreshes the deterministic ADR edge taxonomy.
+     * @param {Object} [options={}]
+     * @returns {Promise<Object>}
+     */
+    async syncAdrsToGraph(options = {}) {
+        const {
+            decisionsDir          = 'learn/agentos/decisions',
+            sourceRoot            = process.cwd(),
+            repository            = null,
+            sources               = null,
+            custodyTransitions    = [],
+            sourceLineageEvidence = [],
+            legacyManifest        = null
+        } = options;
+
+        this.rehydrateCatalogFromGraph();
+
         const stats = {
-            adrsProcessed: 0,
-            adrsUpserted : 0,
-            adrsSkipped  : 0,
-            edgesReplaced: 0,
-            errors       : []
+            adrsProcessed         : 0,
+            adrsUpserted          : 0,
+            adrsSkipped           : 0,
+            edgesReplaced         : 0,
+            refused               : [],
+            preservedSharedVectors: [],
+            staleRecords          : [],
+            errors                : []
         };
 
         try {
             const
-                rootDir = path.resolve(sourceRoot),
-                adrDir  = path.resolve(rootDir, decisionsDir);
+                sourceSpecs          = Array.isArray(sources) && sources.length > 0 ? sources : [{decisionsDir, sourceRoot, repository}],
+                candidates           = [],
+                scannedRepoScopes    = [],
+                seenKeysInScanByRepo = new Map();
 
-            if (!fs.existsSync(adrDir)) {
-                stats.errors.push(`[input] ADR directory not found: ${adrDir}`);
-                return stats;
-            }
+            for (const spec of sourceSpecs) {
+                const
+                    specRootDir      = path.resolve(spec.sourceRoot || sourceRoot),
+                    specDecisionsDir = path.resolve(specRootDir, spec.decisionsDir || 'learn/agentos/decisions'),
+                    specRepo         = spec.repository || null;
 
-            const files = (await fs.promises.readdir(adrDir)).filter(file => ADR_FILE_REGEX.test(file)).sort();
+                if (specRepo) {
+                    try {
+                        validateAdrIdentityFields({
+                            forge       : specRepo.forge || 'github.com',
+                            repositoryId: specRepo.repositoryId,
+                            namespace   : specRepo.namespace,
+                            number      : '0001'
+                        });
+                    } catch (e) {
+                        stats.errors.push(`[repository] ${e.message}`);
+                        stats.refused.push({code: e.code || 'ADR_INVALID_IDENTITY_FIELD', message: e.message});
+                        continue;
+                    }
 
-            // ADR nodes embed into the graph collection so they surface in the candidate-pool
-            // semantic search (the graph collection's vector query — e.g. GoldenPathSynthesizer's
-            // hybrid traversal). Without this the node is inserted but inert to vector retrieval.
-            // (NB: `search_nodes` is SQLite fuzzy text + `query_hybrid_graph` is topology-by-node-id;
-            // neither is the vector path — the collection query is.) Mirrors IssueIngestor.
-            const nodesCollection = StorageRouter ? await StorageRouter.getGraphCollection() : null;
+                    const repoScopeKey = `${specRepo.forge || 'github.com'}:${specRepo.repositoryId}`;
+                    scannedRepoScopes.push({forge: specRepo.forge || 'github.com', repositoryId: specRepo.repositoryId, namespace: specRepo.namespace, repoScopeKey});
+                    if (!seenKeysInScanByRepo.has(repoScopeKey)) seenKeysInScanByRepo.set(repoScopeKey, new Set());
+                }
 
-            for (const file of files) {
-                try {
+                if (!fs.existsSync(specDecisionsDir)) {
+                    stats.errors.push(`[input] ADR directory not found: ${specDecisionsDir}`);
+                    continue;
+                }
+
+                const files = (await fs.promises.readdir(specDecisionsDir)).filter(file => ADR_FILE_REGEX.test(file)).sort();
+
+                for (const file of files) {
                     const
-                        filePath = path.join(adrDir, file),
+                        filePath = path.join(specDecisionsDir, file),
                         content  = await fs.promises.readFile(filePath, 'utf8');
 
-                    // A redirect left at a moved record's old path is not a record: no node, no edges
                     if (isAdrRedirect(content)) continue;
-
                     stats.adrsProcessed++;
 
-                    const
-                        source       = path.relative(rootDir, filePath),
-                        adr          = this.parseAdr(file, content, source),
-                        payloadHash  = this.computePayloadHash(adr),
-                        existingNode = GraphService.db.nodes.get(adr.id);
+                    try {
+                        const
+                            relSource         = path.relative(specRootDir, filePath),
+                            {adrNumber, slug} = parseAdrFilename(file),
+                            aliasInfo         = parseAdrOpeningAliases(content),
+                            identityInfo      = this.#resolveCandidateIdentity({
+                                adrNumber,
+                                currentSlug       : slug,
+                                historicalAliases : aliasInfo.aliases,
+                                sourceRepo        : specRepo,
+                                custodyTransitions: spec.custodyTransitions || custodyTransitions,
+                                legacyManifest    : spec.legacyManifest || legacyManifest
+                            }),
+                            adr = this.parseAdr(file, content, relSource, {
+                                canonicalKey    : specRepo ? identityInfo.canonicalKey : null,
+                                assignedIdentity: identityInfo.assignedIdentity,
+                                repository      : specRepo,
+                                citationOrigin  : spec.citationOrigin !== undefined ? spec.citationOrigin : specRepo?.citationOrigin,
+                                movedCustody    : Boolean(spec.movedCustody ?? specRepo?.movedCustody ?? identityInfo.isCustodyMove)
+                            });
 
-                    // The vector tracks the FULL document (title + body); `payloadHash` deliberately
-                    // excludes the body, so a body-only edit must still re-embed. Compute embed
-                    // freshness first (an md5 over the document) so the skip below cannot strand a
-                    // stale vector behind an unchanged-metadata skip.
-                    let docText = null, contentHash = null, embedCurrent = false;
+                        candidates.push({file, filePath, content, relSource, specRepo, adr, identityInfo});
+                    } catch (e) {
+                        stats.errors.push(`[${file}] ${e.message}`);
+                        stats.refused.push({file, code: e.code || 'ADR_PARSE_ERROR', message: e.message});
+                        logger.warn(`[AdrIngestor] Failed to parse ADR '${file}': ${e.message}`);
+                    }
+                }
+            }
+
+            const
+                refusedCandidates = new Set(),
+                refuseCandidate   = (cand, code, message) => {
+                    if (refusedCandidates.has(cand)) return;
+                    refusedCandidates.add(cand);
+                    stats.errors.push(`[${cand.file}] ${message}`);
+                    stats.refused.push({file: cand.file, canonicalKey: cand.adr.canonicalKey, code, message});
+                    logger.warn(`[AdrIngestor] Refused ADR '${cand.file}' (${code}): ${message}`);
+                };
+
+            evaluateAdrCandidateConflicts({
+                candidates,
+                admissionCatalog       : this.admissionCatalog,
+                ensureReservationBucket: (f, r) => this.#ensureReservationBucket(f, r),
+                sourceLineageEvidence,
+                legacyManifest,
+                refusedCandidates,
+                refuseCandidate
+            });
+
+            const nodesCollection = StorageRouter ? await StorageRouter.getGraphCollection() : null;
+
+            for (const cand of candidates) {
+                if (refusedCandidates.has(cand)) continue;
+
+                try {
+                    const
+                        {content, specRepo, adr, identityInfo} = cand,
+                        existingRecord                         = identityInfo.existingRecord,
+                        payloadHash                            = this.computePayloadHash(adr),
+                        existingNode                           = GraphService.db.nodes.get(adr.id),
+                        docText                                = `${adr.title}\n\n${content}`,
+                        contentHash                            = crypto.createHash('md5').update(docText).digest('hex');
+
+                    if (specRepo) {
+                        seenKeysInScanByRepo.get(`${specRepo.forge || 'github.com'}:${specRepo.repositoryId}`)?.add(adr.canonicalKey);
+                    }
+
+                    const prevVectorId = existingNode?.properties?.semanticVectorId;
+                    if (prevVectorId && prevVectorId !== adr.id) {
+                        const nonAdrOwners = this.inventoryVectorOwners(prevVectorId).filter(o => o.nodeId !== adr.id);
+                        if (nonAdrOwners.length > 0 || prevVectorId.startsWith('summary_')) {
+                            stats.preservedSharedVectors.push({
+                                adrId         : adr.id,
+                                sharedVectorId: prevVectorId,
+                                retainedOwners: nonAdrOwners.map(o => o.nodeId)
+                            });
+                        }
+                    }
+
+                    let embedCurrent = false;
                     if (nodesCollection) {
-                        docText     = `${adr.title}\n\n${content}`;
-                        contentHash = crypto.createHash('md5').update(docText).digest('hex');
                         try {
                             const existing = await nodesCollection.get({ids: [adr.id], include: ['metadatas']});
                             embedCurrent = existing?.ids?.length > 0 && (existing.metadatas[0] || {}).hash === contentHash;
@@ -337,47 +1162,126 @@ class AdrIngestor extends Base {
                         }
                     }
 
-                    // Skip only when BOTH the node metadata AND the embedded document are current.
-                    if (existingNode?.properties?.payloadHash === payloadHash && (embedCurrent || !nodesCollection)) {
+                    const
+                        forge        = specRepo?.forge || identityInfo.assignedIdentity?.forge || 'github.com',
+                        sourceRepoId = specRepo?.repositoryId || null,
+                        sourceNs     = specRepo?.namespace || null,
+                        record       = buildAdmittedAdrRecord({existingRecord, adr, identityInfo, specRepo, payloadHash, contentHash});
+
+                    if (specRepo) {
+                        const bucket = this.#ensureReservationBucket(forge, sourceRepoId);
+                        bucket.numbers.add(adr.adrNumber);
+
+                        for (const b of record.aliasBindings) {
+                            if (b.kind === 'slug' && b.forge === forge && b.repositoryId === sourceRepoId) {
+                                b.current = (b.value === adr.currentSlug && b.namespace.toLowerCase() === sourceNs.toLowerCase());
+                            }
+                        }
+
+                        this.#addAliasBinding(record, bucket, {kind: 'slug', value: adr.currentSlug, forge, repositoryId: sourceRepoId, namespace: sourceNs, targetKey: adr.canonicalKey, current: true});
+                        this.#addAliasBinding(record, bucket, {kind: 'legacy-number', value: adr.adrNumber, forge, repositoryId: sourceRepoId, namespace: sourceNs, targetKey: adr.canonicalKey, current: true});
+
+                        for (const histSlug of adr.historicalAliases) {
+                            const alreadyAdmitted = record.aliasBindings.some(b => b.kind === 'slug' && b.value === histSlug);
+                            if (!alreadyAdmitted && !identityInfo.isCustodyMove) {
+                                this.#addAliasBinding(record, bucket, {kind: 'slug', value: histSlug, forge, repositoryId: sourceRepoId, namespace: sourceNs, targetKey: adr.canonicalKey, current: false});
+                            }
+                        }
+
+                        if (record.assignmentEvidence?.repositoryId && record.assignmentEvidence.repositoryId !== sourceRepoId) {
+                            this.#ensureReservationBucket(record.assignmentEvidence.forge || forge, record.assignmentEvidence.repositoryId).numbers.add(adr.adrNumber);
+                        }
+                    } else {
+                        this.#addAliasBinding(record, null, {kind: 'slug', value: adr.currentSlug, forge: 'github.com', repositoryId: null, namespace: CORPUS_GRAPH_ORIGIN, targetKey: adr.canonicalKey, current: true});
+                        this.#addAliasBinding(record, null, {kind: 'legacy-number', value: adr.adrNumber, forge: 'github.com', repositoryId: null, namespace: CORPUS_GRAPH_ORIGIN, targetKey: adr.canonicalKey, current: true});
+                    }
+
+                    this.admissionCatalog.set(adr.canonicalKey, record);
+
+                    const
+                        existingLabel   = existingNode ? (existingNode.isRecord ? existingNode.get('label') : existingNode.label) : null,
+                        sourceUnchanged = existingNode?.properties?.payloadHash === payloadHash &&
+                                           existingNode?.properties?.source === adr.source &&
+                                           existingLabel === 'ADR' &&
+                                           existingNode?.properties?.semanticVectorId === adr.id &&
+                                           existingNode?.properties?.stale !== true;
+
+                    if (sourceUnchanged && (embedCurrent || !nodesCollection)) {
                         stats.adrsSkipped++;
                         continue;
                     }
+
+                    const renameVerified = Boolean(
+                        existingRecord &&
+                        (!specRepo || existingRecord.sourceTuple?.repositoryId === specRepo.repositoryId) &&
+                        existingRecord.sourceTuple?.path !== adr.source
+                    );
 
                     GraphService.upsertNode({
                         id        : adr.id,
                         type      : 'ADR',
                         name      : adr.title,
                         properties: {
-                            adrNumber     : adr.adrNumber,
-                            adrNumberValue: Number(adr.adrNumber),
+                            adrAdmissionRecord: record,
+                            adrAuthority      : {
+                                admitted                 : true,
+                                adrNumber                : adr.adrNumber,
+                                canonicalKey             : adr.canonicalKey,
+                                custodyTransitionVerified: Boolean(identityInfo.custodyTransitionVerified),
+                                documentAvailable        : true,
+                                forge                    : specRepo?.forge || null,
+                                namespace                : specRepo?.namespace || null,
+                                renameVerified,
+                                repositoryId             : specRepo?.repositoryId || null,
+                                revision                 : specRepo?.revision || null,
+                                semanticVectorId         : adr.id,
+                                source                   : adr.source,
+                                sourceHash               : payloadHash,
+                                stale                    : false
+                            },
+                            adrNumber        : adr.adrNumber,
+                            adrNumberValue   : Number(adr.adrNumber),
+                            canonicalKey     : adr.canonicalKey,
+                            currentSlug      : adr.currentSlug,
+                            documentAvailable: true,
+                            historicalAliases: adr.historicalAliases,
                             payloadHash,
-                            rawStatus     : adr.rawStatus,
-                            // The node points at its own document vector (keyed by the ADR id in the
-                            // graph collection) so a consumer reading the SQLite node knows it is embedded.
-                            semanticVectorId: adr.id,
-                            source          : adr.source,
-                            status          : adr.status,
-                            supersedes      : adr.supersedes,
-                            title           : adr.title
+                            rawStatus        : adr.rawStatus,
+                            semanticVectorId : adr.id,
+                            source           : adr.source,
+                            stale            : false,
+                            status           : adr.status,
+                            supersedes       : adr.supersedes,
+                            title            : adr.title
                         }
                     });
 
-                    // Re-embed the document whenever its content changed (the collection auto-embeds
-                    // the `documents` text; upsert-by-id keeps it idempotent).
                     if (nodesCollection && !embedCurrent) {
                         await nodesCollection.upsert({
                             ids      : [adr.id],
                             documents: [docText],
-                            metadatas: [{hash: contentHash, title: adr.title, type: 'ADR'}]
+                            metadatas: [{canonicalKey: adr.canonicalKey, hash: contentHash, title: adr.title, type: 'ADR'}]
                         });
                     }
 
                     stats.adrsUpserted++;
-                    this.replaceAdrEdges(adr.id, adr.edges);
-                    stats.edgesReplaced += adr.edges.length;
+                    stats.edgesReplaced += this.replaceAdrEdges(adr.id, adr.edges);
                 } catch (e) {
-                    stats.errors.push(`[${file}] ${e.message}`);
-                    logger.warn(`[AdrIngestor] Failed to ingest ADR '${file}': ${e.message}`);
+                    stats.errors.push(`[${cand.file}] ${e.message}`);
+                    logger.warn(`[AdrIngestor] Failed to ingest ADR '${cand.file}': ${e.message}`);
+                }
+            }
+
+            for (const scope of scannedRepoScopes) {
+                const seenKeys = seenKeysInScanByRepo.get(scope.repoScopeKey) || new Set();
+                for (const record of this.admissionCatalog.values()) {
+                    if (record.sourceTuple?.forge === scope.forge &&
+                        record.sourceTuple?.repositoryId === scope.repositoryId &&
+                        !seenKeys.has(record.canonicalKey)) {
+                        if (Array.from(refusedCandidates).some(c => c.adr.canonicalKey === record.canonicalKey)) continue;
+                        this.reconcileSourceAndEvidence({retainedRecord: record, survivingSource: null});
+                        stats.staleRecords.push(record.canonicalKey);
+                    }
                 }
             }
 
