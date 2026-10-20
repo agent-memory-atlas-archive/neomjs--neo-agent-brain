@@ -1,8 +1,179 @@
-import {test, expect}          from '@playwright/test';
-import fs                      from 'node:fs';
-import os                      from 'node:os';
-import path                    from 'node:path';
-import {readSeatSessionFolder} from '../../../../../../ai/services/fleet/seatSessionFolder.mjs';
+import {test, expect}                                     from '@playwright/test';
+import fs                                                 from 'node:fs';
+import os                                                 from 'node:os';
+import path                                               from 'node:path';
+import {convergeSeatSessionPreset, readSeatSessionFolder} from '../../../../../../ai/services/fleet/seatSessionFolder.mjs';
+
+/**
+ * @summary Converging a Claude Desktop seat's session preset to its provisioned checkout before spawn,
+ * and reading where the running seat's session opened from the seat's own profile.
+ */
+test.describe('convergeSeatSessionPreset — preset convergence before claude-desktop spawn (#1223)', () => {
+    const accountId = 'd6da8ba9-b0ba-403e-bb82-53fc76bc6a08';
+
+    let root, instanceHome, checkout, staleFolder, presetPath;
+
+    test.beforeEach(() => {
+        root         = fs.mkdtempSync(path.join(os.tmpdir(), 'seat-session-preset-'));
+        instanceHome = path.join(root, 'profile');
+        checkout     = path.join(root, 'agents', 'neo-fable-mnemosyne', 'neomjs', 'neo');
+        staleFolder  = path.join(root, 'agents', 'neo-fable', 'neomjs', 'neo');
+        presetPath   = path.join(instanceHome, 'ccd-session-presets.json');
+    });
+
+    test.afterEach(() => {
+        fs.rmSync(root, {recursive: true, force: true})
+    });
+
+    test('AC-1: rewrites a stale preset folder to the provisioned checkout and leaves an already-matching file byte-identical', () => {
+        fs.mkdirSync(instanceHome, {recursive: true});
+
+        const initial = `${JSON.stringify({
+            byAccount: {
+                [accountId]: {
+                    presets: [{
+                        id        : '78c5d999-a73b-4239-994f-70d2332da522',
+                        name      : 'neo',
+                        createdAt : 1789984863649,
+                        lastUsedAt: 1789984863649,
+                        target    : {
+                            kind: 'local',
+                            cwd : staleFolder
+                        }
+                    }],
+                    builtIns       : {},
+                    seededFromDraft: true
+                }
+            }
+        }, null, '\t')}\n`;
+
+        fs.writeFileSync(presetPath, initial, {mode: 0o600});
+
+        const updated = convergeSeatSessionPreset({instanceHome, cwd: checkout});
+
+        expect(updated).toEqual({path: presetPath, status: 'updated', cwd: checkout});
+
+        const afterUpdateBytes = fs.readFileSync(presetPath, 'utf8');
+        const parsed           = JSON.parse(afterUpdateBytes);
+
+        expect(parsed.byAccount[accountId].presets).toEqual([{
+            id        : '78c5d999-a73b-4239-994f-70d2332da522',
+            name      : 'neo',
+            createdAt : 1789984863649,
+            lastUsedAt: 1789984863649,
+            target    : {
+                kind: 'local',
+                cwd : checkout
+            }
+        }]);
+
+        const statBeforeSecondCall = fs.statSync(presetPath);
+        const unchanged            = convergeSeatSessionPreset({instanceHome, cwd: checkout});
+        const statAfterSecondCall  = fs.statSync(presetPath);
+
+        expect(unchanged).toEqual({path: presetPath, status: 'unchanged', cwd: checkout});
+        expect(fs.readFileSync(presetPath, 'utf8')).toBe(afterUpdateBytes);
+        expect(statAfterSecondCall.ino).toBe(statBeforeSecondCall.ino);
+        expect(statAfterSecondCall.mtimeMs).toBe(statBeforeSecondCall.mtimeMs)
+    });
+
+    test('converges only local presets and leaves a non-local preset (e.g. ssh) untouched', () => {
+        fs.mkdirSync(instanceHome, {recursive: true});
+
+        const
+            sshPreset = {
+                id        : '11111111-2222-4333-8444-555555555555',
+                name      : 'devbox',
+                createdAt : 1789984860000,
+                lastUsedAt: 1789984860000,
+                target    : {
+                    kind: 'ssh',
+                    host: 'devbox',
+                    cwd : '/home/me/neo'
+                }
+            },
+            staleLocalPreset = {
+                id        : '78c5d999-a73b-4239-994f-70d2332da522',
+                name      : 'neo',
+                createdAt : 1789984863649,
+                lastUsedAt: 1789984863649,
+                target    : {
+                    kind: 'local',
+                    cwd : staleFolder
+                }
+            };
+
+        fs.writeFileSync(presetPath, `${JSON.stringify({
+            byAccount: {
+                [accountId]: {
+                    presets        : [sshPreset, staleLocalPreset],
+                    builtIns       : {},
+                    seededFromDraft: true
+                }
+            }
+        }, null, '\t')}\n`, {mode: 0o600});
+
+        const updated = convergeSeatSessionPreset({instanceHome, cwd: checkout});
+
+        expect(updated).toEqual({path: presetPath, status: 'updated', cwd: checkout});
+
+        const afterUpdateBytes = fs.readFileSync(presetPath, 'utf8');
+        const parsed           = JSON.parse(afterUpdateBytes);
+
+        expect(parsed.byAccount[accountId].presets).toEqual([
+            sshPreset,
+            {
+                ...staleLocalPreset,
+                target: {
+                    kind: 'local',
+                    cwd : checkout
+                }
+            }
+        ]);
+
+        const repeat = convergeSeatSessionPreset({instanceHome, cwd: checkout});
+        expect(repeat).toEqual({path: presetPath, status: 'unchanged', cwd: checkout});
+        expect(fs.readFileSync(presetPath, 'utf8')).toBe(afterUpdateBytes)
+    });
+
+    test('AC-2: seeds one preset pointing at the checkout when a signed-in profile has no preset file, and writes nothing when the profile has no account', () => {
+        fs.mkdirSync(instanceHome, {recursive: true});
+
+        const noAccount = convergeSeatSessionPreset({instanceHome, cwd: checkout});
+
+        expect(noAccount).toEqual({path: presetPath, status: 'no-account', cwd: checkout});
+        expect(fs.existsSync(presetPath)).toBe(false);
+
+        fs.writeFileSync(path.join(instanceHome, 'config.json'), JSON.stringify({lastKnownAccountUuid: accountId}));
+
+        const created = convergeSeatSessionPreset({instanceHome, cwd: checkout});
+
+        expect(created).toEqual({path: presetPath, status: 'created', cwd: checkout});
+
+        const parsed  = JSON.parse(fs.readFileSync(presetPath, 'utf8'));
+        const bucket  = parsed.byAccount?.[accountId];
+        const presets = bucket?.presets;
+
+        expect(Array.isArray(presets)).toBe(true);
+        expect(presets).toHaveLength(1);
+        expect(presets[0]).toMatchObject({
+            name  : 'neo',
+            target: {
+                kind: 'local',
+                cwd : checkout
+            }
+        });
+        expect(bucket.seededFromDraft).toBe(true)
+    });
+
+    test('AC-3: refuses a missing or relative checkout before touching the profile', () => {
+        for (const badCwd of [undefined, null, '', 'relative/checkout', './neo']) {
+            expect(() => convergeSeatSessionPreset({instanceHome, cwd: badCwd}))
+                .toThrow(/must be an absolute provisioned checkout for claude-desktop/)
+        }
+        expect(fs.existsSync(presetPath)).toBe(false)
+    });
+});
 
 /**
  * @summary Where a Claude Desktop seat's session opened, on real temp profiles: only the seat's own
@@ -11,9 +182,9 @@ import {readSeatSessionFolder} from '../../../../../../ai/services/fleet/seatSes
  */
 test.describe('seatSessionFolder — the folder a desktop seat\'s session opened in', () => {
     const
-        since    = '2026-10-03T19:00:00.000Z',
-        before   = Date.parse('2026-10-03T18:00:00.000Z'),
-        after    = minutes => Date.parse(since) + minutes * 60_000;
+        since  = '2026-10-03T19:00:00.000Z',
+        before = Date.parse('2026-10-03T18:00:00.000Z'),
+        after  = minutes => Date.parse(since) + minutes * 60_000;
 
     let root, instanceHome, expected, store;
 
