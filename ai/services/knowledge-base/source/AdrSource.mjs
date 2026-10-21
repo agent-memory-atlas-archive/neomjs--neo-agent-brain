@@ -88,7 +88,11 @@ class AdrSource extends Base {
      * @returns {Number}
      */
     hydrateAdmissionEvidence(records = []) {
-        return hydrateAdrAdmissionRecords(records);
+        for (const rec of records || []) {
+            const key = rec?.adrAdmissionRecord?.canonicalKey || rec?.canonicalKey;
+            if (key) this.reconciledStates.delete(key);
+        }
+        return hydrateAdrAdmissionRecords(records, {replaceExisting: true});
     }
 
     /**
@@ -96,12 +100,15 @@ class AdrSource extends Base {
      * or the persisted Memory Core SQLite `Nodes` table at `aiConfig.memoryCoreDbPath` so KB extraction
      * in a process without `AdrIngestor` reads the retained admission evidence directly.
      * @param {Object} [options={}]
-     * @returns {{available: Boolean, recordCount: Number, hydratedCount: Number, source: String}}
+     * @returns {{available: Boolean, recordCount: Number, hydratedCount: Number, source: String, custodyTransitions: Object[]}}
      */
     rehydrateCatalogFromEvidence(options = {}) {
+        const explicitSqlite = typeof options.sqlitePath === 'string' && Boolean(options.sqlitePath.trim());
+
         return rehydrateAdrCatalogFromEvidence({
             graphDb                 : options.graphDb || null,
-            sqlitePath              : options.sqlitePath || aiConfig.memoryCoreDbPath,
+            sqlitePath              : explicitSqlite ? options.sqlitePath : aiConfig.memoryCoreDbPath,
+            sqlitePathExplicit      : explicitSqlite,
             retainedAdmissionRecords: options.retainedAdmissionRecords || null
         });
     }
@@ -304,26 +311,25 @@ class AdrSource extends Base {
         return isAdrReaderAuthorized(record, context);
     }
 
-    /**
-     * @summary Resolves a human (`<organization>/<repository>#adr:<slug>`, `adr:<slug>`) or canonical
-     * (`adr:<E(forge)>:<E(repositoryId)>:<E(namespace)>:<number>`) ADR reference against the shared
-     * admitted catalog using the same context, forge-adapter, and reader-policy controls as `AdrIngestor`.
-     * @param {String} reference
-     * @param {Object} [context={}]
-     * @returns {Object}
-     */
-    resolveAdrReference(reference, context = {}) {
-        this.rehydrateCatalogFromEvidence(context);
-
+    #resolveFromHydratedCatalog(reference, context = {}) {
         const result = resolveSharedAdrReference(reference, context);
 
         if (result.resolved && result.canonicalKey) {
             const
-                kbChunk     = this.kbIndexedDecisions.get(result.canonicalKey) || null,
-                kbAvailable = Boolean((kbChunk || result.record?.kbAvailable) && !result.stale && result.documentAvailable);
+                reconciled        = this.reconciledStates.get(result.canonicalKey) || null,
+                kbChunk           = this.kbIndexedDecisions.get(result.canonicalKey) || null,
+                documentAvailable = reconciled
+                    ? Boolean(reconciled.documentAvailable)
+                    : Boolean(result.documentAvailable),
+                stale             = reconciled
+                    ? Boolean(reconciled.stale)
+                    : Boolean(result.stale),
+                kbAvailable       = Boolean((kbChunk || result.record?.kbAvailable) && !stale && documentAvailable);
 
             return {
                 ...result,
+                documentAvailable,
+                stale,
                 kbAvailable,
                 kbChunk
             };
@@ -362,6 +368,35 @@ class AdrSource extends Base {
     }
 
     /**
+     * @summary Resolves a human (`<organization>/<repository>#adr:<slug>`, `adr:<slug>`) or canonical
+     * (`adr:<E(forge)>:<E(repositoryId)>:<E(namespace)>:<number>`) ADR reference against the shared
+     * admitted catalog using the same context, forge-adapter, and reader-policy controls as `AdrIngestor`.
+     * @param {String} reference
+     * @param {Object} [context={}]
+     * @returns {Object}
+     */
+    resolveAdrReference(reference, context = {}) {
+        const evidenceState = this.rehydrateCatalogFromEvidence(context);
+
+        if (evidenceState.source === 'projection-unavailable') {
+            return {
+                status            : 'unavailable',
+                resolved          : false,
+                canonicalKey      : null,
+                identityResolved  : false,
+                documentAvailable : false,
+                kbAvailable       : false,
+                admissionAvailable: false,
+                candidates        : [],
+                reasonCode        : 'ADR_ADMISSION_EVIDENCE_UNAVAILABLE',
+                kbChunk           : null
+            };
+        }
+
+        return this.#resolveFromHydratedCatalog(reference, context);
+    }
+
+    /**
      * @summary Processes a batch of candidate ADR entries (across one or multiple repositories),
      * classifying redirects, parsing opening-table `Aliases`, verifying retained admission evidence
      * before any KB emission (never admitting from source files alone), evaluating conflicts against
@@ -383,14 +418,19 @@ class AdrSource extends Base {
         createHashFn          = chunk => crypto.createHash('sha256').update(`${chunk.name}:${chunk.content}`).digest('hex')
     }) {
         const
-            yieldedSourcePaths    = [],
-            skippedSourcePaths    = [],
-            redirects             = [],
-            refusedSourcePaths    = [],
-            admittedDecisions     = [],
-            candidates            = [],
-            unavailableCandidates = new Map(),
-            catalog               = SHARED_ADR_CATALOG_STATE.admissionCatalog;
+            yieldedSourcePaths          = [],
+            skippedSourcePaths          = [],
+            redirects                   = [],
+            refusedSourcePaths          = [],
+            admittedDecisions           = [],
+            candidates                  = [],
+            unavailableCandidates       = new Map(),
+            catalog                     = SHARED_ADR_CATALOG_STATE.admissionCatalog,
+            projectionUnavailable       = evidenceState?.source === 'projection-unavailable',
+            effectiveCustodyTransitions = [
+                ...(custodyTransitions || []),
+                ...(evidenceState?.custodyTransitions || [])
+            ];
 
         for (const item of rawEntries) {
             const
@@ -435,7 +475,7 @@ class AdrSource extends Base {
                     slug,
                     sourcePath,
                     sourceRepo        : specRepo,
-                    custodyTransitions: item.custodyTransitions || custodyTransitions,
+                    custodyTransitions: item.custodyTransitions?.length ? item.custodyTransitions : effectiveCustodyTransitions,
                     legacyManifest    : item.legacyManifest || legacyManifest,
                     admissionCatalog  : catalog,
                     onRegisterRepo    : repo => registerSharedForgeRepository(repo)
@@ -489,7 +529,7 @@ class AdrSource extends Base {
             };
 
         for (const cand of candidates) {
-            const hasAdmissionEvidence = Boolean(
+            const hasAdmissionEvidence = !projectionUnavailable && Boolean(
                 cand.identityInfo.existingRecord ||
                 cand.identityInfo.manifestEntry
             );
@@ -645,7 +685,7 @@ class AdrSource extends Base {
                 };
                 reconciliation.set(key, stateEntry);
                 this.reconciledStates.set(key, stateEntry);
-            } else if (unavailableCand && !retainedRecord) {
+            } else if (unavailableCand && (projectionUnavailable || !retainedRecord)) {
                 const stateEntry = {
                     canonicalKey      : key,
                     state             : 'admission-unavailable',
@@ -665,17 +705,19 @@ class AdrSource extends Base {
                 this.reconciledStates.set(key, stateEntry);
             } else {
                 const identityResolved = Boolean(hasRedirect || retainedRecord);
-                if (retainedRecord) {
+                if (retainedRecord && !projectionUnavailable) {
                     retainedRecord.documentAvailable = false;
                     retainedRecord.kbAvailable       = false;
                     retainedRecord.stale             = true;
                 }
-                this.kbIndexedDecisions.delete(key);
+                if (!projectionUnavailable) {
+                    this.kbIndexedDecisions.delete(key);
+                }
 
                 const stateEntry = {
                     canonicalKey      : key,
                     state             : refusedForKey.length > 0 ? 'both-present' : 'neither-present',
-                    admissionAvailable: Boolean(retainedRecord || evidenceState?.available),
+                    admissionAvailable: !projectionUnavailable && Boolean(retainedRecord || evidenceState?.available),
                     identityResolved,
                     documentAvailable : false,
                     kbAvailable       : false,
@@ -693,7 +735,7 @@ class AdrSource extends Base {
         }
 
         const
-            admissionAvailable = unavailableCandidates.size === 0 && (
+            admissionAvailable = !projectionUnavailable && unavailableCandidates.size === 0 && (
                 admittedByCanonicalKey.size > 0 ||
                 catalog.size > 0 ||
                 Boolean(evidenceState?.available)
@@ -734,7 +776,11 @@ class AdrSource extends Base {
         createHashFn
     } = {}) {
         const
-            evidenceState   = this.rehydrateCatalogFromEvidence({retainedAdmissionRecords, graphDb, sqlitePath}),
+            evidenceState   = this.rehydrateCatalogFromEvidence({
+                retainedAdmissionRecords,
+                graphDb,
+                sqlitePath
+            }),
             rawEntries      = [],
             writtenChunks   = [],
             effectiveStream = writeStream || {
@@ -856,7 +902,7 @@ class AdrSource extends Base {
      * @param {Object} params Repository-bound route invocation.
      * @returns {Promise<{count: Number, admissionAvailable: Boolean, code?: String, yieldedSourcePaths: String[], skippedSourcePaths: Object[], redirects: Object[], admittedDecisions: Object[], refusedSourcePaths: Object[], reconciliation: Object}>}
      */
-    async extractFromRepository({context, writeStream, createHashFn} = {}) {
+    async extractFromRepository({context, options, writeStream, createHashFn} = {}) {
         const reader = context?.repositoryReader;
 
         if (!reader || typeof reader.readText !== 'function') {
@@ -864,7 +910,7 @@ class AdrSource extends Base {
         }
 
         const
-            evidenceState = this.rehydrateCatalogFromEvidence(context || {}),
+            evidenceState = this.rehydrateCatalogFromEvidence({...(options || {}), ...(context || {})}),
             assignments   = [...(context?.territory?.assignments || [])]
                 .sort((left, right) => left.entry.sourcePath === right.entry.sourcePath
                     ? 0

@@ -29,6 +29,8 @@ export const SHARED_ADR_CATALOG_STATE = Object.freeze({
     forgeDirectory        : new Map()
 });
 
+let lastHydratedSqlitePath = null;
+
 /**
  * @summary Ensures and returns the reservation bucket for `(forge, repositoryId)` in the shared catalog state.
  * @param {String} forge
@@ -77,6 +79,7 @@ export function registerSharedForgeRepository({forge = 'github.com', repositoryI
  * @summary Resets the shared admitted ADR catalog and seeds the default cut repositories.
  */
 export function resetSharedAdrCatalog() {
+    lastHydratedSqlitePath = null;
     SHARED_ADR_CATALOG_STATE.admissionCatalog.clear();
     SHARED_ADR_CATALOG_STATE.repositoryReservations.clear();
     SHARED_ADR_CATALOG_STATE.forgeDirectory.clear();
@@ -87,25 +90,91 @@ export function resetSharedAdrCatalog() {
 
 /**
  * @summary Hydrates admitted `adrAdmissionRecord` payloads into `SHARED_ADR_CATALOG_STATE`.
+ * When `replaceExisting` is true (default), refreshes existing catalog records with live
+ * cross-process updates (such as custody moves, newly bound aliases, or status updates)
+ * while preserving any already-recorded in-memory renames and alias bindings.
  * @param {Object[]} [records=[]]
- * @returns {Number} Number of newly hydrated records.
+ * @param {Object} [options={}]
+ * @param {Boolean} [options.replaceExisting=true]
+ * @returns {Number} Number of hydrated or refreshed records.
  */
-export function hydrateAdrAdmissionRecords(records = []) {
+export function hydrateAdrAdmissionRecords(records = [], {replaceExisting = true} = {}) {
     let hydratedCount = 0;
 
     for (const rawRecord of records) {
-        if (!rawRecord?.canonicalKey || SHARED_ADR_CATALOG_STATE.admissionCatalog.has(rawRecord.canonicalKey)) continue;
+        if (!rawRecord?.canonicalKey) continue;
+        const existing = SHARED_ADR_CATALOG_STATE.admissionCatalog.get(rawRecord.canonicalKey) || null;
+        if (existing && !replaceExisting) continue;
+
+        const
+            mergedAliasBindings = (rawRecord.aliasBindings || []).map(b => ({...b})),
+            mergedReservations  = (rawRecord.reservations || []).map(r => ({...r})),
+            mergedTransitions   = [...(rawRecord.provenance?.custodyTransitions || [])],
+            mergedRenames       = [...(rawRecord.provenance?.repositoryRenames || [])],
+            mergedLineage       = [...(rawRecord.provenance?.sourceLineage || [])];
+
+        if (existing) {
+            for (const prevBinding of existing.aliasBindings || []) {
+                const alreadyInRaw = mergedAliasBindings.some(
+                    b => b.kind === prevBinding.kind &&
+                         b.value === prevBinding.value &&
+                         b.forge === prevBinding.forge &&
+                         b.repositoryId === prevBinding.repositoryId &&
+                         String(b.namespace || '').toLowerCase() === String(prevBinding.namespace || '').toLowerCase()
+                );
+                if (!alreadyInRaw) {
+                    mergedAliasBindings.push({...prevBinding});
+                }
+            }
+
+            for (const prevRes of existing.reservations || []) {
+                const alreadyInRaw = mergedReservations.some(
+                    r => r.kind === prevRes.kind &&
+                         r.value === prevRes.value &&
+                         r.forge === prevRes.forge &&
+                         r.repositoryId === prevRes.repositoryId &&
+                         String(r.namespace || '').toLowerCase() === String(prevRes.namespace || '').toLowerCase()
+                );
+                if (!alreadyInRaw) {
+                    mergedReservations.push({...prevRes});
+                }
+            }
+
+            for (const prevRename of existing.provenance?.repositoryRenames || []) {
+                const alreadyInRaw = mergedRenames.some(
+                    r => r.repositoryId === prevRename.repositoryId &&
+                         r.previousNamespace === prevRename.previousNamespace &&
+                         r.currentNamespace === prevRename.currentNamespace
+                );
+                if (!alreadyInRaw) {
+                    mergedRenames.push({...prevRename});
+                }
+            }
+
+            for (const prevTrans of existing.provenance?.custodyTransitions || []) {
+                const alreadyInRaw = mergedTransitions.some(
+                    t => t.canonicalKey === prevTrans.canonicalKey &&
+                         t.fromRepositoryId === prevTrans.fromRepositoryId &&
+                         t.toRepositoryId === prevTrans.toRepositoryId
+                );
+                if (!alreadyInRaw) {
+                    mergedTransitions.push({...prevTrans});
+                }
+            }
+        }
 
         const record = {
+            ...(existing || {}),
             ...rawRecord,
-            historicalAliases: [...(rawRecord.historicalAliases || [])],
-            aliasBindings    : (rawRecord.aliasBindings || []).map(b => ({...b})),
-            reservations     : (rawRecord.reservations || []).map(r => ({...r})),
+            historicalAliases: [...(rawRecord.historicalAliases || existing?.historicalAliases || [])],
+            aliasBindings    : mergedAliasBindings,
+            reservations     : mergedReservations,
             provenance       : {
+                ...(existing?.provenance || {}),
                 ...(rawRecord.provenance || {}),
-                custodyTransitions: [...(rawRecord.provenance?.custodyTransitions || [])],
-                repositoryRenames : [...(rawRecord.provenance?.repositoryRenames || [])],
-                sourceLineage     : [...(rawRecord.provenance?.sourceLineage || [])]
+                custodyTransitions: mergedTransitions,
+                repositoryRenames : mergedRenames,
+                sourceLineage     : mergedLineage
             }
         };
 
@@ -149,18 +218,58 @@ export function hydrateAdrAdmissionRecords(records = []) {
 }
 
 /**
+ * @summary Collects deduplicated custody transitions across a list of `adrAdmissionRecord` entries.
+ * @param {Iterable<Object>} records
+ * @param {Object[]} [seedTransitions=[]]
+ * @returns {Object[]}
+ * @private
+ */
+function collectCustodyTransitionsFromRecords(records, seedTransitions = []) {
+    const
+        transitions = [],
+        seen        = new Set();
+
+    const addTransition = (t) => {
+        if (!t || (!t.canonicalKey && !t.adrNumber)) return;
+        const key = `${t.canonicalKey || t.adrNumber}|${t.fromRepositoryId || ''}|${t.toRepositoryId || ''}|${t.toNamespace || ''}`;
+        if (!seen.has(key)) {
+            seen.add(key);
+            transitions.push({...t});
+        }
+    };
+
+    for (const t of seedTransitions || []) {
+        addTransition(t);
+    }
+
+    for (const rec of records || []) {
+        for (const t of rec?.provenance?.custodyTransitions || []) {
+            addTransition({
+                adrNumber   : rec.adrNumber,
+                canonicalKey: rec.canonicalKey,
+                ...t
+            });
+        }
+    }
+
+    return transitions;
+}
+
+/**
  * @summary Rehydrates `SHARED_ADR_CATALOG_STATE` from retained admission evidence:
  * explicit `retainedAdmissionRecords`, an open `graphDb` (`GraphService.db`), or the
  * persisted Memory Core SQLite `Nodes` table at `sqlitePath`.
  * @param {Object} [options={}]
  * @param {Object|null} [options.graphDb=null]
  * @param {String|null} [options.sqlitePath=null]
+ * @param {Boolean} [options.sqlitePathExplicit=false]
  * @param {Object[]|null} [options.retainedAdmissionRecords=null]
- * @returns {{available: Boolean, recordCount: Number, hydratedCount: Number, source: String}}
+ * @returns {{available: Boolean, recordCount: Number, hydratedCount: Number, source: String, custodyTransitions: Object[], code?: String}}
  */
 export function rehydrateAdrCatalogFromEvidence({
     graphDb                  = null,
     sqlitePath               = null,
+    sqlitePathExplicit       = false,
     retainedAdmissionRecords = null
 } = {}) {
     const
@@ -225,7 +334,8 @@ export function rehydrateAdrCatalogFromEvidence({
             `).get();
 
             if (hasNodesTable) {
-                evidenceReadable = true;
+                evidenceReadable       = true;
+                lastHydratedSqlitePath = sqlitePath;
                 if (evidenceSource === 'none') evidenceSource = 'sqlite-file';
                 const rows = readonlyDb.prepare(`
                     SELECT id, data FROM Nodes WHERE json_extract(data, '$.label') = 'ADR'
@@ -246,16 +356,31 @@ export function rehydrateAdrCatalogFromEvidence({
         }
     }
 
+    const sqliteBackingLost = Boolean(lastHydratedSqlitePath && sqlitePath === lastHydratedSqlitePath && !evidenceReadable);
+
+    if ((sqlitePathExplicit || sqliteBackingLost) && !evidenceReadable && !Array.isArray(retainedAdmissionRecords) && !graphDb) {
+        return {
+            available         : false,
+            recordCount       : 0,
+            hydratedCount     : 0,
+            source            : 'projection-unavailable',
+            code              : 'ADR_ADMISSION_EVIDENCE_UNAVAILABLE',
+            custodyTransitions: []
+        };
+    }
+
     const
-        hydratedCount = hydrateAdrAdmissionRecords(records),
-        recordCount   = SHARED_ADR_CATALOG_STATE.admissionCatalog.size,
-        available     = recordCount > 0 || (evidenceReadable && Array.isArray(retainedAdmissionRecords));
+        hydratedCount      = hydrateAdrAdmissionRecords(records, {replaceExisting: true}),
+        recordCount        = SHARED_ADR_CATALOG_STATE.admissionCatalog.size,
+        available          = recordCount > 0 || (evidenceReadable && Array.isArray(retainedAdmissionRecords)),
+        custodyTransitions = collectCustodyTransitionsFromRecords(SHARED_ADR_CATALOG_STATE.admissionCatalog.values());
 
     return {
         available,
         recordCount,
         hydratedCount,
-        source: recordCount > 0 && evidenceSource === 'none' ? 'in-memory-catalog' : evidenceSource
+        source: recordCount > 0 && evidenceSource === 'none' ? 'in-memory-catalog' : evidenceSource,
+        custodyTransitions
     };
 }
 
