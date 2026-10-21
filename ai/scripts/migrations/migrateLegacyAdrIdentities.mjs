@@ -4,14 +4,12 @@ import fs                                    from 'fs';
 import path                                  from 'path';
 import {createRequire}                       from 'node:module';
 import {fileURLToPath}                       from 'node:url';
-import {ChromaClient}                        from 'chromadb';
 import Neo                                   from 'neo.mjs/src/Neo.mjs';
 import * as core                             from 'neo.mjs/src/core/_export.mjs';
-import InstanceManager                       from 'neo.mjs/src/manager/Instance.mjs';
+import {ChromaClient}                        from 'chromadb';
 import kbConfig                              from '../../mcp/server/knowledge-base/config.mjs';
 import memoryCoreConfig                      from '../../mcp/server/memory-core/config.mjs';
 import AdrSource                             from '../../services/knowledge-base/source/AdrSource.mjs';
-import {qualifyOriginId}                     from '../../services/graph/corpusProjectionContract.mjs';
 import TextEmbeddingService                  from '../../services/memory-core/TextEmbeddingService.mjs';
 import {parseAdrRedirect}                    from '../../services/shared/adrRedirect.mjs';
 import {registerNeoChromaEmbeddingFunctions} from '../../services/shared/vector/chromaClientPrimitives.mjs';
@@ -19,26 +17,15 @@ import {
     ADR_NUMBER_REGEX,
     buildCanonicalAdrKey,
     createCodedError,
-    parseCanonicalAdrKey,
-    validateAdrIdentityFields
+    parseCanonicalAdrKey
 } from '../../services/shared/adrIdentityCodec.mjs';
 import {
-    SHARED_ADR_CATALOG_STATE,
-    bindSharedAdrRecordAliases,
-    ensureSharedReservationBucket,
     hydrateAdrAdmissionRecords,
     isAdrReaderAuthorized,
     registerSharedForgeRepository,
-    rehydrateAdrCatalogFromEvidence,
-    resetSharedAdrCatalog,
-    resolveSharedAdrReference
+    resetSharedAdrCatalog
 } from '../../services/ingestion/adrAdmissionCatalog.mjs';
-import {
-    computeAdrPayloadHash,
-    extractAdrTitleAndStatus,
-    parseAdrFilename,
-    parseAdrOpeningAliases
-} from '../../services/shared/adrDocumentParser.mjs';
+import {parseAdrFilename} from '../../services/shared/adrDocumentParser.mjs';
 import {
     ADR_MIGRATION_RUNBOOK,
     MIGRATION_CUT_REPOSITORIES,
@@ -73,68 +60,34 @@ const __dirname          = path.dirname(__filename);
 const BRAIN_ROOT_DIR     = path.resolve(__dirname, '../../..');
 const WORKSPACE_ROOT_DIR = path.resolve(BRAIN_ROOT_DIR, '..');
 
-/**
- * @summary Computes the 12-hex-character SHA-256 content hash used by the ADR migration manifest.
- * @param {String} content
- * @returns {String}
- */
+function fail(code, message) {
+    throw createCodedError(code, message);
+}
+
+/** @summary Computes the 12-hex-character SHA-256 content hash used by the ADR migration manifest. */
 export function computeMigrationContentHash(content) {
     return crypto.createHash('sha256').update(String(content ?? '')).digest('hex').slice(0, 12);
 }
 
-/**
- * @summary Resolves the local worktree directory for a repository namespace.
- * @param {String} ns
- * @param {Object|null} [repoRoots=null]
- * @returns {String|null}
- * @private
- */
 function resolveRepositoryWorktreeDir(ns, repoRoots = null) {
-    if (repoRoots && typeof repoRoots[ns] === 'string') {
-        return repoRoots[ns];
-    }
-    if (ns === 'neomjs/neo-agent-brain') {
-        return BRAIN_ROOT_DIR;
-    }
+    if (repoRoots && typeof repoRoots[ns] === 'string') return repoRoots[ns];
+    if (ns === 'neomjs/neo-agent-brain') return BRAIN_ROOT_DIR;
     const shortName = String(ns).split('/')[1];
     return shortName ? path.join(WORKSPACE_ROOT_DIR, shortName) : null;
 }
 
-/**
- * @summary Reads a file directly from a live repository worktree on disk (returning `null` when absent).
- * @param {String|null} repoDir
- * @param {String|null} relPath
- * @returns {String|null}
- * @private
- */
 function readLiveWorktreeMarkdown(repoDir, relPath) {
     if (!repoDir || !relPath) return null;
     const absFile = path.join(repoDir, relPath);
-    if (!fs.existsSync(absFile)) {
-        return null;
-    }
-    return fs.readFileSync(absFile, 'utf8');
+    return fs.existsSync(absFile) ? fs.readFileSync(absFile, 'utf8') : null;
 }
 
-/**
- * @summary Reads a file directly from a live repository worktree on disk and returns its 12-character
- * SHA-256 content hash, or `null` when the checkout or file is absent.
- * @param {String|null} repoDir
- * @param {String|null} relPath
- * @returns {String|null}
- * @private
- */
 function readLiveWorktreeContentHash(repoDir, relPath) {
     const raw = readLiveWorktreeMarkdown(repoDir, relPath);
     return raw === null ? null : computeMigrationContentHash(raw);
 }
 
-/**
- * @summary Builds the default `sourceProbe` from live repository worktrees and git state without
- * falling back to manifest values when a checkout or file is missing or modified.
- * @param {Object} [options={}]
- * @returns {Object}
- */
+/** @summary Builds the default `sourceProbe` from live repository worktrees and git state without manifest fallbacks. */
 export function createDefaultSourceProbe({
     manifest                  = REVIEWED_41_ADR_MIGRATION_MANIFEST,
     cutRepositories           = MIGRATION_CUT_REPOSITORIES,
@@ -145,7 +98,12 @@ export function createDefaultSourceProbe({
         revisions             = {},
         contentHashes         = {},
         redirectContentHashes = {},
-        probeHashes           = {};
+        probeHashes           = {},
+        runGit                = (repoDir, args) => execFileSync('git', args, {
+            cwd     : repoDir,
+            encoding: 'utf8',
+            stdio   : ['ignore', 'pipe', 'ignore']
+        }).trim();
 
     for (const [ns, repoMeta] of Object.entries(cutRepositories || {})) {
         if (!repoMeta || typeof repoMeta !== 'object') continue;
@@ -156,69 +114,42 @@ export function createDefaultSourceProbe({
 
         if (repoDir && fs.existsSync(path.join(repoDir, '.git')) && repoMeta.cutRevision) {
             try {
-                const resolvedCommit = execFileSync(
-                    'git',
-                    ['rev-parse', '--verify', `${repoMeta.cutRevision}^{commit}`],
-                    {cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']}
-                ).trim();
-
+                const resolvedCommit = runGit(repoDir, ['rev-parse', '--verify', `${repoMeta.cutRevision}^{commit}`]);
                 if (resolvedCommit.startsWith(repoMeta.cutRevision)) {
                     const
-                        diffFromCut = execFileSync(
-                            'git',
-                            ['diff', '--name-only', repoMeta.cutRevision, 'HEAD', '--', territoryRoot],
-                            {cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']}
-                        ).trim(),
-                        worktreeStatus = execFileSync(
-                            'git',
-                            ['status', '--porcelain', '--untracked-files=no', '--', territoryRoot],
-                            {cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']}
-                        ).trim();
+                        diffFromCut    = runGit(repoDir, ['diff', '--name-only', repoMeta.cutRevision, 'HEAD', '--', territoryRoot]),
+                        worktreeStatus = runGit(repoDir, ['status', '--porcelain', '--untracked-files=no', '--', territoryRoot]);
 
-                    if (worktreeStatus) {
-                        observedRev = 'DIRTY_WORKTREE';
-                    } else if (diffFromCut) {
-                        observedRev = execFileSync(
-                            'git',
-                            ['rev-parse', '--short=9', 'HEAD'],
-                            {cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']}
-                        ).trim() || 'DRIFTED_HEAD';
-                    } else {
-                        observedRev = repoMeta.cutRevision;
-                    }
+                    observedRev = worktreeStatus
+                        ? 'DIRTY_WORKTREE'
+                        : diffFromCut
+                            ? (runGit(repoDir, ['rev-parse', '--short=9', 'HEAD']) || 'DRIFTED_HEAD')
+                            : repoMeta.cutRevision;
                 }
             } catch {
                 observedRev = null;
             }
         }
-        if (observedRev) {
-            revisions[ns] = observedRev;
-        }
-
+        if (observedRev) revisions[ns] = observedRev;
         if (repoMeta.probeRecord?.sourcePath) {
             const probeHash = readLiveWorktreeContentHash(repoDir, repoMeta.probeRecord.sourcePath);
-            if (probeHash) {
-                probeHashes[ns] = probeHash;
-            }
+            if (probeHash) probeHashes[ns] = probeHash;
         }
     }
 
     for (const entry of manifest || []) {
         if (!entry?.sourceTuple) continue;
         const
-            ns         = entry.sourceTuple.namespace,
-            repoDir    = resolveRepositoryWorktreeDir(ns, repoRoots),
+            repoDir    = resolveRepositoryWorktreeDir(entry.sourceTuple.namespace, repoRoots),
             actualHash = readLiveWorktreeContentHash(repoDir, entry.sourcePath);
 
         if (actualHash) {
             contentHashes[entry.legacyId]     = actualHash;
             contentHashes[entry.canonicalKey] = actualHash;
         }
-
         if (entry.custodyTransition?.redirectPath) {
             const
-                originNs           = entry.custodyTransition.fromNamespace,
-                originDir          = resolveRepositoryWorktreeDir(originNs, repoRoots),
+                originDir          = resolveRepositoryWorktreeDir(entry.custodyTransition.fromNamespace, repoRoots),
                 actualRedirectHash = readLiveWorktreeContentHash(originDir, entry.custodyTransition.redirectPath);
 
             if (actualRedirectHash) {
@@ -228,21 +159,10 @@ export function createDefaultSourceProbe({
         }
     }
 
-    return {
-        revisions,
-        contentHashes,
-        redirectContentHashes,
-        probeHashes,
-        requirePrivateStageAccess
-    };
+    return {revisions, contentHashes, redirectContentHashes, probeHashes, requirePrivateStageAccess};
 }
 
-/**
- * @summary Builds the default `readerContext` from verified repository checkouts, granting private-repository
- * read access only when `allowPrivate !== false` and the private checkout and probe file are verified on disk.
- * @param {Object} [options={}]
- * @returns {Object}
- */
+/** @summary Builds the default `readerContext` from verified repository checkouts and private probe files. */
 export function createDefaultReaderContext({
     cutRepositories = MIGRATION_CUT_REPOSITORIES,
     repoRoots       = null,
@@ -258,27 +178,21 @@ export function createDefaultReaderContext({
     for (const [ns, repoMeta] of Object.entries(cutRepositories || {})) {
         if (!repoMeta || typeof repoMeta !== 'object') continue;
         const repoId = repoMeta.repositoryId;
-
         if (repoMeta.visibility === 'private') {
             if (!allowPrivate) continue;
             const
                 repoDir   = resolveRepositoryWorktreeDir(ns, repoRoots),
-                probePath = repoMeta.probeRecord?.sourcePath,
-                probeHash = readLiveWorktreeContentHash(repoDir, probePath);
+                probeHash = readLiveWorktreeContentHash(repoDir, repoMeta.probeRecord?.sourcePath);
 
             if (probeHash && probeHash === repoMeta.probeRecord?.contentHash) {
                 authorizedNamespaces.push(ns);
-                authorizedRepositories.push(ns);
-                if (repoId) authorizedRepositories.push(repoId);
+                authorizedRepositories.push(ns, ...(repoId ? [repoId] : []));
             }
         } else {
             publicNamespaces.push(ns);
-            publicRepositories.push(ns);
-            if (repoId) publicRepositories.push(repoId);
-
+            publicRepositories.push(ns, ...(repoId ? [repoId] : []));
             authorizedNamespaces.push(ns);
-            authorizedRepositories.push(ns);
-            if (repoId) authorizedRepositories.push(repoId);
+            authorizedRepositories.push(ns, ...(repoId ? [repoId] : []));
         }
     }
 
@@ -296,26 +210,10 @@ export function createDefaultReaderContext({
     };
 }
 
-/**
- * @summary Checks whether a candidate vector is a finite numeric embedding array with length > 1.
- * @param {*} vec
- * @returns {Boolean}
- * @private
- */
 function isValidEmbeddingVector(vec) {
-    return Array.isArray(vec) &&
-        vec.length > 1 &&
-        vec.every(v => typeof v === 'number' && Number.isFinite(v));
+    return Array.isArray(vec) && vec.length > 1 && vec.every(v => typeof v === 'number' && Number.isFinite(v));
 }
 
-/**
- * @summary Validates that every vector in a batch is a non-placeholder numeric embedding of uniform dimension.
- * @param {Array} embeddings
- * @param {String[]} ids
- * @param {String} storeLabel
- * @param {Number|null} [expectedDimension=null]
- * @private
- */
 function assertValidUniformEmbeddings(embeddings, ids, storeLabel, expectedDimension = null) {
     let targetDim = Number.isInteger(expectedDimension) && expectedDimension > 1 ? expectedDimension : null;
     for (let i = 0; i < embeddings.length; i++) {
@@ -324,16 +222,15 @@ function assertValidUniformEmbeddings(embeddings, ids, storeLabel, expectedDimen
             id  = ids[i] || `index-${i}`;
 
         if (!isValidEmbeddingVector(vec)) {
-            throw createCodedError(
+            fail(
                 'ADR_MIGRATION_VECTOR_EMBEDDING_REQUIRED',
                 `${storeLabel} requires a non-placeholder numeric embedding vector (length > 1) for '${id}'.`
             );
         }
-
         if (targetDim === null) {
             targetDim = vec.length;
         } else if (vec.length !== targetDim) {
-            throw createCodedError(
+            fail(
                 'ADR_MIGRATION_VECTOR_DIMENSION_MISMATCH',
                 `${storeLabel} embedding dimension mismatch for '${id}': expected ${targetDim}, received ${vec.length}.`
             );
@@ -341,80 +238,45 @@ function assertValidUniformEmbeddings(embeddings, ids, storeLabel, expectedDimen
     }
 }
 
-/**
- * @summary Builds the ADR markdown payload used when computing a fresh embedding for a migrated ADR record.
- * @param {Object} entry
- * @param {Object|null} [repoRoots=null]
- * @param {String|null} [fallbackDocument=null]
- * @returns {String}
- * @private
- */
 function buildAdrEmbeddingDocumentText(entry, repoRoots = null, fallbackDocument = null) {
     const
-        ns       = entry?.sourceTuple?.namespace,
-        repoDir  = resolveRepositoryWorktreeDir(ns, repoRoots),
+        repoDir  = resolveRepositoryWorktreeDir(entry?.sourceTuple?.namespace, repoRoots),
         markdown = readLiveWorktreeMarkdown(repoDir, entry?.sourcePath);
 
-    if (markdown) {
-        return `${entry.title}\n\n${markdown}`;
-    }
-    if (typeof fallbackDocument === 'string' && fallbackDocument.trim().length > 0) {
-        return fallbackDocument;
-    }
+    if (markdown) return `${entry.title}\n\n${markdown}`;
+    if (typeof fallbackDocument === 'string' && fallbackDocument.trim().length > 0) return fallbackDocument;
     return `${entry?.title || entry?.canonicalKey} (${entry?.canonicalKey || entry?.legacyId})`;
 }
 
-/**
- * @summary Creates the default Chroma client for the Memory Core native graph vector store (`neo-native-graph`).
- * @param {Object} [options={}]
- * @returns {ChromaClient}
- * @private
- */
-function createDefaultMemoryCoreChromaClient({clientFactory = null} = {}) {
-    registerNeoChromaEmbeddingFunctions({
-        dummyEmbeddingFunction: memoryCoreConfig.dummyEmbeddingFunction
-    });
-    const
-        chroma   = memoryCoreConfig.engines.chroma,
-        database = chroma.useTestDatabase ? chroma.databaseTest : chroma.database,
-        options  = {
-            host: chroma.host,
-            port: chroma.port,
-            ssl : false,
-            database
-        };
+function createDefaultChromaClient(chroma, database, clientFactory = null) {
+    registerNeoChromaEmbeddingFunctions({dummyEmbeddingFunction: memoryCoreConfig.dummyEmbeddingFunction});
+    const options = {host: chroma.host, port: chroma.port, ssl: false, database};
     return typeof clientFactory === 'function' ? clientFactory(options) : new ChromaClient(options);
 }
 
-/**
- * @summary Creates the default Chroma client for the Knowledge Base vector store (`neo-knowledge-base`).
- * @param {Object} [options={}]
- * @returns {ChromaClient}
- * @private
- */
-function createDefaultKbChromaClient({clientFactory = null} = {}) {
-    registerNeoChromaEmbeddingFunctions({
-        dummyEmbeddingFunction: memoryCoreConfig.dummyEmbeddingFunction
-    });
+async function fetchChromaEntriesMap(collection, lookupIds) {
     const
-        chroma   = kbConfig.engines.chroma,
-        database = kbConfig.chromaDatabase,
-        options  = {
-            host: chroma.host,
-            port: chroma.port,
-            ssl : false,
-            database
-        };
-    return typeof clientFactory === 'function' ? clientFactory(options) : new ChromaClient(options);
+        res          = await collection.get({ids: lookupIds, include: ['embeddings', 'documents', 'metadatas']}),
+        existingById = new Map(),
+        ids          = res?.ids || [];
+    let collectionDimension = null;
+
+    for (let i = 0; i < ids.length; i++) {
+        const vec = res.embeddings?.[i] ?? null;
+        if (collectionDimension === null && isValidEmbeddingVector(vec)) {
+            collectionDimension = vec.length;
+        }
+        existingById.set(ids[i], {
+            id       : ids[i],
+            embedding: vec,
+            document : res.documents?.[i] ?? null,
+            metadata : res.metadatas?.[i] ? {...res.metadatas[i]} : {}
+        });
+    }
+    return {existingById, collectionDimension};
 }
 
-/**
- * @summary Creates a production Chroma adapter for the Memory Core native graph vector collection
- * (`memoryCoreConfig.collections.graph`), implementing `applyAdrMigration`, `exportSnapshot`, and `restoreSnapshot`.
- * @param {Object} [options={}]
- * @returns {Object}
- */
-export function createChromaVectorStoreAdapter({
+function createChromaMigrationAdapter(isKb, {
     client         = null,
     clientFactory  = null,
     collectionName = null,
@@ -422,120 +284,104 @@ export function createChromaVectorStoreAdapter({
     embedText      = null
 } = {}) {
     const
-        resolvedClient         = client || createDefaultMemoryCoreChromaClient({clientFactory}),
-        resolvedCollectionName = collectionName || memoryCoreConfig.collections.graph,
+        chroma   = isKb ? kbConfig.engines.chroma : memoryCoreConfig.engines.chroma,
+        database = isKb
+            ? kbConfig.chromaDatabase
+            : (chroma.useTestDatabase ? chroma.databaseTest : chroma.database),
+        resolvedClient         = client || createDefaultChromaClient(chroma, database, clientFactory),
+        resolvedCollectionName = collectionName || (isKb ? kbConfig.collectionName : memoryCoreConfig.collections.graph),
+        storeLabel             = isKb ? 'Knowledge Base vector store' : 'Memory Core vector store',
+        missingCode            = isKb ? 'ADR_MIGRATION_KB_COLLECTION_MISSING' : 'ADR_MIGRATION_VECTOR_COLLECTION_MISSING',
+        dummyFn                = isKb ? kbConfig.dummyEmbeddingFunction : memoryCoreConfig.dummyEmbeddingFunction,
         resolveEmbedding       = typeof embedText === 'function'
             ? embedText
             : async (text) => TextEmbeddingService.embedText(text, memoryCoreConfig.embeddingProvider, {
-                operationLabel: 'adr migration graph vector embedding',
+                operationLabel: isKb ? 'adr migration kb vector embedding' : 'adr migration graph vector embedding',
                 operationStage: 'adr-migration-embedding',
-                service       : 'memory-core'
-            });
-
-    const getCollection = async () => {
-        if (!resolvedClient || typeof resolvedClient.getCollection !== 'function') {
-            throw createCodedError(
-                'ADR_MIGRATION_VECTOR_COLLECTION_MISSING',
-                `Chroma client does not support getCollection() for '${resolvedCollectionName}'.`
-            );
-        }
-        return resolvedClient.getCollection({
-            name             : resolvedCollectionName,
-            embeddingFunction: memoryCoreConfig.dummyEmbeddingFunction
-        });
-    };
+                service       : isKb ? 'knowledge-base' : 'memory-core'
+            }),
+        getCollection = async () => {
+            if (!resolvedClient || typeof resolvedClient.getCollection !== 'function') {
+                fail(missingCode, `Chroma client does not support getCollection() for '${resolvedCollectionName}'.`);
+            }
+            return resolvedClient.getCollection({name: resolvedCollectionName, embeddingFunction: dummyFn});
+        };
 
     return {
         collectionName: resolvedCollectionName,
-
         async exportSnapshot({manifest = REVIEWED_41_ADR_MIGRATION_MANIFEST} = {}) {
-            const collection = await getCollection();
-            const targetIds  = new Set();
-            for (const entry of manifest) {
-                targetIds.add(entry.legacyId);
-                targetIds.add(entry.canonicalKey);
-                if (entry.observedState?.observedSemanticVectorId) {
-                    targetIds.add(entry.observedState.observedSemanticVectorId);
+            const targetIds = new Set([...manifest.map(e => e.legacyId), ...manifest.map(e => e.canonicalKey)]);
+            if (!isKb) {
+                for (const entry of manifest) {
+                    if (entry.observedState?.observedSemanticVectorId) {
+                        targetIds.add(entry.observedState.observedSemanticVectorId);
+                    }
                 }
             }
-            const res = await collection.get({
-                ids    : Array.from(targetIds),
-                include: ['embeddings', 'documents', 'metadatas']
-            });
-            const entries = [];
-            const ids     = res?.ids || [];
-            for (let i = 0; i < ids.length; i++) {
-                entries.push([
-                    ids[i],
-                    {
-                        id       : ids[i],
-                        embedding: res.embeddings?.[i] ?? null,
-                        document : res.documents?.[i] ?? null,
-                        metadata : res.metadatas?.[i] ? {...res.metadatas[i]} : {}
-                    }
-                ]);
-            }
-            return entries;
+            const {existingById} = await fetchChromaEntriesMap(await getCollection(), Array.from(targetIds));
+            return Array.from(existingById.entries());
         },
-
-        async applyAdrMigration({manifest = REVIEWED_41_ADR_MIGRATION_MANIFEST, nonAdrSummaryIds = []} = {}) {
+        async applyAdrMigration({
+            manifest         = REVIEWED_41_ADR_MIGRATION_MANIFEST,
+            nonAdrSummaryIds = [],
+            admissionRecords = []
+        } = {}) {
             const
                 collection = await getCollection(),
                 lookupIds  = Array.from(new Set([
                     ...manifest.map(e => e.legacyId),
                     ...manifest.map(e => e.canonicalKey),
-                    ...nonAdrSummaryIds
+                    ...(isKb ? [] : nonAdrSummaryIds)
                 ])),
-                res          = await collection.get({
-                    ids    : lookupIds,
-                    include: ['embeddings', 'documents', 'metadatas']
-                }),
-                existingById = new Map(),
-                ids          = res?.ids || [];
-
-            let collectionDimension = null;
-            for (let i = 0; i < ids.length; i++) {
-                const vec = res.embeddings?.[i] ?? null;
-                if (collectionDimension === null && isValidEmbeddingVector(vec)) {
-                    collectionDimension = vec.length;
-                }
-                existingById.set(ids[i], {
-                    id       : ids[i],
-                    embedding: vec,
-                    document : res.documents?.[i] ?? null,
-                    metadata : res.metadatas?.[i] ? {...res.metadatas[i]} : {}
-                });
-            }
-
-            const
+                {existingById, collectionDimension} = await fetchChromaEntriesMap(collection, lookupIds),
                 upsertIds        = [],
                 upsertEmbeddings = [],
                 upsertDocuments  = [],
                 upsertMetadatas  = [],
                 legacyToDelete   = [];
 
-            for (const entry of manifest) {
+            for (let idx = 0; idx < manifest.length; idx++) {
                 const
-                    existingCanonical      = existingById.get(entry.canonicalKey),
-                    existingLegacy         = existingById.get(entry.legacyId),
-                    existing               = existingLegacy || existingCanonical,
-                    isSummaryVectorAnomaly = String(entry.observedState?.observedSemanticVectorId || '').startsWith('summary_'),
-                    docText                = existing?.document || `${entry.title} (${entry.canonicalKey})`;
-
-                let embedding = null;
-                if (isValidEmbeddingVector(existingCanonical?.embedding)) {
-                    embedding = existingCanonical.embedding;
-                } else if (!isSummaryVectorAnomaly && isValidEmbeddingVector(existingLegacy?.embedding)) {
-                    embedding = existingLegacy.embedding;
-                } else {
-                    const textToEmbed = buildAdrEmbeddingDocumentText(entry, repoRoots, existing?.document);
-                    embedding = await resolveEmbedding(textToEmbed, entry);
-                }
+                    entry             = manifest[idx],
+                    existingCanonical = existingById.get(entry.canonicalKey),
+                    existingLegacy    = existingById.get(entry.legacyId),
+                    existing          = existingLegacy || existingCanonical,
+                    isSummaryAnomaly  = String(entry.observedState?.observedSemanticVectorId || '').startsWith('summary_'),
+                    docText           = existing?.document || `${entry.title} (${entry.canonicalKey})`,
+                    embedSourceText   = buildAdrEmbeddingDocumentText(entry, repoRoots, existing?.document),
+                    embedding         = isKb
+                        ? (isValidEmbeddingVector(existing?.embedding)
+                            ? existing.embedding
+                            : await resolveEmbedding(embedSourceText, entry))
+                        : (isValidEmbeddingVector(existingCanonical?.embedding)
+                            ? existingCanonical.embedding
+                            : (!isSummaryAnomaly && isValidEmbeddingVector(existingLegacy?.embedding))
+                                ? existingLegacy.embedding
+                                : await resolveEmbedding(embedSourceText, entry));
 
                 upsertIds.push(entry.canonicalKey);
                 upsertEmbeddings.push(embedding);
                 upsertDocuments.push(docText);
-                upsertMetadatas.push({
+
+                const admissionRecord = isKb
+                    ? (admissionRecords[idx] || buildAdrMigrationRecordFromManifestEntry(entry))
+                    : null;
+
+                upsertMetadatas.push(isKb ? {
+                    ...(existing?.metadata || {}),
+                    id               : entry.canonicalKey,
+                    canonicalKey     : entry.canonicalKey,
+                    legacyId         : entry.legacyId,
+                    adrNumber        : entry.adrNumber,
+                    title            : entry.title,
+                    currentSlug      : entry.currentSlug,
+                    sourcePath       : entry.sourcePath,
+                    repositoryId     : entry.sourceTuple.repositoryId,
+                    namespace        : entry.sourceTuple.namespace,
+                    visibility       : entry.visibility || 'public',
+                    aliases          : JSON.stringify(admissionRecord.aliases || []),
+                    historicalAliases: JSON.stringify(admissionRecord.historicalAliases || [])
+                } : {
                     ...(existing?.metadata || {}),
                     id          : entry.canonicalKey,
                     canonicalKey: entry.canonicalKey,
@@ -552,13 +398,7 @@ export function createChromaVectorStoreAdapter({
                 }
             }
 
-            assertValidUniformEmbeddings(
-                upsertEmbeddings,
-                upsertIds,
-                'Memory Core vector store',
-                collectionDimension
-            );
-
+            assertValidUniformEmbeddings(upsertEmbeddings, upsertIds, storeLabel, collectionDimension);
             if (upsertIds.length > 0) {
                 await collection.upsert({
                     ids       : upsertIds,
@@ -567,25 +407,17 @@ export function createChromaVectorStoreAdapter({
                     metadatas : upsertMetadatas
                 });
             }
-
             if (legacyToDelete.length > 0) {
                 await collection.delete({ids: legacyToDelete});
             }
-
-            let preservedSummaryVectorsCount = 0;
-            for (const summaryId of nonAdrSummaryIds) {
-                if (existingById.has(summaryId)) {
-                    preservedSummaryVectorsCount++;
-                }
-            }
-
-            return {
-                upsertedVectorsCount        : upsertIds.length,
-                removedLegacyAdrVectorsCount: legacyToDelete.length,
-                preservedSummaryVectorsCount
-            };
+            return isKb
+                ? {migratedKbEntriesCount: upsertIds.length, removedLegacyKbCount: legacyToDelete.length}
+                : {
+                    upsertedVectorsCount        : upsertIds.length,
+                    removedLegacyAdrVectorsCount: legacyToDelete.length,
+                    preservedSummaryVectorsCount: nonAdrSummaryIds.filter(id => existingById.has(id)).length
+                };
         },
-
         async restoreSnapshot(entries = [], {canonicalKeys = []} = {}) {
             const
                 collection        = await getCollection(),
@@ -593,13 +425,8 @@ export function createChromaVectorStoreAdapter({
                 restoreEmbeddings = Array.isArray(entries) ? entries.map(([, v]) => v?.embedding) : [];
 
             if (restoreIds.length > 0) {
-                assertValidUniformEmbeddings(
-                    restoreEmbeddings,
-                    restoreIds,
-                    'Memory Core vector store restore'
-                );
+                assertValidUniformEmbeddings(restoreEmbeddings, restoreIds, `${storeLabel} restore`);
             }
-
             if (Array.isArray(canonicalKeys) && canonicalKeys.length > 0) {
                 await collection.delete({ids: canonicalKeys});
             }
@@ -616,205 +443,17 @@ export function createChromaVectorStoreAdapter({
     };
 }
 
-/**
- * @summary Creates a production Chroma adapter for the Knowledge Base ADR collection
- * (`kbConfig.collectionName`), implementing `applyAdrMigration`, `exportSnapshot`, and `restoreSnapshot`.
- * @param {Object} [options={}]
- * @returns {Object}
- */
-export function createChromaKbStoreAdapter({
-    client         = null,
-    clientFactory  = null,
-    collectionName = null,
-    repoRoots      = null,
-    embedText      = null
-} = {}) {
-    const
-        resolvedClient         = client || createDefaultKbChromaClient({clientFactory}),
-        resolvedCollectionName = collectionName || kbConfig.collectionName,
-        resolveEmbedding       = typeof embedText === 'function'
-            ? embedText
-            : async (text) => TextEmbeddingService.embedText(text, memoryCoreConfig.embeddingProvider, {
-                operationLabel: 'adr migration kb vector embedding',
-                operationStage: 'adr-migration-embedding',
-                service       : 'knowledge-base'
-            });
-
-    const getCollection = async () => {
-        if (!resolvedClient || typeof resolvedClient.getCollection !== 'function') {
-            throw createCodedError(
-                'ADR_MIGRATION_KB_COLLECTION_MISSING',
-                `Chroma client does not support getCollection() for '${resolvedCollectionName}'.`
-            );
-        }
-        return resolvedClient.getCollection({
-            name             : resolvedCollectionName,
-            embeddingFunction: kbConfig.dummyEmbeddingFunction
-        });
-    };
-
-    return {
-        collectionName: resolvedCollectionName,
-
-        async exportSnapshot({manifest = REVIEWED_41_ADR_MIGRATION_MANIFEST} = {}) {
-            const collection = await getCollection();
-            const targetIds  = Array.from(new Set([
-                ...manifest.map(e => e.legacyId),
-                ...manifest.map(e => e.canonicalKey)
-            ]));
-            const res = await collection.get({
-                ids    : targetIds,
-                include: ['embeddings', 'documents', 'metadatas']
-            });
-            const entries = [];
-            const ids     = res?.ids || [];
-            for (let i = 0; i < ids.length; i++) {
-                entries.push([
-                    ids[i],
-                    {
-                        id       : ids[i],
-                        embedding: res.embeddings?.[i] ?? null,
-                        document : res.documents?.[i] ?? null,
-                        metadata : res.metadatas?.[i] ? {...res.metadatas[i]} : {}
-                    }
-                ]);
-            }
-            return entries;
-        },
-
-        async applyAdrMigration({manifest = REVIEWED_41_ADR_MIGRATION_MANIFEST, admissionRecords = []} = {}) {
-            const
-                collection = await getCollection(),
-                lookupIds  = Array.from(new Set([
-                    ...manifest.map(e => e.legacyId),
-                    ...manifest.map(e => e.canonicalKey)
-                ])),
-                res          = await collection.get({
-                    ids    : lookupIds,
-                    include: ['embeddings', 'documents', 'metadatas']
-                }),
-                existingById = new Map(),
-                ids          = res?.ids || [];
-
-            let collectionDimension = null;
-            for (let i = 0; i < ids.length; i++) {
-                const vec = res.embeddings?.[i] ?? null;
-                if (collectionDimension === null && isValidEmbeddingVector(vec)) {
-                    collectionDimension = vec.length;
-                }
-                existingById.set(ids[i], {
-                    id       : ids[i],
-                    embedding: vec,
-                    document : res.documents?.[i] ?? null,
-                    metadata : res.metadatas?.[i] ? {...res.metadatas[i]} : {}
-                });
-            }
-
-            const
-                upsertIds        = [],
-                upsertEmbeddings = [],
-                upsertDocuments  = [],
-                upsertMetadatas  = [],
-                legacyToDelete   = [];
-
-            for (let idx = 0; idx < manifest.length; idx++) {
-                const
-                    entry           = manifest[idx],
-                    admissionRecord = admissionRecords[idx] || buildAdrMigrationRecordFromManifestEntry(entry),
-                    existing        = existingById.get(entry.legacyId) || existingById.get(entry.canonicalKey),
-                    docText         = existing?.document || `${entry.title} (${entry.canonicalKey})`;
-
-                let embedding = isValidEmbeddingVector(existing?.embedding) ? existing.embedding : null;
-                if (!embedding) {
-                    const textToEmbed = buildAdrEmbeddingDocumentText(entry, repoRoots, existing?.document);
-                    embedding = await resolveEmbedding(textToEmbed, entry);
-                }
-
-                upsertIds.push(entry.canonicalKey);
-                upsertEmbeddings.push(embedding);
-                upsertDocuments.push(docText);
-                upsertMetadatas.push({
-                    ...(existing?.metadata || {}),
-                    id               : entry.canonicalKey,
-                    canonicalKey     : entry.canonicalKey,
-                    legacyId         : entry.legacyId,
-                    adrNumber        : entry.adrNumber,
-                    title            : entry.title,
-                    currentSlug      : entry.currentSlug,
-                    sourcePath       : entry.sourcePath,
-                    repositoryId     : entry.sourceTuple.repositoryId,
-                    namespace        : entry.sourceTuple.namespace,
-                    visibility       : entry.visibility || 'public',
-                    aliases          : JSON.stringify(admissionRecord.aliases || []),
-                    historicalAliases: JSON.stringify(admissionRecord.historicalAliases || [])
-                });
-
-                if (existingById.has(entry.legacyId)) {
-                    legacyToDelete.push(entry.legacyId);
-                }
-            }
-
-            assertValidUniformEmbeddings(
-                upsertEmbeddings,
-                upsertIds,
-                'Knowledge Base vector store',
-                collectionDimension
-            );
-
-            if (upsertIds.length > 0) {
-                await collection.upsert({
-                    ids       : upsertIds,
-                    embeddings: upsertEmbeddings,
-                    documents : upsertDocuments,
-                    metadatas : upsertMetadatas
-                });
-            }
-
-            if (legacyToDelete.length > 0) {
-                await collection.delete({ids: legacyToDelete});
-            }
-
-            return {
-                migratedKbEntriesCount: upsertIds.length,
-                removedLegacyKbCount  : legacyToDelete.length
-            };
-        },
-
-        async restoreSnapshot(entries = [], {canonicalKeys = []} = {}) {
-            const
-                collection        = await getCollection(),
-                restoreIds        = Array.isArray(entries) ? entries.map(([id]) => id) : [],
-                restoreEmbeddings = Array.isArray(entries) ? entries.map(([, v]) => v?.embedding) : [];
-
-            if (restoreIds.length > 0) {
-                assertValidUniformEmbeddings(
-                    restoreEmbeddings,
-                    restoreIds,
-                    'Knowledge Base vector store restore'
-                );
-            }
-
-            if (Array.isArray(canonicalKeys) && canonicalKeys.length > 0) {
-                await collection.delete({ids: canonicalKeys});
-            }
-            if (restoreIds.length > 0) {
-                await collection.upsert({
-                    ids       : restoreIds,
-                    embeddings: restoreEmbeddings,
-                    documents : entries.map(([id, v]) => v?.document || String(id)),
-                    metadatas : entries.map(([id, v]) => v?.metadata || {id})
-                });
-            }
-            return {restoredCount: restoreIds.length};
-        }
-    };
+/** @summary Creates a production Chroma adapter for the Memory Core native graph vector collection. */
+export function createChromaVectorStoreAdapter(options = {}) {
+    return createChromaMigrationAdapter(false, options);
 }
 
-/**
- * @summary Composes the default migration store adapters (`vectorStore`, `kbStore`), `sourceProbe`, and `readerContext`.
- * @param {Object} [options={}]
- * @returns {Object}
- */
+/** @summary Creates a production Chroma adapter for the Knowledge Base ADR vector collection. */
+export function createChromaKbStoreAdapter(options = {}) {
+    return createChromaMigrationAdapter(true, options);
+}
+
+/** @summary Composes the default migration store adapters (`vectorStore`, `kbStore`), `sourceProbe`, and `readerContext`. */
 export function composeDefaultMigrationStores({
     chromaClient         = null,
     vectorChromaClient   = null,
@@ -832,41 +471,27 @@ export function composeDefaultMigrationStores({
     readerContext        = undefined
 } = {}) {
     return {
-        vectorStore  : vectorStore || createChromaVectorStoreAdapter({
+        vectorStore: vectorStore || createChromaVectorStoreAdapter({
             client        : vectorChromaClient || chromaClient,
             clientFactory,
             collectionName: vectorCollectionName,
             repoRoots,
             embedText
         }),
-        kbStore      : kbStore || createChromaKbStoreAdapter({
+        kbStore: kbStore || createChromaKbStoreAdapter({
             client        : kbChromaClient || chromaClient,
             clientFactory,
             collectionName: kbCollectionName,
             repoRoots,
             embedText
         }),
-        sourceProbe  : sourceProbe !== undefined ? sourceProbe : createDefaultSourceProbe({
-            manifest,
-            cutRepositories,
-            repoRoots
-        }),
-        readerContext: readerContext !== undefined ? readerContext : createDefaultReaderContext({
-            cutRepositories,
-            repoRoots
-        })
+        sourceProbe  : sourceProbe !== undefined ? sourceProbe : createDefaultSourceProbe({manifest, cutRepositories, repoRoots}),
+        readerContext: readerContext !== undefined ? readerContext : createDefaultReaderContext({cutRepositories, repoRoots})
     };
 }
 
-/**
- * @summary Checks whether a store handle is a `Map` or an adapter implementing `applyAdrMigration`, `exportSnapshot`, and `restoreSnapshot`.
- * @param {*} store
- * @returns {Boolean}
- * @private
- */
 function isValidMigrationStore(store) {
-    if (store instanceof Map) return true;
-    return Boolean(
+    return (store instanceof Map) || Boolean(
         store &&
         typeof store === 'object' &&
         typeof store.applyAdrMigration === 'function' &&
@@ -875,20 +500,10 @@ function isValidMigrationStore(store) {
     );
 }
 
-/**
- * @summary Normalizes an issue, pull-request, or discussion origin reference into its canonical
- * repository-qualified form (`ISSUE:org/repo#N`, `PULL_REQUEST:org/repo#N`, `DISCUSSION:org/repo#N`).
- * Typed bare references (`PULL_REQUEST:#N`) qualify against `defaultRepo` (`entry.assignmentEvidence.namespace`),
- * while untyped bare `#N` references only normalize when `declaredReferences` prove their exact type and repository.
- * @param {String} rawRef
- * @param {String|null} [defaultRepo=null]
- * @param {String[]} [declaredReferences=[]]
- * @returns {String}
- */
+/** @summary Normalizes an issue, pull-request, or discussion origin reference into its canonical repository-qualified form. */
 export function normalizeHistoricalOriginReference(rawRef, defaultRepo = null, declaredReferences = []) {
     if (typeof rawRef !== 'string' || !rawRef.trim()) return '';
     const trimmed = rawRef.trim();
-
     if (/^(?:ISSUE|PULL_REQUEST|DISCUSSION):[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+$/i.test(trimmed)) {
         const [prefix, rest] = trimmed.split(':');
         return `${prefix.toUpperCase()}:${rest}`;
@@ -909,12 +524,8 @@ export function normalizeHistoricalOriginReference(rawRef, defaultRepo = null, d
             num        = bareTypedMatch[2],
             proven     = normalizedDeclared.filter(ref => ref.startsWith(`${typePrefix}:`) && ref.endsWith(`#${num}`));
 
-        if (proven.length === 1) {
-            return proven[0];
-        }
-        if (typeof defaultRepo === 'string' && defaultRepo.trim()) {
-            return `${typePrefix}:${defaultRepo.trim()}#${num}`;
-        }
+        if (proven.length === 1) return proven[0];
+        if (typeof defaultRepo === 'string' && defaultRepo.trim()) return `${typePrefix}:${defaultRepo.trim()}#${num}`;
         return trimmed;
     }
 
@@ -923,32 +534,39 @@ export function normalizeHistoricalOriginReference(rawRef, defaultRepo = null, d
         const
             explicitRepo = untypedMatch[1] || null,
             num          = untypedMatch[2],
-            proven       = normalizedDeclared.filter(ref => {
-                if (!ref.endsWith(`#${num}`)) return false;
-                if (!explicitRepo) return true;
-                const [, rest] = ref.split(':');
-                return rest.toLowerCase() === `${explicitRepo.toLowerCase()}#${num}`;
-            });
+            proven       = normalizedDeclared.filter(ref =>
+                ref.endsWith(`#${num}`) &&
+                (!explicitRepo || ref.split(':')[1].toLowerCase() === `${explicitRepo.toLowerCase()}#${num}`)
+            );
 
-        if (proven.length === 1) {
-            return proven[0];
-        }
-        return trimmed;
+        if (proven.length === 1) return proven[0];
     }
-
     return trimmed;
 }
 
-/**
- * @summary Converts a reviewed manifest entry into an `adrAdmissionRecord` payload suitable for
- * `Nodes.properties.adrAdmissionRecord` and `hydrateAdrAdmissionRecords`.
- * @param {Object} entry
- * @returns {Object}
- */
+/** @summary Converts a reviewed manifest entry into an `adrAdmissionRecord` payload for SQLite and catalog hydration. */
 export function buildAdrMigrationRecordFromManifestEntry(entry) {
-    const
-        aliasBindings = (entry.aliasBindings || []).map(b => ({...b})),
-        reservations  = (entry.reservations || []).map(r => ({
+    return {
+        canonicalKey      : entry.canonicalKey,
+        originCanonicalKey: entry.originCanonicalKey || null,
+        adrNumber         : entry.adrNumber,
+        legacyId          : entry.legacyId,
+        title             : entry.title,
+        status            : entry.status || 'Accepted',
+        currentSlug       : entry.currentSlug,
+        fileName          : entry.fileName,
+        sourcePath        : entry.sourcePath,
+        assignmentEvidence: {...entry.assignmentEvidence},
+        sourceTuple       : {...entry.sourceTuple},
+        documentAvailable : true,
+        kbAvailable       : true,
+        stale             : false,
+        visibility        : entry.visibility || 'public',
+        tenantId          : entry.tenantId || null,
+        aliases           : [...(entry.aliases || [entry.currentSlug])],
+        historicalAliases : [...(entry.historicalAliases || [entry.legacyId])],
+        aliasBindings     : (entry.aliasBindings || []).map(b => ({...b})),
+        reservations      : (entry.reservations || []).map(r => ({
             kind        : r.kind || 'legacy-number',
             value       : r.value || r.adrNumber || entry.adrNumber,
             forge       : r.forge,
@@ -957,58 +575,28 @@ export function buildAdrMigrationRecordFromManifestEntry(entry) {
             reason      : r.reason || 'assigned-custody',
             targetKey   : entry.canonicalKey
         })),
-        historicalReferences = (entry.historicalReferences || []).map(ref =>
+        historicalReferences: (entry.historicalReferences || []).map(ref =>
             normalizeHistoricalOriginReference(ref, entry.assignmentEvidence?.namespace)
-        );
-
-    return {
-        canonicalKey       : entry.canonicalKey,
-        originCanonicalKey : entry.originCanonicalKey || null,
-        adrNumber          : entry.adrNumber,
-        legacyId           : entry.legacyId,
-        title              : entry.title,
-        status             : entry.status || 'Accepted',
-        currentSlug        : entry.currentSlug,
-        fileName           : entry.fileName,
-        sourcePath         : entry.sourcePath,
-        assignmentEvidence : {...entry.assignmentEvidence},
-        sourceTuple        : {...entry.sourceTuple},
-        documentAvailable  : true,
-        kbAvailable        : true,
-        stale              : false,
-        visibility         : entry.visibility || 'public',
-        tenantId           : entry.tenantId || null,
-        aliases            : [...(entry.aliases || [entry.currentSlug])],
-        historicalAliases  : [...(entry.historicalAliases || [entry.legacyId])],
-        aliasBindings,
-        reservations,
-        historicalReferences,
+        ),
         semanticDisposition: entry.semanticDisposition || 'retain',
         provenance         : {
             migratedFromLegacyId    : entry.legacyId,
             migrationManifestVersion: MIGRATION_MANIFEST_VERSION,
             custodyTransitions      : entry.custodyTransition ? [{...entry.custodyTransition}] : [],
             repositoryRenames       : [],
-            sourceLineage           : [
-                {
-                    forge       : entry.sourceTuple.forge,
-                    repositoryId: entry.sourceTuple.repositoryId,
-                    namespace   : entry.sourceTuple.namespace,
-                    path        : entry.sourceTuple.path,
-                    revision    : entry.sourceTuple.revision,
-                    contentHash : entry.sourceTuple.contentHash
-                }
-            ]
+            sourceLineage           : [{
+                forge       : entry.sourceTuple.forge,
+                repositoryId: entry.sourceTuple.repositoryId,
+                namespace   : entry.sourceTuple.namespace,
+                path        : entry.sourceTuple.path,
+                revision    : entry.sourceTuple.revision,
+                contentHash : entry.sourceTuple.contentHash
+            }]
         }
     };
 }
 
-/**
- * @summary Validates the migration manifest, source/data preconditions, shared summary-vector owner
- * inventory, and reader capabilities before any migration write is permitted.
- * @param {Object} [options={}]
- * @returns {Object}
- */
+/** @summary Validates the migration manifest, source/data preconditions, shared summary-vector owners, and reader capabilities. */
 export function verifyMigrationPreconditions({
     manifest                 = REVIEWED_41_ADR_MIGRATION_MANIFEST,
     cutRepositories          = MIGRATION_CUT_REPOSITORIES,
@@ -1018,22 +606,14 @@ export function verifyMigrationPreconditions({
     requireCompleteInventory = true
 } = {}) {
     const
-        effectiveSourceProbe   = sourceProbe === undefined
-            ? createDefaultSourceProbe({manifest, cutRepositories})
-            : sourceProbe,
-        effectiveReaderContext = readerContext === undefined
-            ? createDefaultReaderContext({cutRepositories})
-            : readerContext;
+        effectiveSourceProbe   = sourceProbe === undefined ? createDefaultSourceProbe({manifest, cutRepositories}) : sourceProbe,
+        effectiveReaderContext = readerContext === undefined ? createDefaultReaderContext({cutRepositories}) : readerContext;
 
     if (!Array.isArray(manifest) || manifest.length === 0) {
-        throw createCodedError(
-            'ADR_MIGRATION_INCOMPLETE_INVENTORY',
-            'Migration manifest must be a non-empty array of reviewed ADR inventory records.'
-        );
+        fail('ADR_MIGRATION_INCOMPLETE_INVENTORY', 'Migration manifest must be a non-empty array of reviewed ADR inventory records.');
     }
-
     if (requireCompleteInventory && manifest.length !== 41) {
-        throw createCodedError(
+        fail(
             'ADR_MIGRATION_INCOMPLETE_INVENTORY',
             `Expected 41 reviewed legacy ADR records (0001..0041), received ${manifest.length}.`
         );
@@ -1044,7 +624,6 @@ export function verifyMigrationPreconditions({
         seenCanonicalKeys   = new Set(),
         seenRepoAllocations = new Set(),
         seenNumbers         = new Set();
-
     let
         anomalyCount            = 0,
         sharedVectorRecordCount = 0,
@@ -1052,20 +631,16 @@ export function verifyMigrationPreconditions({
 
     for (const entry of manifest) {
         if (!entry || typeof entry !== 'object') {
-            throw createCodedError('ADR_MIGRATION_INCOMPLETE_INVENTORY', 'Manifest contains a null or non-object record.');
+            fail('ADR_MIGRATION_INCOMPLETE_INVENTORY', 'Manifest contains a null or non-object record.');
         }
-
-        if (!ADR_NUMBER_REGEX.test(String(entry.adrNumber || '')) || !LEGACY_ID_REGEX.test(String(entry.legacyId || ''))) {
-            throw createCodedError(
+        if (
+            !ADR_NUMBER_REGEX.test(String(entry.adrNumber || '')) ||
+            !LEGACY_ID_REGEX.test(String(entry.legacyId || '')) ||
+            entry.legacyId !== `adr-${entry.adrNumber}`
+        ) {
+            fail(
                 'ADR_MIGRATION_INCONSISTENT_IDENTITY_PROOF',
-                `Invalid legacyId '${entry.legacyId}' or adrNumber '${entry.adrNumber}'.`
-            );
-        }
-
-        if (entry.legacyId !== `adr-${entry.adrNumber}`) {
-            throw createCodedError(
-                'ADR_MIGRATION_INCONSISTENT_IDENTITY_PROOF',
-                `Mismatched legacyId '${entry.legacyId}' and adrNumber '${entry.adrNumber}'.`
+                `Invalid or mismatched legacyId '${entry.legacyId}' and adrNumber '${entry.adrNumber}'.`
             );
         }
 
@@ -1073,80 +648,68 @@ export function verifyMigrationPreconditions({
         try {
             parsedKey = parseCanonicalAdrKey(entry.canonicalKey);
         } catch (err) {
-            throw createCodedError(
+            fail(
                 'ADR_MIGRATION_INCONSISTENT_IDENTITY_PROOF',
                 `Invalid canonicalKey '${entry.canonicalKey}' for '${entry.legacyId}': ${err.message}`
             );
         }
 
         if (parsedKey.number !== entry.adrNumber) {
-            throw createCodedError(
+            fail(
                 'ADR_MIGRATION_INCONSISTENT_IDENTITY_PROOF',
                 `Canonical key '${entry.canonicalKey}' number '${parsedKey.number}' does not match adrNumber '${entry.adrNumber}'.`
             );
         }
-
-        if (!entry.assignmentEvidence?.verified ||
+        if (
+            !entry.assignmentEvidence?.verified ||
             !entry.assignmentEvidence?.repositoryId ||
             !entry.assignmentEvidence?.namespace ||
             !entry.sourceTuple?.repositoryId ||
             !entry.sourceTuple?.namespace ||
             !entry.sourceTuple?.path ||
-            !entry.sourceTuple?.contentHash) {
-            throw createCodedError(
+            !entry.sourceTuple?.contentHash
+        ) {
+            fail(
                 'ADR_MIGRATION_LOST_PROVENANCE',
                 `Record '${entry.legacyId}' is missing verified assignmentEvidence or sourceTuple provenance.`
             );
         }
-
-        if (parsedKey.repositoryId !== entry.sourceTuple.repositoryId ||
-            parsedKey.namespace.toLowerCase() !== entry.sourceTuple.namespace.toLowerCase()) {
-            throw createCodedError(
+        if (
+            parsedKey.repositoryId !== entry.sourceTuple.repositoryId ||
+            parsedKey.namespace.toLowerCase() !== entry.sourceTuple.namespace.toLowerCase()
+        ) {
+            fail(
                 'ADR_MIGRATION_INCONSISTENT_IDENTITY_PROOF',
-                `Canonical key '${entry.canonicalKey}' repository does not match sourceTuple '${entry.sourceTuple.namespace}' (${entry.sourceTuple.repositoryId}).`
+                `Canonical key '${entry.canonicalKey}' repository does not match sourceTuple '${entry.sourceTuple.namespace}'.`
             );
         }
-
-        if (seenLegacyIds.has(entry.legacyId)) {
-            throw createCodedError(
+        if (seenLegacyIds.has(entry.legacyId) || seenCanonicalKeys.has(entry.canonicalKey)) {
+            fail(
                 'ADR_MIGRATION_DUPLICATE_CANONICAL_CLAIM',
-                `Duplicate legacyId '${entry.legacyId}' in migration manifest.`
+                `Duplicate legacyId '${entry.legacyId}' or canonicalKey '${entry.canonicalKey}' in migration manifest.`
             );
         }
         seenLegacyIds.add(entry.legacyId);
-
-        if (seenCanonicalKeys.has(entry.canonicalKey)) {
-            throw createCodedError(
-                'ADR_MIGRATION_DUPLICATE_CANONICAL_CLAIM',
-                `Duplicate canonicalKey '${entry.canonicalKey}' in migration manifest.`
-            );
-        }
         seenCanonicalKeys.add(entry.canonicalKey);
 
         const repoAllocKey = `${entry.sourceTuple.forge || 'github.com'}:${entry.sourceTuple.repositoryId}:${entry.adrNumber}`;
         if (seenRepoAllocations.has(repoAllocKey)) {
-            throw createCodedError(
-                'ADR_MIGRATION_DUPLICATE_CANONICAL_CLAIM',
-                `Duplicate repository number allocation '${repoAllocKey}' in migration manifest.`
-            );
+            fail('ADR_MIGRATION_DUPLICATE_CANONICAL_CLAIM', `Duplicate repository number allocation '${repoAllocKey}' in migration manifest.`);
         }
         seenRepoAllocations.add(repoAllocKey);
 
         if (entry.custodyTransition) {
             custodyMoveCount++;
-            if (!entry.custodyTransition.verified ||
-                !entry.custodyTransition.proof ||
-                !entry.custodyTransition.fromRepositoryId ||
-                !entry.custodyTransition.toRepositoryId ||
-                !entry.custodyTransition.redirectPath) {
-                throw createCodedError(
+            const ct = entry.custodyTransition;
+            if (!ct.verified || !ct.proof || !ct.fromRepositoryId || !ct.toRepositoryId || !ct.redirectPath) {
+                fail(
                     'ADR_MIGRATION_LOST_PROVENANCE',
                     `Custody move for '${entry.legacyId}' is missing verified transition proof or redirect metadata.`
                 );
             }
-            const originAllocKey = `${entry.custodyTransition.fromForge || 'github.com'}:${entry.custodyTransition.fromRepositoryId}:${entry.adrNumber}`;
+            const originAllocKey = `${ct.fromForge || 'github.com'}:${ct.fromRepositoryId}:${entry.adrNumber}`;
             if (seenRepoAllocations.has(originAllocKey)) {
-                throw createCodedError(
+                fail(
                     'ADR_MIGRATION_DUPLICATE_CANONICAL_CLAIM',
                     `Origin reservation '${originAllocKey}' collides with another allocation in migration manifest.`
                 );
@@ -1155,28 +718,17 @@ export function verifyMigrationPreconditions({
         }
 
         if (!entry.observedState || !Array.isArray(entry.observedState.reusedVectorOwners)) {
-            throw createCodedError(
-                'ADR_MIGRATION_INCOMPLETE_INVENTORY',
-                `Record '${entry.legacyId}' is missing observedState or reusedVectorOwners inventory.`
-            );
+            fail('ADR_MIGRATION_INCOMPLETE_INVENTORY', `Record '${entry.legacyId}' is missing observedState or reusedVectorOwners inventory.`);
         }
-
-        const isSummaryAnomaly = entry.observedState.nodeLabel !== 'ADR' ||
-            String(entry.observedState.observedSemanticVectorId || '').startsWith('summary_');
-        if (isSummaryAnomaly) {
+        if (
+            entry.observedState.nodeLabel !== 'ADR' ||
+            String(entry.observedState.observedSemanticVectorId || '').startsWith('summary_')
+        ) {
             anomalyCount++;
         }
-
         if (entry.observedState.anomalyShape === 'SHARED_SUMMARY_VECTOR_WITH_NON_ADR_OWNER' || entry.adrNumber === '0038') {
-            if (entry.observedState.reusedVectorOwners.length === 0) {
-                throw createCodedError(
-                    'ADR_MIGRATION_INCOMPLETE_VECTOR_OWNER_INVENTORY',
-                    `Record '${entry.legacyId}' carries a shared summary vector but lists zero reusedVectorOwners.`
-                );
-            }
-            const hasNonAdrOwner = entry.observedState.reusedVectorOwners.some(o => o && o.isAdr === false);
-            if (!hasNonAdrOwner) {
-                throw createCodedError(
+            if (!entry.observedState.reusedVectorOwners.some(o => o && o.isAdr === false)) {
+                fail(
                     'ADR_MIGRATION_INCOMPLETE_VECTOR_OWNER_INVENTORY',
                     `Record '${entry.legacyId}' shared summary vector inventory must include its non-ADR owner(s).`
                 );
@@ -1187,13 +739,12 @@ export function verifyMigrationPreconditions({
         for (const ref of entry.historicalReferences || []) {
             const normalized = normalizeHistoricalOriginReference(ref, entry.assignmentEvidence.namespace);
             if (!/^(?:ISSUE|PULL_REQUEST|DISCUSSION):[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+$/.test(normalized)) {
-                throw createCodedError(
+                fail(
                     'ADR_MIGRATION_LOST_PROVENANCE',
                     `Historical reference '${ref}' on '${entry.legacyId}' cannot be normalized to a repository-qualified origin.`
                 );
             }
         }
-
         seenNumbers.add(entry.adrNumber);
     }
 
@@ -1201,112 +752,78 @@ export function verifyMigrationPreconditions({
         for (let i = 1; i <= 41; i++) {
             const num = String(i).padStart(4, '0');
             if (!seenNumbers.has(num)) {
-                throw createCodedError(
-                    'ADR_MIGRATION_INCOMPLETE_INVENTORY',
-                    `Reviewed 41-record manifest is missing legacy ADR number '${num}'.`
-                );
+                fail('ADR_MIGRATION_INCOMPLETE_INVENTORY', `Reviewed 41-record manifest is missing legacy ADR number '${num}'.`);
             }
         }
     }
 
-    if (!effectiveSourceProbe || typeof effectiveSourceProbe !== 'object') {
-        throw createCodedError(
+    if (
+        !effectiveSourceProbe ||
+        typeof effectiveSourceProbe !== 'object' ||
+        !effectiveSourceProbe.revisions ||
+        typeof effectiveSourceProbe.revisions !== 'object'
+    ) {
+        fail(
             'ADR_MIGRATION_SOURCE_PRECONDITION_CHANGED',
             'Migration requires a valid sourceProbe object verifying cut revisions and content hashes.'
         );
     }
-
-    if (!effectiveSourceProbe.revisions || typeof effectiveSourceProbe.revisions !== 'object') {
-        throw createCodedError(
-            'ADR_MIGRATION_SOURCE_PRECONDITION_CHANGED',
-            'sourceProbe.revisions is missing or invalid.'
-        );
-    }
-
     for (const [ns, repoMeta] of Object.entries(cutRepositories || {})) {
         const
             expectedRev = repoMeta?.cutRevision,
             actualRev   = effectiveSourceProbe.revisions[ns];
 
         if (!expectedRev || !actualRev || actualRev !== expectedRev) {
-            throw createCodedError(
+            fail(
                 'ADR_MIGRATION_SOURCE_PRECONDITION_CHANGED',
                 `Repository '${ns}' revision '${actualRev ?? 'MISSING'}' drifted from manifest cutRevision '${expectedRev ?? 'MISSING'}'.`
             );
         }
     }
-
     if (!effectiveSourceProbe.contentHashes || typeof effectiveSourceProbe.contentHashes !== 'object') {
-        throw createCodedError(
-            'ADR_MIGRATION_SOURCE_PRECONDITION_CHANGED',
-            'sourceProbe.contentHashes is missing or invalid.'
-        );
+        fail('ADR_MIGRATION_SOURCE_PRECONDITION_CHANGED', 'sourceProbe.contentHashes is missing or invalid.');
     }
-
     for (const entry of manifest) {
-        const actualHash = effectiveSourceProbe.contentHashes[entry.legacyId] ??
-            effectiveSourceProbe.contentHashes[entry.canonicalKey];
-
+        const actualHash = effectiveSourceProbe.contentHashes[entry.legacyId] ?? effectiveSourceProbe.contentHashes[entry.canonicalKey];
         if (!actualHash || actualHash !== entry.sourceTuple.contentHash) {
-            throw createCodedError(
+            fail(
                 'ADR_MIGRATION_SOURCE_PRECONDITION_CHANGED',
                 `Source contentHash for '${entry.legacyId}' changed from '${entry.sourceTuple.contentHash}' to '${actualHash ?? 'MISSING'}'.`
             );
         }
-
         if (entry.custodyTransition?.redirectContentHash) {
-            if (!effectiveSourceProbe.redirectContentHashes ||
-                typeof effectiveSourceProbe.redirectContentHashes !== 'object') {
-                throw createCodedError(
-                    'ADR_MIGRATION_SOURCE_PRECONDITION_CHANGED',
-                    `sourceProbe.redirectContentHashes is missing for moved ADR '${entry.legacyId}'.`
-                );
-            }
-            const actualRedirectHash = effectiveSourceProbe.redirectContentHashes[entry.legacyId] ??
-                effectiveSourceProbe.redirectContentHashes[entry.canonicalKey];
+            const actualRedirectHash =
+                effectiveSourceProbe.redirectContentHashes?.[entry.legacyId] ??
+                effectiveSourceProbe.redirectContentHashes?.[entry.canonicalKey];
 
             if (!actualRedirectHash || actualRedirectHash !== entry.custodyTransition.redirectContentHash) {
-                throw createCodedError(
+                const expectedRedirectHash = entry.custodyTransition.redirectContentHash;
+                fail(
                     'ADR_MIGRATION_SOURCE_PRECONDITION_CHANGED',
-                    `Redirect stub contentHash for '${entry.legacyId}' changed from '${entry.custodyTransition.redirectContentHash}' to '${actualRedirectHash ?? 'MISSING'}'.`
+                    `Redirect stub contentHash for '${entry.legacyId}' changed from '${expectedRedirectHash}' to '${actualRedirectHash ?? 'MISSING'}'.`
                 );
             }
         }
     }
 
-    const privateRepos = Object.entries(cutRepositories || {}).filter(
-        ([, repoMeta]) => repoMeta?.visibility === 'private'
-    );
-
-    for (const [ns, repoMeta] of privateRepos) {
+    for (const [ns, repoMeta] of Object.entries(cutRepositories || {}).filter(([, m]) => m?.visibility === 'private')) {
         const probeSpec = repoMeta?.probeRecord;
-        if (!probeSpec ||
-            !probeSpec.canonicalKey ||
-            !probeSpec.sourcePath ||
-            !probeSpec.contentHash ||
-            !probeSpec.authorizedReaderContext ||
-            !probeSpec.unauthorizedReaderContext) {
-            throw createCodedError(
-                'ADR_MIGRATION_STAGE_POLICY_MISSING',
-                `Private repository '${ns}' in cutRepositories is missing a complete reader-policy probeRecord.`
-            );
+        if (
+            !probeSpec?.canonicalKey ||
+            !probeSpec?.sourcePath ||
+            !probeSpec?.contentHash ||
+            !probeSpec?.authorizedReaderContext ||
+            !probeSpec?.unauthorizedReaderContext
+        ) {
+            fail('ADR_MIGRATION_STAGE_POLICY_MISSING', `Private repository '${ns}' in cutRepositories is missing a complete reader-policy probeRecord.`);
         }
-
-        if (!effectiveSourceProbe.probeHashes || typeof effectiveSourceProbe.probeHashes !== 'object') {
-            throw createCodedError(
-                'ADR_MIGRATION_SOURCE_PRECONDITION_CHANGED',
-                `sourceProbe.probeHashes is missing for private repository '${ns}'.`
-            );
-        }
-
-        const actualProbeHash = effectiveSourceProbe.probeHashes[ns];
+        const actualProbeHash = effectiveSourceProbe.probeHashes?.[ns];
         if (!actualProbeHash || actualProbeHash !== probeSpec.contentHash) {
-            throw createCodedError(
+            fail(
                 'ADR_MIGRATION_SOURCE_PRECONDITION_CHANGED',
                 `Private repository '${ns}' probe contentHash '${actualProbeHash ?? 'MISSING'}' drifted from '${probeSpec.contentHash}'.`
             );
         }
-
         const stageProbeRecord = {
             canonicalKey: probeSpec.canonicalKey,
             visibility  : repoMeta.visibility,
@@ -1323,27 +840,28 @@ export function verifyMigrationPreconditions({
                 namespace   : repoMeta.namespace
             }
         };
-
-        if (isAdrReaderAuthorized(stageProbeRecord, probeSpec.unauthorizedReaderContext) ||
-            !isAdrReaderAuthorized(stageProbeRecord, probeSpec.authorizedReaderContext)) {
-            throw createCodedError(
+        if (
+            isAdrReaderAuthorized(stageProbeRecord, probeSpec.unauthorizedReaderContext) ||
+            !isAdrReaderAuthorized(stageProbeRecord, probeSpec.authorizedReaderContext)
+        ) {
+            fail(
                 'ADR_MIGRATION_STAGE_POLICY_MISSING',
                 `Private repository '${ns}' probeRecord failed unauthorized-reader denial or authorized-reader verification.`
             );
         }
-
         if (effectiveSourceProbe.requirePrivateStageAccess !== false) {
             const publicContext = effectiveReaderContext?.publicReaderContext || {
                 agentIdentity         : effectiveReaderContext?.agentIdentity || '@neo-public-reader',
                 allowPrivate          : false,
                 authorizedNamespaces  : (effectiveReaderContext?.authorizedNamespaces || []).filter(item => item !== ns),
-                authorizedRepositories: (effectiveReaderContext?.authorizedRepositories || []).filter(
-                    item => item !== ns && item !== repoMeta.repositoryId
-                )
+                authorizedRepositories: (effectiveReaderContext?.authorizedRepositories || [])
+                    .filter(item => item !== ns && item !== repoMeta.repositoryId)
             };
-            if (!isAdrReaderAuthorized(stageProbeRecord, effectiveReaderContext || {}) ||
-                isAdrReaderAuthorized(stageProbeRecord, publicContext)) {
-                throw createCodedError(
+            if (
+                !isAdrReaderAuthorized(stageProbeRecord, effectiveReaderContext || {}) ||
+                isAdrReaderAuthorized(stageProbeRecord, publicContext)
+            ) {
+                fail(
                     'ADR_MIGRATION_READER_PRECONDITION_FAILED',
                     `Reader context is not authorized for private repository '${ns}' required by cut probe.`
                 );
@@ -1351,42 +869,31 @@ export function verifyMigrationPreconditions({
         }
     }
 
-    if (db) {
-        const hasNodes = db.prepare(`
-            SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'Nodes'
-        `).get();
+    if (db && db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'Nodes'").get()) {
+        const
+            manifestByCanonical = new Map(manifest.map(e => [e.canonicalKey, e])),
+            manifestByLegacy    = new Map(manifest.map(e => [e.legacyId, e]));
 
-        if (hasNodes) {
-            const manifestByCanonical = new Map(manifest.map(e => [e.canonicalKey, e]));
-            const manifestByLegacy    = new Map(manifest.map(e => [e.legacyId, e]));
+        for (const row of db.prepare("SELECT id, data FROM Nodes WHERE id LIKE 'adr-%' OR id LIKE 'adr:%'").all()) {
+            if (row.id.startsWith('adr-') && requireCompleteInventory && !manifestByLegacy.has(row.id)) {
+                fail('ADR_MIGRATION_DATA_PRECONDITION_CHANGED', `Uninventoried legacy node '${row.id}' found in SQLite Nodes table.`);
+            }
+            if (row.id.startsWith('adr:')) {
+                const expectedEntry = manifestByCanonical.get(row.id);
+                if (expectedEntry) {
+                    let parsedData = null;
+                    try {
+                        parsedData = JSON.parse(row.data);
+                    } catch {}
+                    const existingLegacyId =
+                        parsedData?.properties?.adrAdmissionRecord?.legacyId ||
+                        parsedData?.properties?.adrAuthority?.migratedFromLegacyId;
 
-            const existingRows = db.prepare(`
-                SELECT id, data FROM Nodes WHERE id LIKE 'adr-%' OR id LIKE 'adr:%'
-            `).all();
-
-            for (const row of existingRows) {
-                if (row.id.startsWith('adr-')) {
-                    if (requireCompleteInventory && !manifestByLegacy.has(row.id)) {
-                        throw createCodedError(
+                    if (existingLegacyId && existingLegacyId !== expectedEntry.legacyId) {
+                        fail(
                             'ADR_MIGRATION_DATA_PRECONDITION_CHANGED',
-                            `Uninventoried legacy node '${row.id}' found in SQLite Nodes table.`
+                            `Canonical node '${row.id}' in SQLite is already claimed by '${existingLegacyId}' instead of '${expectedEntry.legacyId}'.`
                         );
-                    }
-                } else if (row.id.startsWith('adr:')) {
-                    const expectedEntry = manifestByCanonical.get(row.id);
-                    if (expectedEntry) {
-                        let parsedData = null;
-                        try {
-                            parsedData = JSON.parse(row.data);
-                        } catch {}
-                        const existingLegacyId = parsedData?.properties?.adrAdmissionRecord?.legacyId ||
-                            parsedData?.properties?.adrAuthority?.migratedFromLegacyId;
-                        if (existingLegacyId && existingLegacyId !== expectedEntry.legacyId) {
-                            throw createCodedError(
-                                'ADR_MIGRATION_DATA_PRECONDITION_CHANGED',
-                                `Canonical node '${row.id}' in SQLite is already claimed by '${existingLegacyId}' instead of '${expectedEntry.legacyId}'.`
-                            );
-                        }
                     }
                 }
             }
@@ -1404,43 +911,21 @@ export function verifyMigrationPreconditions({
     };
 }
 
-/**
- * @summary Ensures the SQLite schema (`Nodes`, `Edges`, and `AdrIdentityMigrationJournal`) exists.
- * @param {Object} db `better-sqlite3` database instance.
- */
+/** @summary Ensures the SQLite schema (`Nodes`, `Edges`, and `AdrIdentityMigrationJournal`) exists. */
 export function ensureMigrationTables(db) {
     db.exec(`
-        CREATE TABLE IF NOT EXISTS Nodes (
-            id TEXT PRIMARY KEY,
-            data TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS Edges (
-            id TEXT PRIMARY KEY,
-            source TEXT NOT NULL,
-            target TEXT NOT NULL,
-            type TEXT NOT NULL,
-            data TEXT NOT NULL
-        );
+        CREATE TABLE IF NOT EXISTS Nodes (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS Edges (id TEXT PRIMARY KEY, source TEXT NOT NULL, target TEXT NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_edges_source ON Edges(source);
         CREATE INDEX IF NOT EXISTS idx_edges_target ON Edges(target);
         CREATE TABLE IF NOT EXISTS AdrIdentityMigrationJournal (
-            migration_id TEXT PRIMARY KEY,
-            manifest_version TEXT NOT NULL,
-            phase TEXT NOT NULL,
-            completed_phases TEXT NOT NULL,
-            backup_path TEXT,
-            state_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            migration_id TEXT PRIMARY KEY, manifest_version TEXT NOT NULL, phase TEXT NOT NULL,
+            completed_phases TEXT NOT NULL, backup_path TEXT, state_json TEXT NOT NULL, updated_at TEXT NOT NULL
         );
     `);
 }
 
-/**
- * @summary Creates a point-in-time backup snapshot of ADR graph nodes, incident edges, shared-vector
- * owner nodes, vector store entries, and KB projection entries prior to applying the migration.
- * @param {Object} [options={}]
- * @returns {Object}
- */
+/** @summary Creates a point-in-time backup snapshot of ADR graph nodes, edges, vectors, and KB entries. */
 export function createAdrMigrationBackup({
     db,
     vectorStore = null,
@@ -1449,7 +934,7 @@ export function createAdrMigrationBackup({
     manifest    = REVIEWED_41_ADR_MIGRATION_MANIFEST
 } = {}) {
     if (!db) {
-        throw createCodedError('ADR_MIGRATION_DB_REQUIRED', 'createAdrMigrationBackup requires a SQLite db handle.');
+        fail('ADR_MIGRATION_DB_REQUIRED', 'createAdrMigrationBackup requires a SQLite db handle.');
     }
     ensureMigrationTables(db);
 
@@ -1465,24 +950,26 @@ export function createAdrMigrationBackup({
     }
 
     const
-        allNodes    = db.prepare('SELECT id, data FROM Nodes ORDER BY id ASC').all(),
-        allEdges    = db.prepare('SELECT id, source, target, type, data FROM Edges ORDER BY id ASC').all(),
-        backedNodes = allNodes.filter(row =>
-            legacyIds.has(row.id) ||
-            canonicalKeys.has(row.id) ||
-            ownerNodeIds.has(row.id) ||
-            row.id.startsWith('adr-') ||
-            row.id.startsWith('adr:')
+        backedNodes = db.prepare('SELECT id, data FROM Nodes ORDER BY id ASC').all().filter(r =>
+            legacyIds.has(r.id) ||
+            canonicalKeys.has(r.id) ||
+            ownerNodeIds.has(r.id) ||
+            r.id.startsWith('adr-') ||
+            r.id.startsWith('adr:')
         ),
-        backedEdges  = allEdges.filter(row =>
-            legacyIds.has(row.source) ||
-            legacyIds.has(row.target) ||
-            canonicalKeys.has(row.source) ||
-            canonicalKeys.has(row.target)
-        );
+        backedEdges = db.prepare('SELECT id, source, target, type, data FROM Edges ORDER BY id ASC').all().filter(r =>
+            legacyIds.has(r.source) ||
+            legacyIds.has(r.target) ||
+            canonicalKeys.has(r.source) ||
+            canonicalKeys.has(r.target)
+        ),
+        vectorEntries = [],
+        kbEntries     = [];
 
-    let   vectorExportResult = null;
-    const vectorEntries      = [];
+    let
+        vectorExportResult = null,
+        kbExportResult     = null;
+
     if (vectorStore instanceof Map) {
         for (const [k, v] of vectorStore.entries()) {
             if (legacyIds.has(k) || canonicalKeys.has(k) || String(k).startsWith('summary_')) {
@@ -1493,8 +980,6 @@ export function createAdrMigrationBackup({
         vectorExportResult = vectorStore.exportSnapshot({manifest});
     }
 
-    let   kbExportResult = null;
-    const kbEntries      = [];
     if (kbStore instanceof Map) {
         for (const [k, v] of kbStore.entries()) {
             if (legacyIds.has(k) || canonicalKeys.has(k)) {
@@ -1506,13 +991,8 @@ export function createAdrMigrationBackup({
     }
 
     const finalizeSnapshot = (resolvedVecExport, resolvedKbExport) => {
-        if (Array.isArray(resolvedVecExport)) {
-            vectorEntries.push(...structuredClone(resolvedVecExport));
-        }
-        if (Array.isArray(resolvedKbExport)) {
-            kbEntries.push(...structuredClone(resolvedKbExport));
-        }
-
+        if (Array.isArray(resolvedVecExport)) vectorEntries.push(...structuredClone(resolvedVecExport));
+        if (Array.isArray(resolvedKbExport)) kbEntries.push(...structuredClone(resolvedKbExport));
         const snapshot = {
             version    : MIGRATION_MANIFEST_VERSION,
             createdAt  : new Date().toISOString(),
@@ -1522,31 +1002,20 @@ export function createAdrMigrationBackup({
             vectorEntries,
             kbEntries
         };
-
         if (typeof backupPath === 'string' && backupPath.trim()) {
             fs.mkdirSync(path.dirname(path.resolve(backupPath)), {recursive: true});
             fs.writeFileSync(path.resolve(backupPath), JSON.stringify(snapshot, null, 2), 'utf-8');
         }
-
         return snapshot;
     };
 
     if (typeof vectorExportResult?.then === 'function' || typeof kbExportResult?.then === 'function') {
-        return Promise.all([vectorExportResult, kbExportResult]).then(
-            ([vecArr, kbArr]) => finalizeSnapshot(vecArr, kbArr)
-        );
+        return Promise.all([vectorExportResult, kbExportResult]).then(([vecArr, kbArr]) => finalizeSnapshot(vecArr, kbArr));
     }
-
     return finalizeSnapshot(vectorExportResult, kbExportResult);
 }
 
-/**
- * @summary Restores ADR graph nodes, incident edges, vector store entries, and KB projection entries
- * from a pre-migration backup without harming unrelated graph nodes, shared non-ADR summary vectors,
- * or non-ADR KB consumers.
- * @param {Object} [options={}]
- * @returns {Object}
- */
+/** @summary Restores ADR graph nodes, edges, vectors, and KB entries from a pre-migration backup snapshot. */
 export function restoreAdrMigrationBackup({
     db,
     vectorStore = null,
@@ -1555,68 +1024,61 @@ export function restoreAdrMigrationBackup({
     backupPath  = null
 } = {}) {
     if (!db) {
-        throw createCodedError('ADR_MIGRATION_DB_REQUIRED', 'restoreAdrMigrationBackup requires a SQLite db handle.');
+        fail('ADR_MIGRATION_DB_REQUIRED', 'restoreAdrMigrationBackup requires a SQLite db handle.');
     }
-
     const resolvedBackup = backup || (
         typeof backupPath === 'string' && backupPath.trim() && fs.existsSync(path.resolve(backupPath))
             ? JSON.parse(fs.readFileSync(path.resolve(backupPath), 'utf-8'))
             : null
     );
-
     if (!resolvedBackup || !Array.isArray(resolvedBackup.nodes) || !Array.isArray(resolvedBackup.edges)) {
-        throw createCodedError(
-            'ADR_MIGRATION_BACKUP_INVALID',
-            'restoreAdrMigrationBackup requires a valid backup snapshot object or readable backupPath.'
-        );
+        fail('ADR_MIGRATION_BACKUP_INVALID', 'restoreAdrMigrationBackup requires a valid backup snapshot object or readable backupPath.');
     }
 
     ensureMigrationTables(db);
-
     const
-        manifestIds   = resolvedBackup.manifestIds || REVIEWED_41_ADR_MIGRATION_MANIFEST.map(e => ({legacyId: e.legacyId, canonicalKey: e.canonicalKey})),
+        manifestIds   = resolvedBackup.manifestIds || REVIEWED_41_ADR_MIGRATION_MANIFEST.map(e => ({
+            legacyId    : e.legacyId,
+            canonicalKey: e.canonicalKey
+        })),
         legacyIds     = new Set(manifestIds.map(e => e.legacyId)),
         canonicalKeys = new Set(manifestIds.map(e => e.canonicalKey));
 
-    const restoreTx = db.transaction(() => {
-        const currentEdges   = db.prepare('SELECT id, source, target FROM Edges').all();
+    db.transaction(() => {
         const deleteEdgeStmt = db.prepare('DELETE FROM Edges WHERE id = ?');
-        for (const edge of currentEdges) {
-            if (legacyIds.has(edge.source) || legacyIds.has(edge.target) ||
-                canonicalKeys.has(edge.source) || canonicalKeys.has(edge.target)) {
+        for (const edge of db.prepare('SELECT id, source, target FROM Edges').all()) {
+            if (
+                legacyIds.has(edge.source) ||
+                legacyIds.has(edge.target) ||
+                canonicalKeys.has(edge.source) ||
+                canonicalKeys.has(edge.target)
+            ) {
                 deleteEdgeStmt.run(edge.id);
             }
         }
-
         const deleteNodeStmt = db.prepare('DELETE FROM Nodes WHERE id = ?');
         for (const id of [...legacyIds, ...canonicalKeys]) {
             deleteNodeStmt.run(id);
         }
-
         const upsertNodeStmt = db.prepare('INSERT OR REPLACE INTO Nodes (id, data) VALUES (?, ?)');
         for (const row of resolvedBackup.nodes) {
             upsertNodeStmt.run(row.id, row.data);
         }
-
-        const upsertEdgeStmt = db.prepare(
-            'INSERT OR REPLACE INTO Edges (id, source, target, type, data) VALUES (?, ?, ?, ?, ?)'
-        );
+        const upsertEdgeStmt = db.prepare('INSERT OR REPLACE INTO Edges (id, source, target, type, data) VALUES (?, ?, ?, ?, ?)');
         for (const edge of resolvedBackup.edges) {
             upsertEdgeStmt.run(edge.id, edge.source, edge.target, edge.type, edge.data);
         }
-
         db.prepare('DELETE FROM AdrIdentityMigrationJournal').run();
-    });
-
-    restoreTx();
+    })();
 
     let
         restoredVectorsCount = 0,
-        vectorRestoreResult  = null;
+        vectorRestoreResult  = null,
+        restoredKbCount      = 0,
+        kbRestoreResult      = null;
+
     if (vectorStore instanceof Map) {
-        for (const key of canonicalKeys) {
-            vectorStore.delete(key);
-        }
+        for (const key of canonicalKeys) vectorStore.delete(key);
         for (const [k, v] of resolvedBackup.vectorEntries || []) {
             vectorStore.set(k, structuredClone(v));
             restoredVectorsCount++;
@@ -1626,13 +1088,8 @@ export function restoreAdrMigrationBackup({
         restoredVectorsCount = (resolvedBackup.vectorEntries || []).length;
     }
 
-    let
-        restoredKbCount = 0,
-        kbRestoreResult = null;
     if (kbStore instanceof Map) {
-        for (const key of canonicalKeys) {
-            kbStore.delete(key);
-        }
+        for (const key of canonicalKeys) kbStore.delete(key);
         for (const [k, v] of resolvedBackup.kbEntries || []) {
             kbStore.set(k, structuredClone(v));
             restoredKbCount++;
@@ -1644,7 +1101,6 @@ export function restoreAdrMigrationBackup({
 
     const finalizeRestore = () => {
         resetSharedAdrCatalog();
-
         return {
             restored          : true,
             restoredNodesCount: resolvedBackup.nodes.length,
@@ -1653,25 +1109,12 @@ export function restoreAdrMigrationBackup({
             restoredKbCount
         };
     };
-
     if (typeof vectorRestoreResult?.then === 'function' || typeof kbRestoreResult?.then === 'function') {
         return Promise.all([vectorRestoreResult, kbRestoreResult]).then(finalizeRestore);
     }
-
     return finalizeRestore();
 }
 
-/**
- * @summary Merges edge data payloads when two incident edges collapse onto the same `(source, target, type)`
- * tuple during legacy-to-canonical endpoint rewriting, ensuring zero edge metadata or provenance loss.
- * @param {Object} existingData
- * @param {Object} incomingData
- * @param {String} targetId
- * @param {String} newSource
- * @param {String} newTarget
- * @returns {Object}
- * @private
- */
 function mergeMigratedEdgeData(existingData, incomingData, targetId, newSource, newTarget) {
     const
         existingProps = existingData?.properties || {},
@@ -1683,10 +1126,12 @@ function mergeMigratedEdgeData(existingData, incomingData, targetId, newSource, 
             ...(incomingProps.origin ? [incomingProps.origin] : [])
         ])),
         mergedProvenance = [
-            ...(Array.isArray(existingProps.provenance) ? existingProps.provenance : []),
-            ...(existingProps.provenance && !Array.isArray(existingProps.provenance) ? [existingProps.provenance] : []),
-            ...(Array.isArray(incomingProps.provenance) ? incomingProps.provenance : []),
-            ...(incomingProps.provenance && !Array.isArray(incomingProps.provenance) ? [incomingProps.provenance] : [])
+            ...(Array.isArray(existingProps.provenance)
+                ? existingProps.provenance
+                : existingProps.provenance ? [existingProps.provenance] : []),
+            ...(Array.isArray(incomingProps.provenance)
+                ? incomingProps.provenance
+                : incomingProps.provenance ? [incomingProps.provenance] : [])
         ],
         mergedLegacyEdgeIds = Array.from(new Set([
             ...(existingProps.migratedFromEdgeIds || []),
@@ -1712,12 +1157,7 @@ function mergeMigratedEdgeData(existingData, incomingData, targetId, newSource, 
     };
 }
 
-/**
- * @summary Executes or dry-runs the 41-record legacy ADR identity migration with restartable
- * cross-store phase journaling across SQLite (`Nodes` / `Edges`), `vectorStore`, and `kbStore`.
- * @param {Object} [options={}]
- * @returns {Promise<Object>}
- */
+/** @summary Executes or dry-runs the 41-record legacy ADR identity migration with restartable cross-store phase journaling. */
 export async function migrateLegacyAdrIdentities({
     db                       = null,
     sqlitePath               = null,
@@ -1750,7 +1190,6 @@ export async function migrateLegacyAdrIdentities({
             readerContext,
             requireCompleteInventory
         });
-
         const plannedNodeMigrations = manifest.map(entry => {
             const
                 isSummaryVector = String(entry.observedState.observedSemanticVectorId || '').startsWith('summary_'),
@@ -1778,41 +1217,7 @@ export async function migrateLegacyAdrIdentities({
         });
 
         if (dryRun || !apply) {
-            if (typeof backupPath === 'string' && backupPath.trim()) {
-                if (!db) {
-                    throw createCodedError(
-                        'ADR_MIGRATION_DB_REQUIRED',
-                        'Creating a migration backup (--backup) requires a SQLite db or sqlitePath.'
-                    );
-                }
-                const backupSnapshot = await createAdrMigrationBackup({
-                    db,
-                    vectorStore,
-                    kbStore,
-                    backupPath,
-                    manifest
-                });
-                return {
-                    mode             : 'backup',
-                    applied          : false,
-                    noOpRerun        : false,
-                    migrationId,
-                    manifestVersion  : MIGRATION_MANIFEST_VERSION,
-                    backupPath       : path.resolve(backupPath),
-                    backupNodeCount  : backupSnapshot.nodes.length,
-                    backupEdgeCount  : backupSnapshot.edges.length,
-                    backupVectorCount: backupSnapshot.vectorEntries.length,
-                    backupKbCount    : backupSnapshot.kbEntries.length,
-                    preconditions,
-                    plannedNodeMigrations,
-                    plannedCount     : plannedNodeMigrations.length,
-                    custodyMovesCount: plannedNodeMigrations.filter(p => Boolean(p.custodyTransition)).length,
-                    anomaliesCount   : plannedNodeMigrations.filter(p => p.anomalyShape !== 'NONE').length
-                };
-            }
-
-            return {
-                mode             : 'dry-run',
+            const basePlan = {
                 applied          : false,
                 noOpRerun        : false,
                 migrationId,
@@ -1823,45 +1228,42 @@ export async function migrateLegacyAdrIdentities({
                 custodyMovesCount: plannedNodeMigrations.filter(p => Boolean(p.custodyTransition)).length,
                 anomaliesCount   : plannedNodeMigrations.filter(p => p.anomalyShape !== 'NONE').length
             };
+            if (typeof backupPath === 'string' && backupPath.trim()) {
+                if (!db) {
+                    fail('ADR_MIGRATION_DB_REQUIRED', 'Creating a migration backup (--backup) requires a SQLite db or sqlitePath.');
+                }
+                const snap = await createAdrMigrationBackup({db, vectorStore, kbStore, backupPath, manifest});
+                return {
+                    ...basePlan,
+                    mode             : 'backup',
+                    backupPath       : path.resolve(backupPath),
+                    backupNodeCount  : snap.nodes.length,
+                    backupEdgeCount  : snap.edges.length,
+                    backupVectorCount: snap.vectorEntries.length,
+                    backupKbCount    : snap.kbEntries.length
+                };
+            }
+            return {...basePlan, mode: 'dry-run'};
         }
 
         if (!db) {
-            throw createCodedError(
-                'ADR_MIGRATION_DB_REQUIRED',
-                'Applying the migration (--apply) requires a writable SQLite db or sqlitePath.'
-            );
+            fail('ADR_MIGRATION_DB_REQUIRED', 'Applying the migration (--apply) requires a writable SQLite db or sqlitePath.');
         }
-
         if (!isValidMigrationStore(vectorStore)) {
-            throw createCodedError(
-                'ADR_MIGRATION_VECTOR_STORE_REQUIRED',
-                'Applying the migration (--apply) requires a valid vectorStore (Map or Chroma adapter implementing applyAdrMigration, exportSnapshot, and restoreSnapshot).'
-            );
+            fail('ADR_MIGRATION_VECTOR_STORE_REQUIRED', 'Applying the migration (--apply) requires a valid vectorStore.');
         }
-
         if (!isValidMigrationStore(kbStore)) {
-            throw createCodedError(
-                'ADR_MIGRATION_KB_STORE_REQUIRED',
-                'Applying the migration (--apply) requires a valid kbStore (Map or Chroma adapter implementing applyAdrMigration, exportSnapshot, and restoreSnapshot).'
-            );
+            fail('ADR_MIGRATION_KB_STORE_REQUIRED', 'Applying the migration (--apply) requires a valid kbStore.');
         }
 
         ensureMigrationTables(db);
-
-        const existingJournal = db.prepare(
-            'SELECT * FROM AdrIdentityMigrationJournal WHERE migration_id = ?'
-        ).get(migrationId);
-
-        const completedPhases = existingJournal
-            ? JSON.parse(existingJournal.completed_phases || '[]')
-            : [];
-        const savedState = existingJournal
-            ? JSON.parse(existingJournal.state_json || '{}')
-            : {};
+        const
+            existingJournal = db.prepare('SELECT * FROM AdrIdentityMigrationJournal WHERE migration_id = ?').get(migrationId),
+            completedPhases = existingJournal ? JSON.parse(existingJournal.completed_phases || '[]') : [],
+            savedState      = existingJournal ? JSON.parse(existingJournal.state_json || '{}') : {};
 
         if (existingJournal?.phase === 'completed' || completedPhases.includes('completed')) {
-            const admissionRecords = manifest.map(buildAdrMigrationRecordFromManifestEntry);
-            hydrateAdrAdmissionRecords(admissionRecords, {replaceExisting: true});
+            hydrateAdrAdmissionRecords(manifest.map(buildAdrMigrationRecordFromManifestEntry), {replaceExisting: true});
             return {
                 mode           : 'apply',
                 applied        : false,
@@ -1876,12 +1278,9 @@ export async function migrateLegacyAdrIdentities({
             };
         }
 
-        const resumed = completedPhases.length > 0;
-
+        const resumed            = completedPhases.length > 0;
         const recordJournalPhase = (phase, extraState = {}) => {
-            if (!completedPhases.includes(phase)) {
-                completedPhases.push(phase);
-            }
+            if (!completedPhases.includes(phase)) completedPhases.push(phase);
             Object.assign(savedState, extraState);
             db.prepare(`
                 INSERT OR REPLACE INTO AdrIdentityMigrationJournal (
@@ -1896,32 +1295,19 @@ export async function migrateLegacyAdrIdentities({
                 JSON.stringify(savedState),
                 new Date().toISOString()
             );
-
             if (failAfterPhase === phase) {
-                throw createCodedError(
-                    'ADR_MIGRATION_INTERRUPTED_FOR_TEST',
-                    `Simulated interruption immediately after phase '${phase}'.`
-                );
+                fail('ADR_MIGRATION_INTERRUPTED_FOR_TEST', `Simulated interruption immediately after phase '${phase}'.`);
             }
         };
 
-        // Phase 1: preconditions_verified
         if (!completedPhases.includes('preconditions_verified')) {
             recordJournalPhase('preconditions_verified', {preconditionsVerifiedAt: preconditions.verifiedAt});
         }
-
-        // Phase 2: backup_created
         if (!completedPhases.includes('backup_created')) {
-            const backupSnapshot = await createAdrMigrationBackup({
-                db,
-                vectorStore,
-                kbStore,
-                backupPath,
-                manifest
-            });
+            const snap = await createAdrMigrationBackup({db, vectorStore, kbStore, backupPath, manifest});
             recordJournalPhase('backup_created', {
-                backupNodeCount: backupSnapshot.nodes.length,
-                backupEdgeCount: backupSnapshot.edges.length
+                backupNodeCount: snap.nodes.length,
+                backupEdgeCount: snap.edges.length
             });
         }
 
@@ -1932,7 +1318,6 @@ export async function migrateLegacyAdrIdentities({
             manifestByCanonical  = new Map(manifest.map(e => [e.canonicalKey, e])),
             admissionByCanonical = new Map(admissionRecords.map(r => [r.canonicalKey, r]));
 
-        // Phase 3: graph_sqlite_applied
         if (!completedPhases.includes('graph_sqlite_applied')) {
             let
                 migratedNodesCount  = 0,
@@ -1940,7 +1325,7 @@ export async function migrateLegacyAdrIdentities({
                 rewrittenEdgesCount = 0,
                 mergedEdgesCount    = 0;
 
-            const applySqliteTx = db.transaction(() => {
+            db.transaction(() => {
                 const
                     getNodeStmt    = db.prepare('SELECT id, data FROM Nodes WHERE id = ?'),
                     upsertNodeStmt = db.prepare('INSERT OR REPLACE INTO Nodes (id, data) VALUES (?, ?)'),
@@ -1952,33 +1337,26 @@ export async function migrateLegacyAdrIdentities({
                         admissionRecord = admissionRecords[idx],
                         legacyRow       = getNodeStmt.get(entry.legacyId),
                         canonicalRow    = getNodeStmt.get(entry.canonicalKey);
-
                     let existingNodeObj = {};
-                    if (legacyRow) {
-                        try { existingNodeObj = JSON.parse(legacyRow.data); } catch {}
-                    } else if (canonicalRow) {
-                        try { existingNodeObj = JSON.parse(canonicalRow.data); } catch {}
-                    }
+                    try {
+                        existingNodeObj = JSON.parse((legacyRow || canonicalRow)?.data || '{}');
+                    } catch {}
 
                     const
                         existingProps   = existingNodeObj.properties || {},
                         previousLabel   = existingNodeObj.label || entry.observedState.nodeLabel || 'ADR',
                         previousVecId   = existingNodeObj.semanticVectorId || entry.observedState.observedSemanticVectorId || entry.legacyId,
                         isSummaryVec    = String(previousVecId).startsWith('summary_'),
-                        nonAdrVecOwners = (entry.observedState.reusedVectorOwners || []).filter(o => o.isAdr === false);
-
-                    if (previousLabel !== 'ADR') {
-                        relabeledNodesCount++;
-                    }
-
-                    const
-                        declaredRefs   = admissionRecord.historicalReferences || [],
-                        normalizedRefs = Array.from(new Set([
+                        nonAdrVecOwners = (entry.observedState.reusedVectorOwners || []).filter(o => o.isAdr === false),
+                        declaredRefs    = admissionRecord.historicalReferences || [],
+                        normalizedRefs  = Array.from(new Set([
                             ...declaredRefs,
                             ...((existingProps.historicalReferences || []).map(r =>
                                 normalizeHistoricalOriginReference(r, entry.assignmentEvidence.namespace, declaredRefs)
                             ))
                         ])).filter(Boolean);
+
+                    if (previousLabel !== 'ADR') relabeledNodesCount++;
 
                     const newNodePayload = {
                         ...existingNodeObj,
@@ -2023,49 +1401,46 @@ export async function migrateLegacyAdrIdentities({
                     };
 
                     upsertNodeStmt.run(entry.canonicalKey, JSON.stringify(newNodePayload));
-                    if (legacyRow) {
-                        deleteNodeStmt.run(entry.legacyId);
-                    }
+                    if (legacyRow) deleteNodeStmt.run(entry.legacyId);
                     migratedNodesCount++;
                 }
 
-                // Rewrite all incident edges referencing any legacy ADR ID
                 const
                     allEdges       = db.prepare('SELECT id, source, target, type, data FROM Edges ORDER BY id ASC').all(),
                     deleteEdgeStmt = db.prepare('DELETE FROM Edges WHERE id = ?'),
-                    upsertEdgeStmt = db.prepare(
-                        'INSERT OR REPLACE INTO Edges (id, source, target, type, data) VALUES (?, ?, ?, ?, ?)'
-                    ),
+                    upsertEdgeStmt = db.prepare('INSERT OR REPLACE INTO Edges (id, source, target, type, data) VALUES (?, ?, ?, ?, ?)'),
                     edgeByTuple    = new Map();
 
                 for (const row of allEdges) {
+                    if (legacyToCanonical.has(row.source) || legacyToCanonical.has(row.target)) continue;
                     let parsed = {};
-                    try { parsed = JSON.parse(row.data); } catch {}
-                    const tupleKey = `${row.source}|${row.target}|${row.type}`;
-                    if (!legacyToCanonical.has(row.source) && !legacyToCanonical.has(row.target)) {
-                        edgeByTuple.set(tupleKey, {id: row.id, source: row.source, target: row.target, type: row.type, data: parsed});
-                    }
+                    try {
+                        parsed = JSON.parse(row.data);
+                    } catch {}
+                    edgeByTuple.set(`${row.source}|${row.target}|${row.type}`, {
+                        id    : row.id,
+                        source: row.source,
+                        target: row.target,
+                        type  : row.type,
+                        data  : parsed
+                    });
                 }
 
                 for (const row of allEdges) {
-                    const
-                        hasLegacySource = legacyToCanonical.has(row.source),
-                        hasLegacyTarget = legacyToCanonical.has(row.target);
-
-                    if (!hasLegacySource && !hasLegacyTarget) continue;
-
+                    if (!legacyToCanonical.has(row.source) && !legacyToCanonical.has(row.target)) continue;
                     const
                         newSource = legacyToCanonical.get(row.source) || row.source,
                         newTarget = legacyToCanonical.get(row.target) || row.target,
                         tupleKey  = `${newSource}|${newTarget}|${row.type}`;
-
                     let parsed = {};
-                    try { parsed = JSON.parse(row.data); } catch {}
+                    try {
+                        parsed = JSON.parse(row.data);
+                    } catch {}
 
                     const
-                        existingProps   = parsed.properties || {},
-                        normalizedProps = {...existingProps},
-                        incidentEntry   = manifestByLegacy.get(row.source) ||
+                        normalizedProps = {...(parsed.properties || {})},
+                        incidentEntry   =
+                            manifestByLegacy.get(row.source) ||
                             manifestByLegacy.get(row.target) ||
                             manifestByCanonical.get(newSource) ||
                             manifestByCanonical.get(newTarget) ||
@@ -2103,13 +1478,7 @@ export async function migrateLegacyAdrIdentities({
                             newTarget
                         );
                         existingSurvivor.data = mergedData;
-                        upsertEdgeStmt.run(
-                            existingSurvivor.id,
-                            newSource,
-                            newTarget,
-                            row.type,
-                            JSON.stringify(mergedData)
-                        );
+                        upsertEdgeStmt.run(existingSurvivor.id, newSource, newTarget, row.type, JSON.stringify(mergedData));
                         mergedEdgesCount++;
                     } else {
                         const
@@ -2122,32 +1491,17 @@ export async function migrateLegacyAdrIdentities({
                                 type      : row.type,
                                 properties: {
                                     ...normalizedProps,
-                                    migratedFromEdgeIds: Array.from(new Set([
-                                        ...(normalizedProps.migratedFromEdgeIds || []),
-                                        row.id
-                                    ]))
+                                    migratedFromEdgeIds: Array.from(new Set([...(normalizedProps.migratedFromEdgeIds || []), row.id]))
                                 }
                             };
-                        edgeByTuple.set(tupleKey, {
-                            id    : newEdgeId,
-                            source: newSource,
-                            target: newTarget,
-                            type  : row.type,
-                            data  : newEdgeData
-                        });
+                        edgeByTuple.set(tupleKey, {id: newEdgeId, source: newSource, target: newTarget, type: row.type, data: newEdgeData});
                         upsertEdgeStmt.run(newEdgeId, newSource, newTarget, row.type, JSON.stringify(newEdgeData));
                     }
                 }
-            });
+            })();
 
-            applySqliteTx();
-
-            // Hydrate in-memory catalog state
-            for (const repo of Object.values(cutRepositories)) {
-                registerSharedForgeRepository(repo);
-            }
+            for (const repo of Object.values(cutRepositories)) registerSharedForgeRepository(repo);
             hydrateAdrAdmissionRecords(admissionRecords, {replaceExisting: true});
-
             recordJournalPhase('graph_sqlite_applied', {
                 migratedNodesCount,
                 relabeledNodesCount,
@@ -2155,35 +1509,32 @@ export async function migrateLegacyAdrIdentities({
                 mergedEdgesCount
             });
         } else {
-            for (const repo of Object.values(cutRepositories)) {
-                registerSharedForgeRepository(repo);
-            }
+            for (const repo of Object.values(cutRepositories)) registerSharedForgeRepository(repo);
             hydrateAdrAdmissionRecords(admissionRecords, {replaceExisting: true});
         }
 
-        // Phase 4: vector_store_applied
         if (!completedPhases.includes('vector_store_applied')) {
             let
                 upsertedVectorsCount         = 0,
                 removedLegacyAdrVectorsCount = 0,
                 preservedSummaryVectorsCount = 0;
-
             const nonAdrSummaryIds = new Set();
+
             for (const entry of manifest) {
                 const vecId = entry.observedState?.observedSemanticVectorId;
-                if (typeof vecId === 'string' && vecId.startsWith('summary_')) {
-                    const hasNonAdrOwner = (entry.observedState.reusedVectorOwners || []).some(o => o.isAdr === false);
-                    if (hasNonAdrOwner) {
-                        nonAdrSummaryIds.add(vecId);
-                    }
+                if (
+                    typeof vecId === 'string' &&
+                    vecId.startsWith('summary_') &&
+                    (entry.observedState.reusedVectorOwners || []).some(o => o.isAdr === false)
+                ) {
+                    nonAdrSummaryIds.add(vecId);
                 }
             }
 
             if (vectorStore instanceof Map) {
                 for (const entry of manifest) {
-                    const legacyEntry = vectorStore.get(entry.legacyId);
                     vectorStore.set(entry.canonicalKey, {
-                        ...(legacyEntry || {}),
+                        ...(vectorStore.get(entry.legacyId) || {}),
                         id          : entry.canonicalKey,
                         canonicalKey: entry.canonicalKey,
                         legacyId    : entry.legacyId,
@@ -2194,17 +1545,13 @@ export async function migrateLegacyAdrIdentities({
                         contentHash : entry.sourceTuple.contentHash
                     });
                     upsertedVectorsCount++;
-
                     if (vectorStore.has(entry.legacyId)) {
                         vectorStore.delete(entry.legacyId);
                         removedLegacyAdrVectorsCount++;
                     }
                 }
-
                 for (const summaryVecId of nonAdrSummaryIds) {
-                    if (vectorStore.has(summaryVecId)) {
-                        preservedSummaryVectorsCount++;
-                    }
+                    if (vectorStore.has(summaryVecId)) preservedSummaryVectorsCount++;
                 }
             } else if (vectorStore && typeof vectorStore.applyAdrMigration === 'function') {
                 const res = await vectorStore.applyAdrMigration({manifest, nonAdrSummaryIds: Array.from(nonAdrSummaryIds)});
@@ -2212,7 +1559,6 @@ export async function migrateLegacyAdrIdentities({
                 removedLegacyAdrVectorsCount = res?.removedLegacyAdrVectorsCount ?? 0;
                 preservedSummaryVectorsCount = res?.preservedSummaryVectorsCount ?? nonAdrSummaryIds.size;
             }
-
             recordJournalPhase('vector_store_applied', {
                 upsertedVectorsCount,
                 removedLegacyAdrVectorsCount,
@@ -2220,19 +1566,16 @@ export async function migrateLegacyAdrIdentities({
             });
         }
 
-        // Phase 5: kb_projection_applied
         if (!completedPhases.includes('kb_projection_applied')) {
             let migratedKbEntriesCount = 0;
-
             if (kbStore instanceof Map) {
                 for (let idx = 0; idx < manifest.length; idx++) {
                     const
                         entry           = manifest[idx],
-                        admissionRecord = admissionRecords[idx],
-                        existingLegacy  = kbStore.get(entry.legacyId) || {};
+                        admissionRecord = admissionRecords[idx];
 
                     kbStore.set(entry.canonicalKey, {
-                        ...existingLegacy,
+                        ...(kbStore.get(entry.legacyId) || {}),
                         id               : entry.canonicalKey,
                         canonicalKey     : entry.canonicalKey,
                         legacyId         : entry.legacyId,
@@ -2246,9 +1589,7 @@ export async function migrateLegacyAdrIdentities({
                         aliases          : admissionRecord.aliases,
                         historicalAliases: admissionRecord.historicalAliases
                     });
-                    if (kbStore.has(entry.legacyId)) {
-                        kbStore.delete(entry.legacyId);
-                    }
+                    if (kbStore.has(entry.legacyId)) kbStore.delete(entry.legacyId);
                     migratedKbEntriesCount++;
                 }
             } else if (kbStore && typeof kbStore.applyAdrMigration === 'function') {
@@ -2267,11 +1608,9 @@ export async function migrateLegacyAdrIdentities({
                     namespace   : rec.sourceTuple.namespace
                 });
             }
-
             recordJournalPhase('kb_projection_applied', {migratedKbEntriesCount});
         }
 
-        // Phase 6: reader_verified
         if (!completedPhases.includes('reader_verified')) {
             for (const entry of manifest) {
                 const canonicalResolved = AdrSource.resolveAdrReference(entry.canonicalKey, {
@@ -2279,7 +1618,7 @@ export async function migrateLegacyAdrIdentities({
                     authorizedNamespaces    : [entry.sourceTuple.namespace]
                 });
                 if (!canonicalResolved.resolved || canonicalResolved.canonicalKey !== entry.canonicalKey) {
-                    throw createCodedError(
+                    fail(
                         'ADR_MIGRATION_READER_VERIFICATION_FAILED',
                         `Reader failed to resolve migrated canonicalKey '${entry.canonicalKey}'.`
                     );
@@ -2292,7 +1631,7 @@ export async function migrateLegacyAdrIdentities({
                     authorizedNamespaces    : [entry.sourceTuple.namespace]
                 });
                 if (!shortAliasResolved.resolved || shortAliasResolved.canonicalKey !== entry.canonicalKey) {
-                    throw createCodedError(
+                    fail(
                         'ADR_MIGRATION_READER_VERIFICATION_FAILED',
                         `Reader failed to resolve legacy number '${entry.legacyId}' in '${entry.sourceTuple.namespace}'.`
                     );
@@ -2306,20 +1645,17 @@ export async function migrateLegacyAdrIdentities({
                         authorizedNamespaces    : [entry.sourceTuple.namespace, entry.custodyTransition.fromNamespace]
                     });
                     if (!originAliasResolved.resolved || originAliasResolved.canonicalKey !== entry.canonicalKey) {
-                        throw createCodedError(
+                        fail(
                             'ADR_MIGRATION_READER_VERIFICATION_FAILED',
                             `Reader failed to resolve moved FM ADR '${entry.legacyId}' from origin namespace '${entry.custodyTransition.fromNamespace}'.`
                         );
                     }
                 }
             }
-
             recordJournalPhase('reader_verified', {readerVerifiedCount: manifest.length});
         }
 
-        // Phase 7: completed
         recordJournalPhase('completed', {completedAt: new Date().toISOString()});
-
         return {
             mode           : 'apply',
             applied        : true,
@@ -2334,19 +1670,14 @@ export async function migrateLegacyAdrIdentities({
         };
     } finally {
         if (ownedDb) {
-            try { ownedDb.close(); } catch {}
+            try {
+                ownedDb.close();
+            } catch {}
         }
     }
 }
 
-/**
- * @summary Reconciles ADR rebuilds after slug rename (`0042-old` -> `0042-new`), custody move (`A` -> `B`),
- * combined custody move + rename (`A-old` -> `B-new`), source loss, and admission-record loss using
- * `AdrSource` and `adrAdmissionCatalog` without ever reconstructing identity from basename or re-scoping
- * custody without verified transition evidence.
- * @param {Object} [options={}]
- * @returns {Promise<Object>}
- */
+/** @summary Reconciles ADR rebuilds after slug rename, custody move, combined move+rename, source loss, and admission-record loss. */
 export async function reconcileRebuildAndCustodyControls({
     retainedAdmissionRecords = [],
     repositories             = [],
@@ -2360,13 +1691,9 @@ export async function reconcileRebuildAndCustodyControls({
 
     for (const rec of retainedAdmissionRecords || []) {
         const record = rec?.adrAdmissionRecord || rec;
-        if (record?.canonicalKey) {
-            verifiedRecords.set(record.canonicalKey, structuredClone(record));
-        }
+        if (record?.canonicalKey) verifiedRecords.set(record.canonicalKey, structuredClone(record));
     }
 
-    // Inspect candidate files across repositories before delegating to AdrSource.reconcileDecisionStates
-    // to enforce explicit refusal codes when admission evidence is missing or custody transition is unverified.
     for (const repoSpec of repositories || []) {
         const
             forge        = repoSpec.forge || repoSpec.repository?.forge || 'github.com',
@@ -2375,28 +1702,24 @@ export async function reconcileRebuildAndCustodyControls({
             files        = repoSpec.files || {};
 
         for (const [sourcePath, rawContent] of Object.entries(files)) {
-            const
-                fileName     = path.posix.basename(sourcePath),
-                parsedName   = parseAdrFilename(fileName),
-                redirectInfo = parseAdrRedirect(rawContent);
-
-            if (!parsedName || redirectInfo.isRedirect) continue;
+            const parsedName = parseAdrFilename(path.posix.basename(sourcePath));
+            if (!parsedName || parseAdrRedirect(rawContent).isRedirect) continue;
 
             const
                 {adrNumber, slug} = parsedName,
                 directKey         = repositoryId && namespace
                     ? buildCanonicalAdrKey({forge, repositoryId, namespace, number: adrNumber})
                     : null,
-                directRecord      = directKey ? verifiedRecords.get(directKey) : null;
+                directRecord     = directKey ? verifiedRecords.get(directKey) : null,
+                matchingByNumber = Array.from(verifiedRecords.values()).filter(r =>
+                    r.adrNumber === adrNumber &&
+                    r.sourceTuple?.repositoryId !== repositoryId &&
+                    r.assignmentEvidence?.repositoryId !== repositoryId
+                );
 
-            // Check if this file represents a custody move from another repository
-            const matchingRecordsByNumber = Array.from(verifiedRecords.values()).filter(
-                r => r.adrNumber === adrNumber && r.sourceTuple?.repositoryId !== repositoryId && r.assignmentEvidence?.repositoryId !== repositoryId
-            );
-
-            if (!directRecord && matchingRecordsByNumber.length > 0) {
+            if (!directRecord && matchingByNumber.length > 0) {
                 const
-                    originRecord = matchingRecordsByNumber[0],
+                    originRecord = matchingByNumber[0],
                     verifiedMove = (custodyTransitions || []).find(t =>
                         (t.canonicalKey === originRecord.canonicalKey || t.adrNumber === adrNumber) &&
                         String(t.toRepositoryId) === String(repositoryId) &&
@@ -2413,11 +1736,9 @@ export async function reconcileRebuildAndCustodyControls({
                         namespace,
                         reasonCode: 'ADR_CUSTODY_TRANSITION_UNVERIFIED'
                     });
-                    continue;
                 }
                 continue;
             }
-
             if (!directRecord) {
                 refusedCandidates.push({
                     sourcePath,
@@ -2427,7 +1748,6 @@ export async function reconcileRebuildAndCustodyControls({
                     namespace,
                     reasonCode: 'ADR_ADMISSION_EVIDENCE_MISSING'
                 });
-                continue;
             }
         }
     }
@@ -2442,16 +1762,11 @@ export async function reconcileRebuildAndCustodyControls({
                 delete files[refused.sourcePath];
             }
         }
-
-        return {
-            ...repoSpec,
-            files
-        };
+        return {...repoSpec, files};
     });
 
     const updatedRetainedRecords = Array.from(verifiedRecords.values());
     AdrSource.resetCatalog();
-
     const reconciled = await AdrSource.reconcileDecisionStates({
         repositories            : filteredRepositories,
         custodyTransitions,
@@ -2462,19 +1777,12 @@ export async function reconcileRebuildAndCustodyControls({
 
     return {
         ...reconciled,
-        refusedCandidates: [
-            ...refusedCandidates,
-            ...(reconciled.refusedSourcePaths || [])
-        ],
-        retainedRecords: updatedRetainedRecords
+        refusedCandidates: [...refusedCandidates, ...(reconciled.refusedSourcePaths || [])],
+        retainedRecords  : updatedRetainedRecords
     };
 }
 
-/**
- * @summary Parses CLI arguments for `migrateLegacyAdrIdentities.mjs`.
- * @param {String[]} [argv=process.argv.slice(2)]
- * @returns {Object}
- */
+/** @summary Parses CLI arguments for `migrateLegacyAdrIdentities.mjs`. */
 export function parseArgs(argv = process.argv.slice(2)) {
     const options = {
         apply      : false,
@@ -2485,7 +1793,6 @@ export function parseArgs(argv = process.argv.slice(2)) {
         runbook    : false,
         help       : false
     };
-
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i];
         if (arg === '--apply') {
@@ -2506,14 +1813,10 @@ export function parseArgs(argv = process.argv.slice(2)) {
             options.help = true;
         }
     }
-
     return options;
 }
 
-/**
- * @summary Returns human-readable CLI usage instructions.
- * @returns {String}
- */
+/** @summary Returns human-readable CLI usage instructions. */
 export function getUsageText() {
     return [
         'Usage: node ai/scripts/migrations/migrateLegacyAdrIdentities.mjs [options]',
@@ -2529,19 +1832,13 @@ export function getUsageText() {
     ].join('\n');
 }
 
-/**
- * @summary Executes the CLI workflow with default production store adapters, `sourceProbe`, and `readerContext`.
- * @param {String[]} [argv=process.argv.slice(2)]
- * @param {Object} [deps={}]
- * @returns {Promise<Object|undefined>}
- */
+/** @summary Executes the CLI workflow with default production store adapters, `sourceProbe`, and `readerContext`. */
 export async function runCli(argv = process.argv.slice(2), deps = {}) {
     const opts = parseArgs(argv);
     if (opts.help) {
         if (!deps.silent) console.log(getUsageText());
         return;
     }
-
     if (opts.runbook) {
         if (!deps.silent) console.log(JSON.stringify(ADR_MIGRATION_RUNBOOK, null, 2));
         return ADR_MIGRATION_RUNBOOK;
@@ -2561,8 +1858,10 @@ export async function runCli(argv = process.argv.slice(2), deps = {}) {
     });
 
     if (opts.restorePath) {
-        const Database = createRequire(import.meta.url)('better-sqlite3');
-        const db       = deps.db || new Database(opts.sqlitePath);
+        const
+            Database = createRequire(import.meta.url)('better-sqlite3'),
+            db       = deps.db || new Database(opts.sqlitePath);
+
         try {
             const res = await restoreAdrMigrationBackup({
                 db,
@@ -2573,9 +1872,7 @@ export async function runCli(argv = process.argv.slice(2), deps = {}) {
             if (!deps.silent) console.log(JSON.stringify(res, null, 2));
             return res;
         } finally {
-            if (!deps.db) {
-                db.close();
-            }
+            if (!deps.db) db.close();
         }
     }
 
@@ -2596,13 +1893,13 @@ export async function runCli(argv = process.argv.slice(2), deps = {}) {
     return result;
 }
 
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
-if (isMain) {
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
     runCli().catch(err => {
         console.error(err);
         process.exitCode = 1;
     });
 }
+
 export {
     ADR_MIGRATION_RUNBOOK,
     MIGRATION_CUT_REPOSITORIES,
