@@ -17,12 +17,39 @@ export const PUBLISH_CHANNELS = Object.freeze({
 });
 
 /**
+ * Four legal switch states per `(peer, channel)` pair, ordered from strictest (`0`) to most permissive (`3`).
+ * @type {Readonly<{approveEach: 'approve each', approveBatch: 'approve the batch', autoApproveAttested: 'auto-approve after a cross-family review attestation', autoApprove: 'auto-approve'}>}
+ */
+export const SWITCH_STATES = Object.freeze({
+    approveEach        : 'approve each',
+    approveBatch       : 'approve the batch',
+    autoApproveAttested: 'auto-approve after a cross-family review attestation',
+    autoApprove        : 'auto-approve'
+});
+
+/**
+ * Numeric rank per switch state (`0` = strictest `'approve each'`, `3` = `'auto-approve'`).
+ * @type {Readonly<Record<String, Number>>}
+ */
+export const SWITCH_STATE_RANK = Object.freeze({
+    [SWITCH_STATES.approveEach]        : 0,
+    [SWITCH_STATES.approveBatch]       : 1,
+    [SWITCH_STATES.autoApproveAttested]: 2,
+    [SWITCH_STATES.autoApprove]        : 3
+});
+
+/**
  * Named refusal codes emitted by the Fleet publish executor and custody store.
  * @type {Readonly<Record<String, String>>}
  */
 export const REFUSAL_CODES = Object.freeze({
     credential                   : 'refused: credential',
     switch                       : 'refused: switch',
+    switchMoved                  : 'refused: switch-moved',
+    reason                       : 'refused: reason',
+    state                        : 'refused: state',
+    expectedFrom                 : 'refused: expectedFrom',
+    peer                         : 'refused: peer',
     digest                       : 'refused: digest',
     attestation                  : 'refused: attestation',
     replyClassificationUnresolved: 'refused: reply-classification-unresolved',
@@ -30,7 +57,8 @@ export const REFUSAL_CODES = Object.freeze({
     unresolved                   : 'refused: unresolved',
     publishingInFlight           : 'refused: publishing-in-flight',
     channel                      : 'refused: channel',
-    notFound                     : 'refused: not-found'
+    notFound                     : 'refused: not-found',
+    who                          : 'refused: who'
 });
 
 /**
@@ -96,6 +124,34 @@ export function scrubSecrets(value, secrets = []) {
     return value;
 }
 
+let atomicWriteCounter = 0;
+
+/**
+ * @summary Writes `payload` as formatted JSON to `filePath` via a PID/timestamp/sequence-scoped
+ * temporary sibling and atomic rename with `0o600` owner-only permissions.
+ * @param {Object} fsModule
+ * @param {String} filePath
+ * @param {*}      payload
+ * @param {Number} nowMs
+ * @returns {Promise<void>}
+ */
+async function writeAtomic0600(fsModule, filePath, payload, nowMs) {
+    const dir     = path.dirname(filePath),
+          seq     = ++atomicWriteCounter,
+          tmpPath = `${filePath}.${process.pid}.${nowMs}.${seq}.tmp`,
+          body    = JSON.stringify(payload, null, 2);
+
+    await fsModule.mkdir(dir, {recursive: true});
+    await fsModule.writeFile(tmpPath, body, {encoding: 'utf8', mode: 0o600});
+    if (typeof fsModule.chmod === 'function') {
+        await fsModule.chmod(tmpPath, 0o600);
+    }
+    await fsModule.rename(tmpPath, filePath);
+    if (typeof fsModule.chmod === 'function') {
+        await fsModule.chmod(filePath, 0o600);
+    }
+}
+
 /**
  * @summary Creates a Fleet custody credential reader over `<userData>/brain/fleet` (or an injected
  * credentials map/directory). Tokens are read by `{channel, account}`, checked for presence,
@@ -125,8 +181,7 @@ export function createFleetCustodyStore({
     const customFetch       = fetch !== undefined,
           fetchFn           = fetch ?? fetchImpl,
           inFlightRefreshes = new Map();
-    let   writeChain    = Promise.resolve(),
-          atomicCounter = 0;
+    let   writeChain = Promise.resolve();
 
     function enqueueWrite(task) {
         const next = writeChain.then(task, task);
@@ -190,23 +245,6 @@ export function createFleetCustodyStore({
         }
     }
 
-    async function writeAtomic0600(filePath, payload, nowMs) {
-        const dir     = path.dirname(filePath),
-              seq     = ++atomicCounter,
-              tmpPath = `${filePath}.${process.pid}.${nowMs}.${seq}.tmp`,
-              body    = JSON.stringify(payload, null, 2);
-
-        await fsModule.mkdir(dir, {recursive: true});
-        await fsModule.writeFile(tmpPath, body, {encoding: 'utf8', mode: 0o600});
-        if (typeof fsModule.chmod === 'function') {
-            await fsModule.chmod(tmpPath, 0o600);
-        }
-        await fsModule.rename(tmpPath, filePath);
-        if (typeof fsModule.chmod === 'function') {
-            await fsModule.chmod(filePath, 0o600);
-        }
-    }
-
     async function persistRotatedRecord(channel, account, loaded, rotatedRecord, nowMs) {
         if (credentials && typeof credentials === 'object') {
             if (loaded.sourceKind === 'memory-composite') {
@@ -240,13 +278,13 @@ export function createFleetCustodyStore({
                 }
 
                 if (!latestBundle) {
-                    await writeAtomic0600(perAccount, rotatedRecord, nowMs);
+                    await writeAtomic0600(fsModule, perAccount, rotatedRecord, nowMs);
                     return;
                 }
 
                 if (loaded.sourceKind === 'bundle-composite') {
                     const nextBundle = {...latestBundle, [loaded.key]: rotatedRecord};
-                    await writeAtomic0600(bundlePath, nextBundle, nowMs);
+                    await writeAtomic0600(fsModule, bundlePath, nextBundle, nowMs);
                     return;
                 }
 
@@ -258,11 +296,11 @@ export function createFleetCustodyStore({
                         [account]: rotatedRecord
                     }
                 };
-                await writeAtomic0600(bundlePath, nextBundle, nowMs);
+                await writeAtomic0600(fsModule, bundlePath, nextBundle, nowMs);
                 return;
             }
 
-            await writeAtomic0600(loaded.filePath || perAccount, rotatedRecord, nowMs);
+            await writeAtomic0600(fsModule, loaded.filePath || perAccount, rotatedRecord, nowMs);
         });
     }
 
@@ -503,5 +541,353 @@ export function createFleetCustodyStore({
                 }
             };
         }
+    };
+}
+
+/**
+ * @summary Canonicalizes a peer or operator identity to its `@<login>` form.
+ * @param {*} value
+ * @returns {String|null}
+ * @private
+ */
+function canonicalizePeerId(value) {
+    if (typeof value !== 'string') {
+        return null;
+    }
+    const trimmed = value.trim().replace(/^@+/, '');
+    if (!trimmed) {
+        return null;
+    }
+    return `@${trimmed}`;
+}
+
+/**
+ * @summary Normalizes a raw switch entry into `{peer, channel, state, updatedAt, updatedBy, audit, proposal}`.
+ * @param {*}      raw
+ * @param {String} canonicalPeer
+ * @param {String} channel
+ * @returns {Object}
+ * @private
+ */
+function normalizeSwitchRecord(raw, canonicalPeer, channel) {
+    if (typeof raw === 'string' && Object.hasOwn(SWITCH_STATE_RANK, raw)) {
+        return {
+            peer     : canonicalPeer,
+            channel,
+            state    : raw,
+            updatedAt: null,
+            updatedBy: null,
+            audit    : [],
+            proposal : null
+        };
+    }
+
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        const state = Object.hasOwn(SWITCH_STATE_RANK, raw.state)
+            ? raw.state
+            : SWITCH_STATES.approveEach;
+
+        return {
+            peer     : canonicalPeer,
+            channel,
+            state,
+            updatedAt: raw.updatedAt ?? null,
+            updatedBy: raw.updatedBy ?? null,
+            audit    : Array.isArray(raw.audit) ? raw.audit.map(entry => ({...entry})) : [],
+            proposal : raw.proposal ?? null
+        };
+    }
+
+    return {
+        peer     : canonicalPeer,
+        channel,
+        state    : SWITCH_STATES.approveEach,
+        updatedAt: null,
+        updatedBy: null,
+        audit    : [],
+        proposal : null
+    };
+}
+
+/**
+ * @summary Creates a Fleet-side per-`(peer, channel)` outbound publish switch store backed by
+ * `<custodyDir>/publish-switches.json` with atomic `0o600` temp-file-and-rename persistence (or an
+ * in-memory `switches` map when `custodyDir` is null).
+ *
+ * Enforces:
+ * - Default `'approve each'` whenever a `(peer, channel)` record is absent (never falls back to a channel-only key).
+ * - Optimistic concurrency via `expectedFrom` (`refused: switch-moved` on mismatch).
+ * - Mandatory non-empty `reason` whenever promoting a switch (`SWITCH_STATE_RANK[to] > SWITCH_STATE_RANK[current.state]`).
+ * - Append-only `{who, when, from, to, reason}` audit log per `(peer, channel)`.
+ *
+ * @param {Object}   [options={}]
+ * @param {String}   [options.custodyDir=null]
+ * @param {Object}   [options.switches=null]
+ * @param {Object}   [options.fsModule=fsPromises]
+ * @param {Function} [options.now=Date.now]
+ * @returns {{getSwitchState: Function, read: Function, readPeerSwitches: Function, setSwitch: Function}}
+ */
+export function createPublishSwitchStore({
+    custodyDir = null,
+    switches   = null,
+    fsModule   = fsPromises,
+    now        = () => Date.now()
+} = {}) {
+    const memorySwitches = (switches && typeof switches === 'object' && !Array.isArray(switches))
+        ? switches
+        : {};
+    let writeChain = Promise.resolve();
+
+    function enqueueWrite(task) {
+        const next = writeChain.then(task, task);
+        writeChain = next.catch(() => {});
+        return next;
+    }
+
+    function resolveSwitchesFilePath() {
+        return custodyDir ? path.join(custodyDir, 'publish-switches.json') : null;
+    }
+
+    async function loadStoreMap() {
+        const filePath = resolveSwitchesFilePath();
+        if (!filePath) {
+            return memorySwitches;
+        }
+
+        try {
+            const raw    = await fsModule.readFile(filePath, 'utf8'),
+                  parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                return parsed;
+            }
+        } catch {
+            // Fall through to in-memory seed or empty store when file does not exist yet.
+        }
+
+        return {...memorySwitches};
+    }
+
+    function lookupRawEntry(storeMap, canonicalPeer, channel) {
+        if (!storeMap || typeof storeMap !== 'object') {
+            return undefined;
+        }
+        const barePeer         = canonicalPeer.slice(1),
+              canonicalCompKey = `${canonicalPeer}:${channel}`,
+              bareCompKey      = `${barePeer}:${channel}`;
+
+        if (Object.hasOwn(storeMap, canonicalCompKey)) {
+            return storeMap[canonicalCompKey];
+        }
+        if (Object.hasOwn(storeMap, bareCompKey)) {
+            return storeMap[bareCompKey];
+        }
+        if (storeMap[canonicalPeer] && typeof storeMap[canonicalPeer] === 'object' && Object.hasOwn(storeMap[canonicalPeer], channel)) {
+            return storeMap[canonicalPeer][channel];
+        }
+        if (storeMap[barePeer] && typeof storeMap[barePeer] === 'object' && Object.hasOwn(storeMap[barePeer], channel)) {
+            return storeMap[barePeer][channel];
+        }
+        return undefined;
+    }
+
+    async function getChannelRecord(canonicalPeer, channel) {
+        const storeMap = await loadStoreMap(),
+              raw      = lookupRawEntry(storeMap, canonicalPeer, channel);
+        return normalizeSwitchRecord(raw, canonicalPeer, channel);
+    }
+
+    async function getSwitchState({peer, channel} = {}) {
+        const canonicalPeer = canonicalizePeerId(peer);
+        if (!canonicalPeer || !Object.values(PUBLISH_CHANNELS).includes(channel)) {
+            return SWITCH_STATES.approveEach;
+        }
+        const record = await getChannelRecord(canonicalPeer, channel);
+        return record.state;
+    }
+
+    async function readPeerSwitches({peer} = {}) {
+        const canonicalPeer = canonicalizePeerId(peer);
+        if (!canonicalPeer) {
+            return {
+                ok     : false,
+                state  : 'rejected',
+                refused: REFUSAL_CODES.peer,
+                code   : REFUSAL_CODES.peer,
+                reason : `${REFUSAL_CODES.peer} — peer must be a non-empty string`
+            };
+        }
+
+        const storeMap = await loadStoreMap(),
+              channels = {};
+
+        for (const channel of Object.values(PUBLISH_CHANNELS)) {
+            const raw = lookupRawEntry(storeMap, canonicalPeer, channel);
+            channels[channel] = normalizeSwitchRecord(raw, canonicalPeer, channel);
+        }
+
+        return {
+            state: 'ok',
+            peer : canonicalPeer,
+            channels
+        };
+    }
+
+    async function read({peer, channel} = {}) {
+        if (channel !== undefined && channel !== null) {
+            return getSwitchState({peer, channel});
+        }
+        return readPeerSwitches({peer});
+    }
+
+    async function setSwitch({
+        peer,
+        channel,
+        to,
+        expectedFrom,
+        reason   = '',
+        who,
+        proposal = undefined,
+        nowMs    = now()
+    } = {}) {
+        const canonicalPeer = canonicalizePeerId(peer);
+        if (!canonicalPeer) {
+            return {
+                ok     : false,
+                refused: REFUSAL_CODES.peer,
+                code   : REFUSAL_CODES.peer,
+                reason : `${REFUSAL_CODES.peer} — peer must be a non-empty string`
+            };
+        }
+
+        const canonicalWho = canonicalizePeerId(who);
+        if (!canonicalWho) {
+            return {
+                ok     : false,
+                refused: REFUSAL_CODES.who,
+                code   : REFUSAL_CODES.who,
+                reason : `${REFUSAL_CODES.who} — who must be a valid operator or peer identity`
+            };
+        }
+
+        if (!Object.values(PUBLISH_CHANNELS).includes(channel)) {
+            return {
+                ok     : false,
+                refused: REFUSAL_CODES.channel,
+                code   : REFUSAL_CODES.channel,
+                reason : `${REFUSAL_CODES.channel} — unsupported publish channel '${String(channel)}'`
+            };
+        }
+
+        if (!Object.hasOwn(SWITCH_STATE_RANK, to)) {
+            return {
+                ok     : false,
+                refused: REFUSAL_CODES.state,
+                code   : REFUSAL_CODES.state,
+                reason : `${REFUSAL_CODES.state} — invalid target switch state '${String(to)}'`
+            };
+        }
+
+        if (!Object.hasOwn(SWITCH_STATE_RANK, expectedFrom)) {
+            return {
+                ok     : false,
+                refused: REFUSAL_CODES.expectedFrom,
+                code   : REFUSAL_CODES.expectedFrom,
+                reason : `${REFUSAL_CODES.expectedFrom} — expectedFrom must be a valid switch state`
+            };
+        }
+
+        return enqueueWrite(async () => {
+            const storeMap = await loadStoreMap(),
+                  raw      = lookupRawEntry(storeMap, canonicalPeer, channel),
+                  current  = normalizeSwitchRecord(raw, canonicalPeer, channel);
+
+            if (current.state !== expectedFrom) {
+                return {
+                    ok          : false,
+                    refused     : REFUSAL_CODES.switchMoved,
+                    code        : REFUSAL_CODES.switchMoved,
+                    currentState: current.state,
+                    reason      : `${REFUSAL_CODES.switchMoved} — switch for ${canonicalPeer} × ${channel} is currently '${current.state}', expected '${expectedFrom}'`
+                };
+            }
+
+            const trimmedReason = typeof reason === 'string' ? reason.trim() : '';
+            if (SWITCH_STATE_RANK[to] > SWITCH_STATE_RANK[current.state] && !trimmedReason) {
+                return {
+                    ok     : false,
+                    refused: REFUSAL_CODES.reason,
+                    code   : REFUSAL_CODES.reason,
+                    reason : `${REFUSAL_CODES.reason} — a reason is required to promote a publish switch`
+                };
+            }
+
+            const isoNow    = new Date(nowMs).toISOString(),
+                  nextAudit = [
+                      ...current.audit,
+                      {
+                          who   : canonicalWho,
+                          when  : isoNow,
+                          from  : current.state,
+                          to,
+                          reason: trimmedReason
+                      }
+                  ],
+                  nextRecord = {
+                      peer     : canonicalPeer,
+                      channel,
+                      state    : to,
+                      updatedAt: isoNow,
+                      updatedBy: canonicalWho,
+                      audit    : nextAudit,
+                      proposal : proposal !== undefined ? proposal : current.proposal
+                  },
+                  barePeer     = canonicalPeer.slice(1),
+                  compKey      = `${canonicalPeer}:${channel}`,
+                  bareKey      = `${barePeer}:${channel}`,
+                  filePath     = resolveSwitchesFilePath(),
+                  nextStoreMap = {...storeMap};
+
+            delete nextStoreMap[bareKey];
+            for (const peerKey of [canonicalPeer, barePeer]) {
+                if (nextStoreMap[peerKey] && typeof nextStoreMap[peerKey] === 'object' && !Array.isArray(nextStoreMap[peerKey])) {
+                    const remaining = {...nextStoreMap[peerKey]};
+                    delete remaining[channel];
+                    if (Object.keys(remaining).length > 0) {
+                        nextStoreMap[peerKey] = remaining;
+                    } else {
+                        delete nextStoreMap[peerKey];
+                    }
+                }
+            }
+            nextStoreMap[compKey] = nextRecord;
+
+            memorySwitches[compKey] = nextRecord;
+            delete memorySwitches[bareKey];
+            for (const peerKey of [canonicalPeer, barePeer]) {
+                if (memorySwitches[peerKey] && typeof memorySwitches[peerKey] === 'object' && !Array.isArray(memorySwitches[peerKey])) {
+                    delete memorySwitches[peerKey][channel];
+                    if (Object.keys(memorySwitches[peerKey]).length === 0) {
+                        delete memorySwitches[peerKey];
+                    }
+                }
+            }
+
+            if (filePath) {
+                await writeAtomic0600(fsModule, filePath, nextStoreMap, nowMs);
+            }
+
+            return {
+                ok    : true,
+                switch: nextRecord,
+                record: nextRecord
+            };
+        });
+    }
+
+    return {
+        getSwitchState,
+        read,
+        readPeerSwitches,
+        setSwitch
     };
 }
