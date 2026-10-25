@@ -19,7 +19,16 @@ import {expect, test} from '@playwright/test';
 import Neo            from 'neo.mjs/src/Neo.mjs';
 import * as core      from 'neo.mjs/src/core/_export.mjs';
 import                              'neo.mjs/src/manager/Instance.mjs';
-import RequestContextService   from '../../../../../../ai/mcp/server/shared/services/RequestContextService.mjs';
+import RequestContextService       from '../../../../../../ai/mcp/server/shared/services/RequestContextService.mjs';
+import FleetControlBridge          from '../../../../../../ai/services/fleet/FleetControlBridge.mjs';
+import {wireOperatorComposeWriter} from '../../../../../../ai/services/fleet/wireOperatorComposeWriter.mjs';
+import {
+    X_REFRESH_MARGIN_MS,
+    createFleetCustodyStore as createFleetCustodyStoreDirect
+} from '../../../../../../ai/services/fleet/fleetCustodyStore.mjs';
+import {
+    createSocialPlatformClient as createSocialPlatformClientDirect
+} from '../../../../../../ai/services/fleet/socialPlatformClient.mjs';
 import {
     LINKEDIN_TOKEN_MAX_AGE_MS,
     PUBLICATION_STATES,
@@ -31,6 +40,7 @@ import {
     computePublishRevisionDigest,
     createFleetCustodyStore,
     createPublishExecutor,
+    createSocialPlatformClient,
     matchesRequestedPublishText,
     publish,
     readMetrics,
@@ -1207,6 +1217,824 @@ test.describe('publishExecutor (#979)', () => {
             if (mailboxAiConfig?.messageWal?.dir) {
                 await fs.rm(mailboxAiConfig.messageWal.dir, {recursive: true, force: true});
             }
+        }
+    });
+
+    test('#1267 AC-1: createSocialPlatformClient dispatches X v2 and LinkedIn HTTP calls (publishPost with in-memory verifiedMedia[].bytes, listRecentPosts with createdAt, readMetrics, and verifyOwnedPost)', async () => {
+        const httpCalls  = [];
+        const mediaBytes = Buffer.from('png-card-binary-payload-1267', 'utf8');
+        const mediaHash  = crypto.createHash('sha256').update(mediaBytes).digest('hex');
+
+        const mockFetch = async (url, init = {}) => {
+            const urlStr = String(url);
+            httpCalls.push({url: urlStr, method: init.method ?? 'GET', headers: init.headers ?? {}, body: init.body});
+
+            // X media upload
+            if (urlStr === 'https://api.x.com/2/media/upload' && init.method === 'POST') {
+                const parsed = JSON.parse(init.body);
+                expect(parsed.media).toBe(mediaBytes.toString('base64'));
+                expect(parsed.media_type).toBe('image/png');
+                return {ok: true, status: 200, async json() { return {data: {id: 'x-media-701'}}; }};
+            }
+
+            // X post creation
+            if (urlStr === 'https://api.x.com/2/tweets' && init.method === 'POST') {
+                const parsed = JSON.parse(init.body);
+                expect(parsed.media).toEqual({media_ids: ['x-media-701']});
+                return {
+                    ok    : true,
+                    status: 201,
+                    async json() {
+                        return {
+                            data: {
+                                id        : 'tweet-http-1267',
+                                text      : `${parsed.text} https://t.co/xyz987`,
+                                created_at: '2026-10-25T02:01:00.000Z'
+                            }
+                        };
+                    }
+                };
+            }
+
+            // X tweet read-back / metrics / verifyOwnedPost
+            if (urlStr.startsWith('https://api.x.com/2/tweets/tweet-http-1267')) {
+                if (urlStr.includes('expansions=author_id')) {
+                    return {
+                        ok    : true,
+                        status: 200,
+                        async json() {
+                            return {
+                                data    : {id: 'tweet-http-1267', author_id: '4242'},
+                                includes: {users: [{id: '4242', username: 'neomjs'}]}
+                            };
+                        }
+                    };
+                }
+                if (urlStr.includes('non_public_metrics')) {
+                    return {
+                        ok    : true,
+                        status: 200,
+                        async json() {
+                            return {
+                                data: {
+                                    id            : 'tweet-http-1267',
+                                    public_metrics: {
+                                        impression_count: 2500,
+                                        like_count      : 91,
+                                        retweet_count   : 18,
+                                        reply_count     : 4,
+                                        quote_count     : 2
+                                    },
+                                    non_public_metrics: {
+                                        url_link_clicks: 112
+                                    }
+                                }
+                            };
+                        }
+                    };
+                }
+                return {
+                    ok    : true,
+                    status: 200,
+                    async json() {
+                        return {
+                            data: {
+                                id        : 'tweet-http-1267',
+                                text      : 'Live X adapter post https://t.co/xyz987',
+                                created_at: '2026-10-25T02:01:00.000Z'
+                            }
+                        };
+                    }
+                };
+            }
+
+            // X user lookup + recent tweets
+            if (urlStr === 'https://api.x.com/2/users/by/username/neomjs') {
+                return {ok: true, status: 200, async json() { return {data: {id: '4242', username: 'neomjs'}}; }};
+            }
+            if (urlStr.startsWith('https://api.x.com/2/users/4242/tweets')) {
+                return {
+                    ok    : true,
+                    status: 200,
+                    async json() {
+                        return {
+                            data: [
+                                {
+                                    id        : 'tweet-http-1267',
+                                    text      : 'Live X adapter post',
+                                    created_at: '2026-10-25T02:01:00.000Z'
+                                }
+                            ]
+                        };
+                    }
+                };
+            }
+
+            // LinkedIn image initializeUpload + binary PUT + post creation + read-back + listRecentPosts + readMetrics
+            if (urlStr === 'https://api.linkedin.com/rest/images?action=initializeUpload' && init.method === 'POST') {
+                return {
+                    ok    : true,
+                    status: 200,
+                    async json() {
+                        return {
+                            value: {
+                                uploadUrl: 'https://api.linkedin.com/mediaUpload/li-img-1',
+                                image    : 'urn:li:image:990011'
+                            }
+                        };
+                    }
+                };
+            }
+            if (urlStr === 'https://api.linkedin.com/mediaUpload/li-img-1' && init.method === 'PUT') {
+                expect(Buffer.isBuffer(init.body)).toBe(true);
+                expect(init.body.equals(mediaBytes)).toBe(true);
+                return {ok: true, status: 201, async json() { return {}; }};
+            }
+            if (urlStr === 'https://api.linkedin.com/rest/posts' && init.method === 'POST') {
+                const parsed = JSON.parse(init.body);
+                expect(parsed.author).toBe('urn:li:organization:neomjs-org');
+                expect(parsed.content).toEqual({media: {id: 'urn:li:image:990011'}});
+                return {
+                    ok     : true,
+                    status : 201,
+                    headers: {get: name => (name.toLowerCase() === 'x-restli-id' ? 'urn:li:share:556677' : null)},
+                    async json() { return {}; }
+                };
+            }
+            if (urlStr === 'https://api.linkedin.com/rest/posts/urn%3Ali%3Ashare%3A556677' && init.method === 'GET') {
+                return {
+                    ok    : true,
+                    status: 200,
+                    async json() {
+                        return {
+                            id         : 'urn:li:share:556677',
+                            author     : 'urn:li:organization:neomjs-org',
+                            commentary : 'Live LinkedIn adapter post',
+                            publishedAt: Date.UTC(2026, 9, 25, 2, 2, 0)
+                        };
+                    }
+                };
+            }
+            if (urlStr.startsWith('https://api.linkedin.com/rest/posts?author=')) {
+                return {
+                    ok    : true,
+                    status: 200,
+                    async json() {
+                        return {
+                            elements: [
+                                {
+                                    id         : 'urn:li:share:556677',
+                                    commentary : 'Live LinkedIn adapter post',
+                                    publishedAt: Date.UTC(2026, 9, 25, 2, 2, 0)
+                                }
+                            ]
+                        };
+                    }
+                };
+            }
+            if (urlStr.startsWith('https://api.linkedin.com/rest/organizationalEntityShareStatistics')) {
+                return {
+                    ok    : true,
+                    status: 200,
+                    async json() {
+                        return {
+                            elements: [
+                                {
+                                    totalShareStatistics: {
+                                        impressionCount: 840,
+                                        clickCount     : 47,
+                                        likeCount      : 29,
+                                        commentCount   : 5
+                                    }
+                                }
+                            ]
+                        };
+                    }
+                };
+            }
+
+            return {ok: false, status: 404, async json() { return {error: 'not-found'}; }};
+        };
+
+        const client = createSocialPlatformClient({fetch: mockFetch, now: () => NOW_MS});
+
+        // 1. X publishPost uploads verified in-memory bytes directly without touching any disk path
+        const xPublished = await client.publishPost({
+            channel       : PUBLISH_CHANNELS.x,
+            account       : '@neomjs',
+            token         : SECRET,
+            text          : 'Live X adapter post',
+            media         : [{bytes: mediaBytes, sha256: mediaHash, mimeType: 'image/png'}],
+            attemptId     : 'attempt-http-x',
+            revisionDigest: 'd'.repeat(64)
+        });
+        expect(xPublished).toMatchObject({
+            providerId: 'tweet-http-1267',
+            createdAt : '2026-10-25T02:01:00.000Z',
+            readback  : {
+                providerId: 'tweet-http-1267',
+                text      : 'Live X adapter post https://t.co/xyz987'
+            }
+        });
+
+        // 2. X listRecentPosts returns createdAt timestamps; verifyOwnedPost checks author username
+        const xRecent = await client.listRecentPosts({
+            channel: PUBLISH_CHANNELS.x,
+            account: '@neomjs',
+            token  : SECRET
+        });
+        expect(xRecent).toEqual([
+            {
+                id        : 'tweet-http-1267',
+                providerId: 'tweet-http-1267',
+                text      : 'Live X adapter post',
+                createdAt : '2026-10-25T02:01:00.000Z'
+            }
+        ]);
+        expect(await client.verifyOwnedPost({
+            channel   : PUBLISH_CHANNELS.x,
+            account   : '@neomjs',
+            providerId: 'tweet-http-1267',
+            token     : SECRET
+        })).toBe(true);
+        expect(await client.verifyOwnedPost({
+            channel   : PUBLISH_CHANNELS.x,
+            account   : '@other-account',
+            providerId: 'tweet-http-1267',
+            token     : SECRET
+        })).toBe(false);
+
+        // 3. LinkedIn publishPost + listRecentPosts + verifyOwnedPost + readMetrics through executor
+        const liPublished = await client.publishPost({
+            channel: PUBLISH_CHANNELS.linkedin,
+            account: 'neomjs-org',
+            token  : 'li-token-1267',
+            text   : 'Live LinkedIn adapter post',
+            media  : [{bytes: mediaBytes, sha256: mediaHash, mimeType: 'image/png'}]
+        });
+        expect(liPublished).toMatchObject({
+            providerId: 'urn:li:share:556677',
+            createdAt : '2026-10-25T02:02:00.000Z',
+            readback  : {
+                providerId: 'urn:li:share:556677',
+                text      : 'Live LinkedIn adapter post'
+            }
+        });
+
+        const liRecent = await client.listRecentPosts({
+            channel: PUBLISH_CHANNELS.linkedin,
+            account: 'neomjs-org',
+            token  : 'li-token-1267'
+        });
+        expect(liRecent).toEqual([
+            {
+                id        : 'urn:li:share:556677',
+                providerId: 'urn:li:share:556677',
+                text      : 'Live LinkedIn adapter post',
+                createdAt : '2026-10-25T02:02:00.000Z'
+            }
+        ]);
+        expect(await client.verifyOwnedPost({
+            channel   : PUBLISH_CHANNELS.linkedin,
+            account   : 'neomjs-org',
+            providerId: 'urn:li:share:556677',
+            token     : 'li-token-1267'
+        })).toBe(true);
+
+        const liMetrics = await readMetrics('urn:li:share:556677', {
+            channel    : PUBLISH_CHANNELS.linkedin,
+            account    : 'neomjs-org',
+            credentials: {'linkedin:neomjs-org': {accessToken: 'li-token-1267'}},
+            platform   : client
+        });
+        expect(liMetrics).toEqual({
+            ok        : true,
+            providerId: 'urn:li:share:556677',
+            channel   : 'linkedin',
+            account   : 'neomjs-org',
+            source    : 'linkedin-community-management-api',
+            window    : 'lifetime',
+            claimClass: 'owned-object-telemetry',
+            metrics   : {
+                impressions      : 840,
+                uniqueImpressions: 'unknown',
+                clicks           : 47,
+                likes            : 29,
+                comments         : 5,
+                shares           : 'unknown',
+                engagement       : 'unknown'
+            }
+        });
+        expect(httpCalls.length).toBeGreaterThanOrEqual(8);
+    });
+
+    test('#1267 AC-2: createFleetCustodyStore rotates expired X tokens via offline.access refreshToken, atomically persists rotated credentials with 0o600 permissions, and returns refused: credential without secret leakage when refresh fails', async () => {
+        const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-custody-1267-refresh-'));
+        const xCredDir = path.join(tempRoot, 'social-credentials', 'x');
+        const credFile = path.join(xCredDir, '_neomjs.json');
+        await fs.mkdir(xCredDir, {recursive: true});
+
+        const EXPIRED_ACCESS  = 'expired-x-access-token-111';
+        const INITIAL_REFRESH = 'initial-x-refresh-token-222';
+        const CLIENT_SECRET   = 'x-oauth-client-secret-333';
+        const ROTATED_ACCESS  = 'rotated-x-access-token-444';
+        const ROTATED_REFRESH = 'rotated-x-refresh-token-555';
+
+        await fs.writeFile(
+            credFile,
+            JSON.stringify({
+                accessToken : EXPIRED_ACCESS,
+                refreshToken: INITIAL_REFRESH,
+                clientId    : 'neo-x-client-id',
+                clientSecret: CLIENT_SECRET,
+                scopes      : ['tweet.read', 'tweet.write', 'users.read', 'offline.access'],
+                expiresAt   : new Date(NOW_MS - 60_000).toISOString()
+            }),
+            {encoding: 'utf8', mode: 0o600}
+        );
+
+        try {
+            let   refreshCalls = 0;
+            const custodyOk    = createFleetCustodyStore({
+                custodyDir: tempRoot,
+                now       : () => NOW_MS,
+                fetch     : async (url, init = {}) => {
+                    refreshCalls++;
+                    expect(url).toBe('https://api.x.com/2/oauth2/token');
+                    expect(init.method).toBe('POST');
+                    expect(init.body).toContain('grant_type=refresh_token');
+                    expect(init.body).toContain(`refresh_token=${INITIAL_REFRESH}`);
+                    const expectedBasic = Buffer.from(`neo-x-client-id:${CLIENT_SECRET}`).toString('base64');
+                    expect(init.headers.Authorization).toBe(`Basic ${expectedBasic}`);
+
+                    return {
+                        ok    : true,
+                        status: 200,
+                        async json() {
+                            return {
+                                access_token : ROTATED_ACCESS,
+                                refresh_token: ROTATED_REFRESH,
+                                expires_in   : 7200
+                            };
+                        }
+                    };
+                }
+            });
+
+            const rotated = await custodyOk.readCredential({channel: PUBLISH_CHANNELS.x, account: '@neomjs'});
+            expect(refreshCalls).toBe(1);
+            expect(rotated).toMatchObject({
+                ok     : true,
+                rotated: true,
+                token  : ROTATED_ACCESS,
+                record : {
+                    channel  : 'x',
+                    account  : '@neomjs',
+                    expiresAt: new Date(NOW_MS + 7200 * 1000).toISOString(),
+                    updatedAt: new Date(NOW_MS).toISOString()
+                }
+            });
+
+            // Verify atomic persistence on disk with 0o600 permissions and no leftover .tmp files
+            const stat = await fs.stat(credFile);
+            expect(stat.mode & 0o777).toBe(0o600);
+            const dirEntries = await fs.readdir(xCredDir);
+            expect(dirEntries).toEqual(['_neomjs.json']);
+
+            const persisted = JSON.parse(await fs.readFile(credFile, 'utf8'));
+            expect(persisted).toMatchObject({
+                accessToken : ROTATED_ACCESS,
+                refreshToken: ROTATED_REFRESH,
+                expiresAt   : new Date(NOW_MS + 7200 * 1000).toISOString(),
+                updatedAt   : new Date(NOW_MS).toISOString()
+            });
+
+            // When the refreshed token later expires and the refresh endpoint fails, returns `refused: credential` with zero secret leakage
+            const custodyFail = createFleetCustodyStore({
+                custodyDir: tempRoot,
+                now       : () => NOW_MS + 8000 * 1000,
+                fetch     : async () => ({
+                    ok    : false,
+                    status: 400,
+                    async json() {
+                        return {
+                            error            : 'invalid_grant',
+                            error_description: `Refresh token ${ROTATED_REFRESH} rejected for client secret ${CLIENT_SECRET} and bearer ${ROTATED_ACCESS}`
+                        };
+                    }
+                })
+            });
+
+            const failedRefresh = await custodyFail.readCredential({
+                channel: PUBLISH_CHANNELS.x,
+                account: '@neomjs',
+                nowMs  : NOW_MS + 8000 * 1000
+            });
+            expect(failedRefresh.ok).toBe(false);
+            expect(failedRefresh.code).toBe(REFUSAL_CODES.credential);
+
+            const serializedFailure = JSON.stringify(failedRefresh);
+            for (const secret of [EXPIRED_ACCESS, INITIAL_REFRESH, CLIENT_SECRET, ROTATED_ACCESS, ROTATED_REFRESH]) {
+                expect(serializedFailure).not.toContain(secret);
+            }
+        } finally {
+            await fs.rm(tempRoot, {recursive: true, force: true});
+        }
+    });
+
+    test('#1267 AC-3: FleetControlBridge exposes publish, readMetrics, and reply wired to MailboxService and <userData>/brain/fleet, with no MCP tool exposure to agent seats', async () => {
+        const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-bridge-1267-'));
+        const xCredDir = path.join(tempRoot, 'social-credentials', 'x');
+        await fs.mkdir(xCredDir, {recursive: true});
+        await fs.writeFile(
+            path.join(xCredDir, '_neomjs.json'),
+            JSON.stringify({accessToken: SECRET, expiresAt: NOW_MS + 3600_000}),
+            {encoding: 'utf8', mode: 0o600}
+        );
+
+        try {
+            const req     = seedApprovedRequest();
+            const digest  = req.currentRevision.revisionDigest;
+            const mailbox = createInMemoryMailbox({[REQ_ID]: req});
+
+            const composeWriter = wireOperatorComposeWriter({
+                addMessage            : async () => ({}),
+                getMessage            : arg => mailbox.getMessage(arg),
+                transitionPublishState: arg => mailbox.transitionPublishState(arg)
+            });
+
+            const customExecutor = createPublishExecutor({
+                mailbox    : composeWriter,
+                custodyDir : tempRoot,
+                switchStore: {[`${PEER_ID}:x`]: SWITCH_STATES.approveEach},
+                now        : () => NOW_MS,
+                platform   : {
+                    async publishPost(call) {
+                        return {
+                            providerId: 'tweet-bridge-1267',
+                            readback  : {providerId: 'tweet-bridge-1267', text: call.text}
+                        };
+                    },
+                    async readMetrics() {
+                        return {
+                            source        : 'x-v2-owned-object-metrics',
+                            window        : '30d',
+                            claimClass    : 'owned-object-telemetry',
+                            public_metrics: {impression_count: 512, like_count: 19}
+                        };
+                    }
+                }
+            });
+
+            FleetControlBridge.composeWriter   = composeWriter;
+            FleetControlBridge.publishExecutor = customExecutor;
+            FleetControlBridge.registry        = {
+                getDataDir: () => tempRoot
+            };
+
+            const pubOut = await FleetControlBridge.publish(REQ_ID, digest);
+            expect(pubOut).toMatchObject({
+                ok        : true,
+                state     : PUBLICATION_STATES.published,
+                providerId: 'tweet-bridge-1267'
+            });
+
+            // Also verify auto-derived executor when `publishExecutor` is not explicitly injected
+            FleetControlBridge.publishExecutor = null;
+            const idempotentViaCompose = await FleetControlBridge.publish({
+                requestId     : REQ_ID,
+                revisionDigest: digest
+            });
+            expect(idempotentViaCompose).toMatchObject({
+                ok        : true,
+                noop      : true,
+                state     : PUBLICATION_STATES.published,
+                providerId: 'tweet-bridge-1267'
+            });
+
+            FleetControlBridge.publishExecutor = customExecutor;
+            const metricsOut = await FleetControlBridge.readMetrics('tweet-bridge-1267');
+            expect(metricsOut).toMatchObject({
+                ok        : true,
+                providerId: 'tweet-bridge-1267',
+                channel   : 'x',
+                account   : '@neomjs'
+            });
+            expect(metricsOut.metrics.impressions).toBe(512);
+            expect(metricsOut.metrics.likes).toBe(19);
+            expect(metricsOut.metrics.url_link_clicks).toBe('unknown');
+
+            const replyOut = await FleetControlBridge.reply({inReplyTo: 'tweet-third-party-1'});
+            expect(replyOut).toMatchObject({
+                ok           : false,
+                refused      : REFUSAL_CODES.replyClassificationUnresolved,
+                primarySource: REPLY_CLASSIFICATION_PRIMARY_SOURCE
+            });
+
+            // Verify zero MCP tool exposure of `publish`, `readMetrics`, or `reply` across all agent-facing MCP OpenAPI specs
+            const mcpSpecPaths = [
+                '../../../../../../ai/mcp/server/memory-core/openapi.yaml',
+                '../../../../../../ai/mcp/server/github-workflow/openapi.yaml',
+                '../../../../../../ai/mcp/server/knowledge-base/openapi.yaml',
+                '../../../../../../ai/mcp/server/neural-link/openapi.yaml'
+            ];
+            for (const relPath of mcpSpecPaths) {
+                const absPath = path.resolve(import.meta.dirname, relPath);
+                const content = await fs.readFile(absPath, 'utf8');
+                expect(content).not.toMatch(/operationId:\s*(publish|readMetrics|reply)\b/);
+            }
+        } finally {
+            FleetControlBridge.composeWriter   = null;
+            FleetControlBridge.publishExecutor = null;
+            FleetControlBridge.registry        = null;
+            await fs.rm(tempRoot, {recursive: true, force: true});
+        }
+    });
+
+    test('#1267 RA-1 & Observation-4: FleetControlBridge strips seam overrides from wire params and resolves readMetrics durably from MailboxService across executor instances', async () => {
+        const unapprovedReq = seedApprovedRequest({
+            approved: false
+        });
+        const digest  = unapprovedReq.currentRevision.revisionDigest;
+        const mailbox = createInMemoryMailbox({[REQ_ID]: unapprovedReq});
+
+        let   platformCalls  = 0;
+        const customExecutor = createPublishExecutor({
+            mailbox,
+            credentials: {'x:@neomjs': SECRET},
+            switchStore: {[`${PEER_ID}:x`]: SWITCH_STATES.approveEach},
+            now        : () => NOW_MS,
+            platform   : {
+                async publishPost() {
+                    platformCalls += 1;
+                    return {providerId: 'should-not-publish'};
+                }
+            }
+        });
+
+        try {
+            FleetControlBridge.publishExecutor = customExecutor;
+
+            // Attempt wire injection of switchStore: auto-approve and non-function platform override
+            const bypassAttempt = await FleetControlBridge.publish({
+                requestId     : REQ_ID,
+                revisionDigest: digest,
+                switchStore   : {[`${PEER_ID}:x`]: SWITCH_STATES.autoApprove},
+                platform      : 'malicious-non-function',
+                custody       : {readCredential: async () => ({ok: true, token: 'injected'})}
+            });
+
+            expect(bypassAttempt).toMatchObject({
+                ok     : false,
+                state  : PUBLICATION_STATES.refused,
+                refused: REFUSAL_CODES.switch
+            });
+            expect(platformCalls).toBe(0);
+
+            // Verify durable readMetrics lookup from MailboxService on a fresh executor instance with no in-memory publishedByProviderId entry
+            const publishedReq = seedApprovedRequest({
+                payload: {
+                    channel: PUBLISH_CHANNELS.linkedin,
+                    account: 'urn:li:organization:998877',
+                    format : PUBLISH_FORMATS.post,
+                    text   : 'Published LinkedIn org post'
+                }
+            });
+            publishedReq.publication.state      = PUBLICATION_STATES.published;
+            publishedReq.publication.providerId = 'urn:li:share:55443322';
+            const durableMailbox  = createInMemoryMailbox({[REQ_ID]: publishedReq});
+            let   metricsCallArgs = null;
+            const freshExecutor   = createPublishExecutor({
+                mailbox    : durableMailbox,
+                credentials: {'linkedin:urn:li:organization:998877': SECRET},
+                now        : () => NOW_MS,
+                platform   : {
+                    async readMetrics(args) {
+                        metricsCallArgs = args;
+                        return {
+                            source    : 'linkedin-community-management-api',
+                            window    : 'lifetime',
+                            claimClass: 'owned-object-telemetry',
+                            statistics: {impressions: 900, likes: 45}
+                        };
+                    }
+                }
+            });
+
+            FleetControlBridge.publishExecutor = freshExecutor;
+            const metricsOut = await FleetControlBridge.readMetrics({
+                providerId: 'urn:li:share:55443322',
+                custody   : {readCredential: async () => ({ok: false, reason: 'injected-custody-must-be-ignored'})},
+                platform  : 'injected-platform-must-be-ignored'
+            });
+
+            expect(metricsOut).toMatchObject({
+                ok        : true,
+                providerId: 'urn:li:share:55443322',
+                channel   : PUBLISH_CHANNELS.linkedin,
+                account   : 'urn:li:organization:998877'
+            });
+            expect(metricsCallArgs).toMatchObject({
+                providerId: 'urn:li:share:55443322',
+                channel   : PUBLISH_CHANNELS.linkedin,
+                account   : 'urn:li:organization:998877'
+            });
+        } finally {
+            FleetControlBridge.publishExecutor = null;
+        }
+    });
+
+    test('#1267 RA-3 & RA-4: fleetCustodyStore single-flight refresh, 60s pre-expiry margin, non-clobbering concurrent bundle writes, and split module exports', async () => {
+        expect(createFleetCustodyStoreDirect).toBe(createFleetCustodyStore);
+        expect(createSocialPlatformClientDirect).toBe(createSocialPlatformClient);
+        expect(X_REFRESH_MARGIN_MS).toBe(60_000);
+
+        const tempRoot   = await fs.mkdtemp(path.join(os.tmpdir(), 'fleet-custody-ra3-'));
+        const bundlePath = path.join(tempRoot, 'social-credentials.json');
+
+        // Seed two accounts in the shared bundle:
+        // - @neomjs expires 30s from NOW_MS (inside the 60s pre-expiry margin -> must rotate!)
+        // - @neo-gemini-maryam is already expired -> must also rotate without clobbering @neomjs
+        await fs.writeFile(
+            bundlePath,
+            JSON.stringify({
+                'x:@neomjs': {
+                    accessToken : 'old-access-neomjs',
+                    refreshToken: 'old-refresh-neomjs',
+                    expiresAt   : new Date(NOW_MS + 30_000).toISOString()
+                },
+                'x:@neo-gemini-maryam': {
+                    accessToken : 'old-access-maryam',
+                    refreshToken: 'old-refresh-maryam',
+                    expiresAt   : new Date(NOW_MS - 5_000).toISOString()
+                }
+            }, null, 2),
+            {encoding: 'utf8', mode: 0o600}
+        );
+
+        try {
+            let neomjsRefreshCalls = 0;
+            let maryamRefreshCalls = 0;
+
+            const store = createFleetCustodyStoreDirect({
+                custodyDir: tempRoot,
+                now       : () => NOW_MS,
+                fetch     : async (_url, init) => {
+                    const params = new URLSearchParams(init.body);
+                    const rt     = params.get('refresh_token');
+                    await new Promise(resolve => setTimeout(resolve, 15));
+
+                    if (rt === 'old-refresh-neomjs') {
+                        neomjsRefreshCalls += 1;
+                        return {
+                            ok    : true,
+                            status: 200,
+                            async json() {
+                                return {
+                                    access_token : `new-access-neomjs-${neomjsRefreshCalls}`,
+                                    refresh_token: `new-refresh-neomjs-${neomjsRefreshCalls}`,
+                                    expires_in   : 7200
+                                };
+                            }
+                        };
+                    }
+
+                    if (rt === 'old-refresh-maryam') {
+                        maryamRefreshCalls += 1;
+                        return {
+                            ok    : true,
+                            status: 200,
+                            async json() {
+                                return {
+                                    access_token : `new-access-maryam-${maryamRefreshCalls}`,
+                                    refresh_token: `new-refresh-maryam-${maryamRefreshCalls}`,
+                                    expires_in   : 7200
+                                };
+                            }
+                        };
+                    }
+
+                    return {ok: false, status: 400, async json() { return {error: 'unexpected_token'}; }};
+                }
+            });
+
+            // Fire two concurrent reads for @neomjs (testing single-flight + 60s pre-expiry margin)
+            // and one concurrent read for @neo-gemini-maryam (testing serialized non-clobbering bundle write)
+            const [resNeomjs1, resNeomjs2, resMaryam] = await Promise.all([
+                store.readCredential({channel: PUBLISH_CHANNELS.x, account: '@neomjs', nowMs: NOW_MS}),
+                store.readCredential({channel: PUBLISH_CHANNELS.x, account: '@neomjs', nowMs: NOW_MS}),
+                store.readCredential({channel: PUBLISH_CHANNELS.x, account: '@neo-gemini-maryam', nowMs: NOW_MS})
+            ]);
+
+            expect(neomjsRefreshCalls).toBe(1);
+            expect(maryamRefreshCalls).toBe(1);
+            expect(resNeomjs1).toMatchObject({ok: true, rotated: true, token: 'new-access-neomjs-1'});
+            expect(resNeomjs2).toMatchObject({ok: true, rotated: true, token: 'new-access-neomjs-1'});
+            expect(resMaryam).toMatchObject({ok: true, rotated: true, token: 'new-access-maryam-1'});
+
+            // Verify both rotated accounts survived in social-credentials.json without clobbering one another
+            const persistedBundle = JSON.parse(await fs.readFile(bundlePath, 'utf8'));
+            expect(persistedBundle['x:@neomjs'].accessToken).toBe('new-access-neomjs-1');
+            expect(persistedBundle['x:@neomjs'].refreshToken).toBe('new-refresh-neomjs-1');
+            expect(persistedBundle['x:@neo-gemini-maryam'].accessToken).toBe('new-access-maryam-1');
+            expect(persistedBundle['x:@neo-gemini-maryam'].refreshToken).toBe('new-refresh-maryam-1');
+
+            // Verify failed/corrupt write-time bundle re-read falls back to per-account file without clobbering social-credentials.json
+            await fs.writeFile(
+                bundlePath,
+                JSON.stringify({
+                    'x:@neomjs': {
+                        accessToken : 'expired-neomjs-2',
+                        refreshToken: 'old-refresh-neomjs',
+                        expiresAt   : new Date(NOW_MS - 10_000).toISOString()
+                    },
+                    'x:@neo-gemini-maryam': {
+                        accessToken : 'surviving-maryam-access',
+                        refreshToken: 'surviving-maryam-refresh',
+                        expiresAt   : new Date(NOW_MS + 3_600_000).toISOString()
+                    }
+                }, null, 2),
+                {encoding: 'utf8', mode: 0o600}
+            );
+
+            let   bundleReads = 0;
+            const midWriteFs  = {
+                ...fs,
+                async readFile(targetPath, encoding) {
+                    if (targetPath === bundlePath) {
+                        bundleReads += 1;
+                        if (bundleReads === 2) {
+                            return '{"x:@neomjs":';
+                        }
+                    }
+                    return fs.readFile(targetPath, encoding);
+                }
+            };
+
+            const fallbackStore = createFleetCustodyStoreDirect({
+                custodyDir: tempRoot,
+                fsModule  : midWriteFs,
+                now       : () => NOW_MS,
+                fetch     : async () => ({
+                    ok    : true,
+                    status: 200,
+                    async json() {
+                        return {
+                            access_token : 'fallback-per-account-neomjs',
+                            refresh_token: 'fallback-refresh-neomjs',
+                            expires_in   : 7200
+                        };
+                    }
+                })
+            });
+
+            const fallbackRes = await fallbackStore.readCredential({
+                channel: PUBLISH_CHANNELS.x,
+                account: '@neomjs',
+                nowMs  : NOW_MS
+            });
+            expect(fallbackRes).toMatchObject({ok: true, rotated: true, token: 'fallback-per-account-neomjs'});
+
+            const untouchedBundle = JSON.parse(await fs.readFile(bundlePath, 'utf8'));
+            expect(untouchedBundle['x:@neo-gemini-maryam'].accessToken).toBe('surviving-maryam-access');
+            expect(untouchedBundle['x:@neomjs'].accessToken).toBe('expired-neomjs-2');
+
+            const perAccountFallback = JSON.parse(await fs.readFile(path.join(tempRoot, 'social-credentials', 'x', '_neomjs.json'), 'utf8'));
+            expect(perAccountFallback.accessToken).toBe('fallback-per-account-neomjs');
+
+            const [reReadNeomjs, reReadMaryam] = await Promise.all([
+                fallbackStore.readCredential({channel: PUBLISH_CHANNELS.x, account: '@neomjs', nowMs: NOW_MS}),
+                fallbackStore.readCredential({channel: PUBLISH_CHANNELS.x, account: '@neo-gemini-maryam', nowMs: NOW_MS})
+            ]);
+            expect(reReadNeomjs).toMatchObject({ok: true, token: 'fallback-per-account-neomjs'});
+            expect(reReadMaryam).toMatchObject({ok: true, token: 'surviving-maryam-access'});
+
+            // Also verify POST /2/tweets sends only standard Authorization + Content-Type headers
+            let   capturedTweetHeaders = null;
+            const client               = createSocialPlatformClientDirect({
+                now  : () => NOW_MS,
+                fetch: async (_url, init) => {
+                    if (init?.method === 'POST') {
+                        capturedTweetHeaders = init.headers;
+                    }
+                    return {ok: true, status: 201, async json() { return {data: {id: 'tweet-hdr-1', text: 'hello'}}; }};
+                }
+            });
+            await client.publishPost({
+                channel       : PUBLISH_CHANNELS.x,
+                account       : '@neomjs',
+                format        : PUBLISH_FORMATS.post,
+                text          : 'hello',
+                token         : 'tok-1',
+                attemptId     : 'attempt-hdr-1',
+                revisionDigest: 'digest-hdr-1'
+            });
+            expect(capturedTweetHeaders).toEqual({
+                'Authorization': 'Bearer tok-1',
+                'Content-Type' : 'application/json'
+            });
+        } finally {
+            await fs.rm(tempRoot, {recursive: true, force: true});
         }
     });
 });

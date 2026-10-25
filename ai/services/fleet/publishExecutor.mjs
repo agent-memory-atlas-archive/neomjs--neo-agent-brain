@@ -21,26 +21,40 @@
  * Every publication-state read and write binds directly to `MailboxService`'s single-writer verbs
  * (`getMessage`, `transitionPublishState`, `approvePublishRevision`, `attestPublishRevision`) and
  * shares `computePublishRevisionDigest` via `ai/services/memory-core/helpers/publishDigest.mjs`.
+ * Custody rotation and live HTTP platform adapters live in sibling modules
+ * `ai/services/fleet/fleetCustodyStore.mjs` and `ai/services/fleet/socialPlatformClient.mjs`.
  */
 
-import crypto     from 'node:crypto';
-import fsPromises from 'node:fs/promises';
-import path       from 'node:path';
+import crypto from 'node:crypto';
 import {
     computePublishRevisionDigest,
     matchesRequestedPublishText
 } from '../memory-core/helpers/publishDigest.mjs';
+import {
+    PUBLISH_CHANNELS,
+    REFUSAL_CODES,
+    LINKEDIN_TOKEN_MAX_AGE_MS,
+    X_REFRESH_MARGIN_MS,
+    scrubSecrets,
+    createFleetCustodyStore
+} from './fleetCustodyStore.mjs';
+import {
+    RECONCILE_RECENT_POSTS_LIMIT,
+    createSocialPlatformClient
+} from './socialPlatformClient.mjs';
 
-export {computePublishRevisionDigest, matchesRequestedPublishText};
-
-/**
- * Closed v1 outbound publishing channels.
- * @type {Readonly<{x: 'x', linkedin: 'linkedin'}>}
- */
-export const PUBLISH_CHANNELS = Object.freeze({
-    x       : 'x',
-    linkedin: 'linkedin'
-});
+export {
+    computePublishRevisionDigest,
+    matchesRequestedPublishText,
+    PUBLISH_CHANNELS,
+    REFUSAL_CODES,
+    LINKEDIN_TOKEN_MAX_AGE_MS,
+    X_REFRESH_MARGIN_MS,
+    RECONCILE_RECENT_POSTS_LIMIT,
+    scrubSecrets,
+    createFleetCustodyStore,
+    createSocialPlatformClient
+};
 
 /**
  * Closed v1 outbound post formats.
@@ -89,23 +103,6 @@ const SWITCH_STATE_RANK = Object.freeze({
 export const REPLY_CLASSIFICATION_PRIMARY_SOURCE = 'https://help.x.com/en/rules-and-policies/x-automation';
 
 /**
- * Named refusal codes emitted by the Fleet publish executor.
- * @type {Readonly<Record<String, String>>}
- */
-export const REFUSAL_CODES = Object.freeze({
-    credential                   : 'refused: credential',
-    switch                       : 'refused: switch',
-    digest                       : 'refused: digest',
-    attestation                  : 'refused: attestation',
-    replyClassificationUnresolved: 'refused: reply-classification-unresolved',
-    alreadyPublished             : 'refused: already-published',
-    unresolved                   : 'refused: unresolved',
-    publishingInFlight           : 'refused: publishing-in-flight',
-    channel                      : 'refused: channel',
-    notFound                     : 'refused: not-found'
-});
-
-/**
  * Canonical metric keys returned by {@link readMetrics} per channel. Any metric absent, `null`,
  * `undefined`, or non-finite in the platform response is reported as `'unknown'`, never `0`.
  * @type {Readonly<Record<String, ReadonlyArray<String>>>}
@@ -152,214 +149,7 @@ const X_RAW_COUNT_ALIAS_KEYS = new Set([
     'bookmark_count'
 ]);
 
-/**
- * LinkedIn page-admin token maximum lifetime in milliseconds (60 days).
- * @type {Number}
- */
-export const LINKEDIN_TOKEN_MAX_AGE_MS = 60 * 24 * 60 * 60 * 1000;
-
-/**
- * Default number of recent account posts inspected during post-crash reconciliation.
- * @type {Number}
- */
-export const RECONCILE_RECENT_POSTS_LIMIT = 20;
-
 const SECRET_KEY_PATTERN = /(token|secret|password|credential|authorization|api[_-]?key|private[_-]?key|client[_-]?secret|refresh[_-]?token|access[_-]?token)/i;
-
-/**
- * @summary Scrubs known secret values and Bearer tokens from strings, errors, and objects so no
- * verb, log line, or refusal reason ever leaks a platform credential.
- * @param {*}        value
- * @param {String[]} [secrets=[]]
- * @returns {*}
- */
-export function scrubSecrets(value, secrets = []) {
-    const activeSecrets = secrets.filter(item => typeof item === 'string' && item.length > 0);
-
-    const scrubString = text => {
-        let output = String(text).replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer [REDACTED]');
-        for (const secret of activeSecrets) {
-            output = output.split(secret).join('[REDACTED]');
-        }
-        return output;
-    };
-
-    if (typeof value === 'string') {
-        return scrubString(value);
-    }
-
-    if (value instanceof Error) {
-        return scrubString(value.message || String(value));
-    }
-
-    if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
-        return value;
-    }
-
-    if (Array.isArray(value)) {
-        return value.map(item => scrubSecrets(item, activeSecrets));
-    }
-
-    if (value && typeof value === 'object') {
-        const clone = {};
-        for (const [key, entry] of Object.entries(value)) {
-            if (SECRET_KEY_PATTERN.test(key)) {
-                continue;
-            }
-            clone[key] = scrubSecrets(entry, activeSecrets);
-        }
-        return clone;
-    }
-
-    return value;
-}
-
-/**
- * @summary Creates a Fleet custody credential reader over `<userData>/brain/fleet` (or an injected
- * credentials map/directory). Tokens are read by `{channel, account}`, checked for presence,
- * revocation, and expiry (including LinkedIn's 60-day token window), and never logged or returned
- * by any public executor verb.
- * @param {Object}   [options={}]
- * @param {String}   [options.custodyDir] Directory under `<userData>/brain/fleet`.
- * @param {Object}   [options.credentials] Optional in-memory map keyed by `${channel}:${account}` or `account`.
- * @param {Object}   [options.fsModule=fsPromises]
- * @param {Function} [options.now=Date.now]
- * @returns {{readCredential: Function}}
- */
-export function createFleetCustodyStore({
-    custodyDir  = null,
-    credentials = null,
-    fsModule    = fsPromises,
-    now         = () => Date.now()
-} = {}) {
-    async function loadRawRecord(channel, account) {
-        if (credentials && typeof credentials === 'object') {
-            const compositeKey = `${channel}:${account}`;
-            if (Object.hasOwn(credentials, compositeKey)) {
-                return credentials[compositeKey];
-            }
-            if (credentials[channel] && typeof credentials[channel] === 'object' && Object.hasOwn(credentials[channel], account)) {
-                return credentials[channel][account];
-            }
-            if (Object.hasOwn(credentials, account)) {
-                return credentials[account];
-            }
-        }
-
-        if (!custodyDir) {
-            return null;
-        }
-
-        const safeAccount = String(account).replace(/[^a-zA-Z0-9._@-]/g, '_'),
-              perAccount  = path.join(custodyDir, 'social-credentials', channel, `${safeAccount}.json`),
-              bundlePath  = path.join(custodyDir, 'social-credentials.json');
-
-        try {
-            const raw = await fsModule.readFile(perAccount, 'utf8');
-            return JSON.parse(raw);
-        } catch {
-            // Fall through to aggregate custody file if present.
-        }
-
-        try {
-            const raw    = await fsModule.readFile(bundlePath, 'utf8'),
-                  parsed = JSON.parse(raw);
-            return parsed?.[`${channel}:${account}`] ?? parsed?.[channel]?.[account] ?? null;
-        } catch {
-            return null;
-        }
-    }
-
-    return {
-        /**
-         * @summary Reads and validates the custody credential for `{channel, account}` at `now()`.
-         * @param {Object} params
-         * @param {String} params.channel
-         * @param {String} params.account
-         * @param {Number} [params.nowMs]
-         * @returns {Promise<{ok: Boolean, token?: String, record?: Object, code?: String, reason?: String}>}
-         */
-        async readCredential({channel, account, nowMs = now()}) {
-            if (!channel || !account) {
-                return {
-                    ok    : false,
-                    code  : REFUSAL_CODES.credential,
-                    reason: `${REFUSAL_CODES.credential} — channel and account are required to resolve Fleet custody`
-                };
-            }
-
-            const record = await loadRawRecord(channel, account);
-
-            if (!record || typeof record !== 'object') {
-                return {
-                    ok    : false,
-                    code  : REFUSAL_CODES.credential,
-                    reason: `${REFUSAL_CODES.credential} — no Fleet custody token registered for ${channel}:${account}`
-                };
-            }
-
-            if (record.revoked === true) {
-                return {
-                    ok    : false,
-                    code  : REFUSAL_CODES.credential,
-                    reason: `${REFUSAL_CODES.credential} — Fleet custody token for ${channel}:${account} is marked revoked`
-                };
-            }
-
-            const token = typeof record.accessToken === 'string'
-                ? record.accessToken.trim()
-                : (typeof record.token === 'string' ? record.token.trim() : '');
-
-            if (!token) {
-                return {
-                    ok    : false,
-                    code  : REFUSAL_CODES.credential,
-                    reason: `${REFUSAL_CODES.credential} — Fleet custody record for ${channel}:${account} holds no access token`
-                };
-            }
-
-            if (record.expiresAt != null) {
-                const expiresMs = typeof record.expiresAt === 'number'
-                    ? record.expiresAt
-                    : Date.parse(String(record.expiresAt));
-
-                if (!Number.isFinite(expiresMs) || expiresMs <= nowMs) {
-                    return {
-                        ok    : false,
-                        code  : REFUSAL_CODES.credential,
-                        reason: `${REFUSAL_CODES.credential} — Fleet custody token for ${channel}:${account} is expired`
-                    };
-                }
-            }
-
-            if (channel === PUBLISH_CHANNELS.linkedin && record.issuedAt != null) {
-                const issuedMs = typeof record.issuedAt === 'number'
-                    ? record.issuedAt
-                    : Date.parse(String(record.issuedAt));
-
-                if (!Number.isFinite(issuedMs) || (nowMs - issuedMs) >= LINKEDIN_TOKEN_MAX_AGE_MS) {
-                    return {
-                        ok    : false,
-                        code  : REFUSAL_CODES.credential,
-                        reason: `${REFUSAL_CODES.credential} — LinkedIn page-admin token for ${account} exceeded the 60-day custody lifetime`
-                    };
-                }
-            }
-
-            return {
-                ok    : true,
-                token,
-                record: {
-                    channel,
-                    account,
-                    scopes   : Array.isArray(record.scopes) ? [...record.scopes] : [],
-                    expiresAt: record.expiresAt ?? null,
-                    issuedAt : record.issuedAt ?? null
-                }
-            };
-        }
-    };
-}
 
 /**
  * @summary Reads a message record from `MailboxService#getMessage({messageId})`, returning `null`
@@ -499,6 +289,73 @@ function normalizeRequestRecord(raw) {
             refusalReason  : rawPub.refusalReason ?? rawPub.reason ?? null
         }
     };
+}
+
+/**
+ * @summary Resolves `{channel, account, requestId}` for a published `providerId` from the durable
+ * `MailboxService` store when the in-memory `publishedByProviderId` cache does not hold it.
+ * @param {Object} mailbox
+ * @param {String} providerId
+ * @returns {Promise<{channel: String, account: String, requestId: String}|null>}
+ */
+async function findPublishedRecordByProviderId(mailbox, providerId) {
+    if (!mailbox || !providerId) {
+        return null;
+    }
+
+    const targetProviderId = String(providerId);
+    const matchRaw         = raw => {
+        const norm = normalizeRequestRecord(raw);
+        if (
+            norm &&
+            String(norm.publication?.providerId ?? '') === targetProviderId &&
+            norm.currentRevision?.payload?.channel &&
+            norm.currentRevision?.payload?.account
+        ) {
+            return {
+                channel  : norm.currentRevision.payload.channel,
+                account  : norm.currentRevision.payload.account,
+                requestId: norm.requestId
+            };
+        }
+        return null;
+    };
+
+    if (mailbox.store instanceof Map) {
+        for (const raw of mailbox.store.values()) {
+            const matched = matchRaw(raw);
+            if (matched) return matched;
+        }
+    }
+
+    const listFn = typeof mailbox.observeMessages === 'function'
+        ? mailbox.observeMessages.bind(mailbox)
+        : (typeof mailbox.listMessages === 'function' ? mailbox.listMessages.bind(mailbox) : null);
+
+    if (listFn) {
+        try {
+            const page = await listFn({limit: 100}),
+                  rows = Array.isArray(page)
+                      ? page
+                      : (Array.isArray(page?.messages) ? page.messages : (Array.isArray(page?.rows) ? page.rows : []));
+
+            for (const row of rows) {
+                const direct = matchRaw(row);
+                if (direct) return direct;
+
+                const msgId = row?.messageId ?? row?.id ?? null;
+                if (msgId && typeof mailbox.getMessage === 'function') {
+                    const full    = await readMailboxMessage(mailbox, msgId),
+                          matched = matchRaw(full);
+                    if (matched) return matched;
+                }
+            }
+        } catch {
+            // Fall through if listing is unavailable
+        }
+    }
+
+    return null;
 }
 
 /**
@@ -799,6 +656,12 @@ export function createPublishExecutor(config = {}) {
           custody       = config.custody ?? createFleetCustodyStore({
               custodyDir : config.custodyDir ?? null,
               credentials: config.credentials ?? null,
+              fetch      : config.fetch,
+              now
+          }),
+          defaultPlatform = config.platform ?? createSocialPlatformClient({
+              fetch: config.fetch,
+              custody,
               now
           }),
           logger                = config.logger ?? null,
@@ -1062,7 +925,7 @@ export function createPublishExecutor(config = {}) {
             const mailbox               = callOptions.mailbox ?? config.mailbox,
                   custodySeam           = callOptions.custody ?? custody,
                   switchStore           = callOptions.switchStore ?? config.switchStore,
-                  platform              = callOptions.platform ?? config.platform,
+                  platform              = callOptions.platform ?? defaultPlatform,
                   mediaReader           = callOptions.mediaReader ?? config.mediaReader,
                   resolveIdentityFamily = callOptions.resolveIdentityFamily ?? config.resolveIdentityFamily ?? (async () => null),
                   nowMs                 = (callOptions.now ?? now)();
@@ -1562,7 +1425,7 @@ export function createPublishExecutor(config = {}) {
          * @summary Reads owned-object metrics (`public_metrics` + `non_public_metrics` on X or page
          * statistics on LinkedIn) with `{source, window, claimClass}`. Any unavailable metric is
          * reported as `'unknown'`, never `0`. Derives `channel` and `account` from the published
-         * record when omitted by the caller.
+         * record (in memory or durably via `MailboxService`) when omitted by the caller.
          * @param {String} providerId
          * @param {Object} [options={}]
          * @returns {Promise<Object>}
@@ -1570,7 +1433,7 @@ export function createPublishExecutor(config = {}) {
         async readMetrics(providerId, options = {}) {
             const mailbox     = options.mailbox ?? config.mailbox,
                   custodySeam = options.custody ?? custody,
-                  platform    = options.platform ?? config.platform,
+                  platform    = options.platform ?? defaultPlatform,
                   nowMs       = (options.now ?? now)();
 
             if (!providerId || typeof providerId !== 'string') {
@@ -1591,6 +1454,13 @@ export function createPublishExecutor(config = {}) {
                         account  : norm.currentRevision.payload.account,
                         requestId: options.requestId
                     };
+                }
+            }
+            if (!derivedRecord?.channel || !derivedRecord?.account) {
+                const found = await findPublishedRecordByProviderId(mailbox, providerId);
+                if (found) {
+                    derivedRecord = found;
+                    publishedByProviderId.set(String(providerId), found);
                 }
             }
 

@@ -17,6 +17,7 @@ import {
 import {normalizeMailboxObserver} from '../memory-core/helpers/mailboxObservation.mjs';
 
 import {createFleetCockpitStatus, createNotWiredCapability} from './fleetCockpitStatus.mjs';
+import {createPublishExecutor}                              from './publishExecutor.mjs';
 import {FLEET_COCKPIT_SOURCES}                              from '../../../src/fleet/contract/cockpit.mjs';
 
 /**
@@ -514,6 +515,13 @@ class FleetControlBridge extends Base {
      * @member {Object|null} composeWriter=null
      */
     composeWriter = null
+    /**
+     * Outbound social publish executor seam — an injected collaborator exposing `publish`,
+     * `readMetrics`, and `reply`, or resolved on demand over {@link #composeWriter} and the
+     * registry's `<userData>/brain/fleet` custody root.
+     * @member {Object|null} publishExecutor=null
+     */
+    publishExecutor = null
 
     /**
      * Identity-display resolver seam — maps a fleet agent onto its identity-root display facts
@@ -562,6 +570,38 @@ class FleetControlBridge extends Base {
      */
     getTenantService() {
         return this.tenantService || FleetTenantService;
+    }
+
+    /**
+     * @returns {Object|null} the outbound social publish executor (injected or bound to composeWriter + custodyDir).
+     * @protected
+     */
+    getPublishExecutor() {
+        if (this.publishExecutor) {
+            return this.publishExecutor;
+        }
+        if (
+            typeof this.composeWriter?.getMessage === 'function' &&
+            typeof this.composeWriter?.transitionPublishState === 'function'
+        ) {
+            const custodyDir = typeof this.getRegistry()?.getDataDir === 'function'
+                ? this.getRegistry().getDataDir()
+                : null;
+            if (
+                !this._defaultPublishExecutor ||
+                this._defaultPublishExecutorMailbox !== this.composeWriter ||
+                this._defaultPublishExecutorCustodyDir !== custodyDir
+            ) {
+                this._defaultPublishExecutorMailbox    = this.composeWriter;
+                this._defaultPublishExecutorCustodyDir = custodyDir;
+                this._defaultPublishExecutor           = createPublishExecutor({
+                    mailbox: this.composeWriter,
+                    custodyDir
+                });
+            }
+            return this._defaultPublishExecutor;
+        }
+        return null;
     }
 
     // ---- capability allowlist (the ONLY pane-reachable operations) ----------
@@ -1480,6 +1520,76 @@ class FleetControlBridge extends Base {
             typeof newState === 'string' && newState ? null : 'newState must be a non-empty string');
 
         return typeof answer?.then === 'function' ? answer.catch(error => taskRefusalOf(error) ?? Promise.reject(error)) : answer
+    }
+
+    /**
+     * @summary WRITE: execute an approved `requestPublish` revision at most once under Fleet
+     * credential custody (`<userData>/brain/fleet`) and `MailboxService` single-writer reservation.
+     * Accepts only `requestId` (or `messageId`) and `revisionDigest` from the wire; executor seam
+     * overrides (`switchStore`, `custody`, `platform`, `mailbox`, `mediaReader`, `now`) are never
+     * forwarded from wire parameters.
+     * @param {String|Object} requestOrId
+     * @param {String}        [revisionDigest]
+     * @returns {Promise<Object>|Object}
+     */
+    publish(requestOrId, revisionDigest) {
+        const executor = this.getPublishExecutor();
+        if (typeof executor?.publish !== 'function') {
+            return {status: 'not-wired', reason: 'fleet: publish executor not wired'};
+        }
+
+        if (requestOrId && typeof requestOrId === 'object' && !Array.isArray(requestOrId)) {
+            const targetId     = requestOrId.requestId ?? requestOrId.messageId,
+                  targetDigest = requestOrId.revisionDigest ?? revisionDigest;
+            return executor.publish(targetId, targetDigest);
+        }
+
+        return executor.publish(requestOrId, revisionDigest);
+    }
+
+    /**
+     * @summary READ-OBSERVE: read owned-object metrics (`public_metrics` + `non_public_metrics` on X
+     * or organization share statistics on LinkedIn) under Fleet custody. Forwards only `providerId`
+     * and optional string `{channel, account, requestId}` lookup hints; executor seam overrides are
+     * never accepted from wire parameters.
+     * @param {String|Object} providerOrParams
+     * @returns {Promise<Object>|Object}
+     */
+    readMetrics(providerOrParams) {
+        const executor = this.getPublishExecutor();
+        if (typeof executor?.readMetrics !== 'function') {
+            return {status: 'not-wired', reason: 'fleet: publish executor not wired'};
+        }
+
+        if (providerOrParams && typeof providerOrParams === 'object' && !Array.isArray(providerOrParams)) {
+            const {providerId, channel, account, requestId} = providerOrParams,
+                  safeOptions                               = {};
+            if (typeof channel === 'string' && channel)     safeOptions.channel   = channel;
+            if (typeof account === 'string' && account)     safeOptions.account   = account;
+            if (typeof requestId === 'string' && requestId) safeOptions.requestId = requestId;
+            return executor.readMetrics(providerId, safeOptions);
+        }
+
+        return executor.readMetrics(providerOrParams);
+    }
+
+    /**
+     * @summary WRITE: outbound third-party reply verb; disabled until X reply automation
+     * classification is verified against the primary rules.
+     * @param {Object} [params={}]
+     * @returns {Promise<Object>}
+     */
+    reply(params = {}) {
+        const executor   = this.getPublishExecutor() ?? createPublishExecutor(),
+              safeParams = (params && typeof params === 'object' && !Array.isArray(params))
+                  ? {
+                      ...(typeof params.inReplyTo === 'string' ? {inReplyTo: params.inReplyTo} : {}),
+                      ...(typeof params.text === 'string' ? {text: params.text} : {}),
+                      ...(typeof params.channel === 'string' ? {channel: params.channel} : {}),
+                      ...(typeof params.account === 'string' ? {account: params.account} : {})
+                  }
+                  : {};
+        return executor.reply(safeParams);
     }
 
     /**
