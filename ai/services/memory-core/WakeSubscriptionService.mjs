@@ -24,7 +24,9 @@ import {projectIdentityWakeReachability} from './wakeDeliveryProjection.mjs';
 import {readWakeDelivery}                from './wakeDeliveryReader.mjs';
 import {
     activeWakeSubscriptionStatusSql,
-    isActiveWakeSubscriptionStatus
+    isActiveWakeSubscriptionStatus,
+    isReusableWakeSubscriptionStatus,
+    reusableWakeSubscriptionStatusSql
 } from './wakeSubscriptionStatusPolicy.mjs';
 
 /**
@@ -1436,6 +1438,8 @@ class WakeSubscriptionService extends Base {
         }
         this.validateHarnessTargetMetadata(harnessTarget, finalMetadata);
 
+        this._reconcileDuplicateSubscriptions(owner);
+
         const existing = this._findActiveSubscriptionByRoute({
             owner,
             trigger,
@@ -1537,19 +1541,20 @@ class WakeSubscriptionService extends Base {
     }
 
     /**
-     * @summary Restores a degraded route to active — the operator-reachable resumption path.
+     * @summary Restores a degraded route to active — the explicit `resume()` path alongside
+     * owner re-arm via `subscribe()` / `bootstrap()`.
      *
-     * Degradation is deliberately terminal: a route whose endpoint refuses connections is marked
-     * `status: 'degraded'` and then never attempted again, which is what bounds the attempt count.
-     * Coming back is therefore an explicit operator act, never something the delivery path does on
-     * its own — a service that silently re-activates routes would restore the unbounded retry the
-     * bound exists to prevent.
+     * Degradation is deliberately terminal per arm: a route whose endpoint refuses connections is
+     * marked `status: 'degraded'` and never attempted again by the delivery path, bounding the
+     * attempt count per re-arm. Coming back is therefore an explicit act — either calling `resume()`
+     * or the owner re-subscribing the same route key via `subscribe()` / `bootstrap()` — never
+     * something the delivery path does on its own, which would restore unbounded retry.
      *
      * Resuming requires clearing BOTH truths the delivery skip reads: the durable
      * `properties.status` on the node, and the in-flight process markers. Splitting them across two
      * calls is a footgun — clearing only the in-memory half resumes nothing, because the next flush
-     * re-reads a `status` that still says `degraded`. This action performs both as one step so an
-     * operator never has to know that.
+     * re-reads a `status` that still says `degraded`. Both `resume()` and route re-arm perform
+     * both halves as one step so callers never have to know that.
      *
      * @param {Object} opts
      * @param {String} opts.subscriptionId
@@ -2446,7 +2451,7 @@ class WakeSubscriptionService extends Base {
         });
 
         for (const subscription of this._getCandidateSubscriptions(owner, trigger, harnessTarget)) {
-            if (!isActiveWakeSubscriptionStatus(subscription.status)) continue;
+            if (!isReusableWakeSubscriptionStatus(subscription.status)) continue;
             if (this._buildSubscriptionRouteKey(subscription) === candidateRouteKey) {
                 this.subscriptionCache.set(subscription.id, subscription);
                 return subscription;
@@ -2457,13 +2462,15 @@ class WakeSubscriptionService extends Base {
     }
 
     /**
-     * @summary Retires all-but-newest active wake subscriptions WITHIN each canonical route group.
+     * @summary Retires all-but-newest active/degraded wake subscriptions WITHIN each canonical route group.
      *
-     * Active subscription duplicates can accumulate across sessions when route recovery misses a
-     * durable row or a prior session exits without cleanup. The reconciler groups owner-scoped
-     * active subscriptions by canonical route key and retires N-1 per group. This preserves
-     * legitimate multi-route setups for the same agent, such as a `SENT_TO_ME` bridge-daemon route
-     * plus a `TASK_STATE_CHANGED` webhook route; only identical route tuples are retired.
+     * Subscription duplicates can accumulate across sessions when route recovery misses a durable
+     * row or a prior session exits without cleanup. The reconciler groups owner-scoped reusable
+     * (`active` and `degraded`) subscriptions by canonical route key, prefers `active` rows ahead
+     * of `degraded` rows (and newest within each status), and retires N-1 per group.
+     * This preserves legitimate multi-route setups for the same agent, such as a `SENT_TO_ME`
+     * bridge-daemon route plus a `TASK_STATE_CHANGED` webhook route; only identical route tuples
+     * are retired.
      *
      * @param {String} owner AgentIdentity node id.
      * @returns {Number} Count of subscriptions retired (0 when state was already canonical).
@@ -2477,12 +2484,13 @@ class WakeSubscriptionService extends Base {
             SELECT id, data FROM Nodes
             WHERE json_extract(data, '$.label') = 'WAKE_SUBSCRIPTION'
               AND json_extract(data, '$.properties.agentIdentity') = ?
-              AND ${activeWakeSubscriptionStatusSql()}
-            ORDER BY COALESCE(
-                json_extract(data, '$.properties.updatedAt'),
-                json_extract(data, '$.properties.createdAt'),
-                ''
-            ) DESC
+              AND ${reusableWakeSubscriptionStatusSql()}
+            ORDER BY CASE WHEN ${activeWakeSubscriptionStatusSql()} THEN 0 ELSE 1 END ASC,
+                     COALESCE(
+                         json_extract(data, '$.properties.updatedAt'),
+                         json_extract(data, '$.properties.createdAt'),
+                         ''
+                     ) DESC
         `).all(owner);
 
         if (rows.length <= 1) return 0;
@@ -2495,8 +2503,8 @@ class WakeSubscriptionService extends Base {
 
         if (subscriptions.length <= 1) return 0;
 
-        // Group by canonical route key (preserves DESC order within each group via Map insertion order
-        // because SQL already ordered by updatedAt/createdAt DESC).
+        // Group by canonical route key (preserves active-first, newest-first order within each group
+        // via Map insertion order because SQL already ordered by status and updatedAt/createdAt DESC).
         const byRouteKey = new Map();
         for (const subscription of subscriptions) {
             const key = this._buildSubscriptionRouteKey(subscription);
@@ -2508,7 +2516,7 @@ class WakeSubscriptionService extends Base {
         for (const group of byRouteKey.values()) {
             if (group.length <= 1) continue;
 
-            // Group is already newest-first; keep [0], retire the rest.
+            // Group is already active-first and newest-first; keep [0], retire the rest.
             const [keep, ...retire] = group;
             logger.warn(`[WakeSubscription] Reconciler: ${group.length} duplicate subscriptions for ${owner} on route ${keep.harnessTarget}/${keep.trigger}, keeping ${keep.id}, retiring ${retire.length}`);
 
@@ -2549,6 +2557,7 @@ class WakeSubscriptionService extends Base {
             properties: updatedProperties
         });
 
+        WebhookDeliveryService.clearDegraded(subscriptionId);
         this.subscriptionCache.delete(subscriptionId);
         return true;
     }
@@ -2574,7 +2583,13 @@ class WakeSubscriptionService extends Base {
                   AND json_extract(data, '$.properties.agentIdentity') = ?
                   AND json_extract(data, '$.properties.trigger') = ?
                   AND json_extract(data, '$.properties.harnessTarget') = ?
-                  AND ${activeWakeSubscriptionStatusSql()}
+                  AND ${reusableWakeSubscriptionStatusSql()}
+                ORDER BY CASE WHEN ${activeWakeSubscriptionStatusSql()} THEN 0 ELSE 1 END ASC,
+                         COALESCE(
+                             json_extract(data, '$.properties.updatedAt'),
+                             json_extract(data, '$.properties.createdAt'),
+                             ''
+                         ) DESC
             `).all(owner, trigger, harnessTarget);
 
             return rows
@@ -2611,14 +2626,15 @@ class WakeSubscriptionService extends Base {
 
         return this._getCandidateSubscriptionsFromMemory(
             identity,
-            sub => ['bridge-daemon', 'a2a-webhook'].includes(sub.harnessTarget)
+            sub => isActiveWakeSubscriptionStatus(sub.status) && ['bridge-daemon', 'a2a-webhook'].includes(sub.harnessTarget)
         ).length > 0;
     }
 
     /**
      * @summary In-memory subscription scan fallback for unit-test harnesses where the
-     * graph storage substrate is replaced. Pulls active nodes from `GraphService.db.nodes`
-     * and applies the caller-supplied predicate on the WAKE_SUBSCRIPTION's properties.
+     * graph storage substrate is replaced. Pulls reusable (`active` and `degraded`) nodes from
+     * `GraphService.db.nodes` and applies the caller-supplied predicate on the WAKE_SUBSCRIPTION's
+     * properties.
      *
      * @param {String} owner AgentIdentity node id.
      * @param {Function} predicate Filter applied to the hydrated subscription entry.
@@ -2631,16 +2647,23 @@ class WakeSubscriptionService extends Base {
         if (!db) return candidates;
 
         for (const node of db.nodes.items) {
-            if (node.label !== 'WAKE_SUBSCRIPTION')   continue;
+            if (node.label !== 'WAKE_SUBSCRIPTION')       continue;
             const props = node.properties || {};
-            if (props.agentIdentity !== owner)        continue;
-            if (!isActiveWakeSubscriptionStatus(props.status)) continue;
+            if (props.agentIdentity !== owner)            continue;
+            if (!isReusableWakeSubscriptionStatus(props.status)) continue;
             const entry = {id: node.id, ...props};
-            if (!predicate(entry))                    continue;
+            if (!predicate(entry))                        continue;
             candidates.push(entry);
         }
 
-        return candidates;
+        return candidates.sort((a, b) => {
+            const aActive = isActiveWakeSubscriptionStatus(a.status) ? 0 : 1;
+            const bActive = isActiveWakeSubscriptionStatus(b.status) ? 0 : 1;
+            if (aActive !== bActive) return aActive - bActive;
+            const aTime = a.updatedAt || a.createdAt || '';
+            const bTime = b.updatedAt || b.createdAt || '';
+            return bTime.localeCompare(aTime);
+        });
     }
 
     /**
@@ -2759,12 +2782,14 @@ class WakeSubscriptionService extends Base {
     }
 
     /**
-     * @summary Refreshes mutable metadata on an existing active wake route during re-subscribe.
+     * @summary Refreshes mutable metadata on an existing active or degraded wake route during re-subscribe.
      *
-     * Idempotent subscribe must not create a duplicate route, but re-subscribe is also the
-     * operator recovery path after bridge/MCP restarts. Merging the current request's filters and
-     * metadata into the existing row lets agents repair stale route settings (for example a
-     * corrected `focusSeedKey`) without adding parallel active `WAKE_SUBSCRIPTION` rows.
+     * Idempotent subscribe must not create a duplicate route, and re-subscribe / bootstrap is also
+     * the recovery path after bridge/MCP restarts or delivery degradation. Merging the
+     * current request's filters and metadata into the existing row lets agents repair stale route
+     * settings (for example a corrected `focusSeedKey`) while preserving the route's subscription
+     * id and server-issued `signingKey`, restoring `status: 'active'`, and clearing the in-memory
+     * degraded markers on `WebhookDeliveryService`.
      *
      * @param {Object} subscription Existing cache entry.
      * @param {Object} opts
@@ -2774,14 +2799,24 @@ class WakeSubscriptionService extends Base {
      * @protected
      */
     _refreshExistingSubscriptionRoute(subscription, {filters = {}, harnessTargetMetadata = {}} = {}) {
+        const existingSigningKey = subscription.harnessTargetMetadata?.signingKey;
+        const mergedMetadata     = {
+            ...(subscription.harnessTargetMetadata || {}),
+            ...harnessTargetMetadata
+        };
+
+        if (existingSigningKey !== undefined) {
+            mergedMetadata.signingKey = existingSigningKey;
+        } else {
+            delete mergedMetadata.signingKey;
+        }
+
         const refreshed = {
             ...subscription,
+            status               : 'active',
             filters,
-            harnessTargetMetadata: {
-                ...(subscription.harnessTargetMetadata || {}),
-                ...harnessTargetMetadata
-            },
-            updatedAt: new Date().toISOString()
+            harnessTargetMetadata: mergedMetadata,
+            updatedAt            : new Date().toISOString()
         };
 
         this.validateHarnessTargetMetadata(refreshed.harnessTarget, refreshed.harnessTargetMetadata || {});
@@ -2793,6 +2828,7 @@ class WakeSubscriptionService extends Base {
             properties
         });
 
+        WebhookDeliveryService.clearDegraded(id);
         this.subscriptionCache.set(id, refreshed);
 
         return refreshed;
