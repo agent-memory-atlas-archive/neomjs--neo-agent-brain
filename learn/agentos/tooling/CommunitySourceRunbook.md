@@ -241,4 +241,26 @@ local tenant fallback alone does not establish a viewer. Seen markers change no 
 checkpoint, membership count, Task, wake or ranking state. Popularity events are excluded even if an
 invalid stored row marks one attention-eligible.
 
-This section documents the query contract; retire or update it when these three operations change.
+Call `claim_community_activity_task` with an admitted `sourceEventId` to atomically validate eligibility
+and bind the occurrence to one canonical tenant-private A2A Task (`MESSAGE:<uuid>`). Only admitted,
+attention-eligible response items (`issue`, `issue_comment`, `discussion`, `discussion_comment`,
+`pull_request`, `pull_request_review`, `pull_request_review_comment`) from an `ACTIVE` GitHub repository
+source owned by the authenticated tenant can be claimed; cross-tenant, revoked-source, tombstoned, or
+popularity occurrences fail closed (`ineligible`, `inaccessible`, or `deleted`). Task creation (`Nodes`,
+`Edges`, `GraphLog`) and the `(tenant_id, occurrence_identity) -> task_id` binding commit in one SQLite
+transaction, so concurrent or retrying callers receive the same server-owned canonical Task and
+injected crash points leave neither orphan authority nor duplicate Tasks. Once committed, existing
+`MailboxService.transitionTask` assignment/RBAC/state-transition rules govern the Task.
+
+Call `get_community_activity_attention_counts` (optionally scoped by a non-empty `sourceInstanceIds` array) to
+inspect bounded tenant/source attention counts (`community-attention.v1`), `oldestOccurredAt`, the bounded
+monotonic `sourceWatermark` (`seq:<16d>:claims:<16d>:reg:<16d-maxUpdatedAt>:<16d-epochStateRankSum>`), coverage
+honesty (`fresh`, `empty`, `degraded`, `missing`), and structured calibration measurements
+(`eligibleUnclaimedCount`, `claimedExcludedCount`, `ineligibleExcludedCount`, `totalAdmittedObservations`,
+`payloadBytes`, `attentionAmplification`). Claimed occurrences are excluded from `count` and `oldestOccurredAt`
+(canonical Task authority owns them); per-viewer `seen` markers never alter `count`, `oldestOccurredAt`, or
+`sourceWatermark`. Count projections remain strictly query-only (`notAuthority: true`) with no second projection
+file/lock/writer and no prose, ranking scores, assignment hints, or wake thresholds until ADR 0035's
+`HookProjectionChannels` owner admits a community-attention slot.
+
+This section documents the query, claim, and count-projection contract; retire or update it when these five operations change.

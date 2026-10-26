@@ -18,12 +18,14 @@ import path           from 'node:path';
 import Ajv            from 'ajv';
 import * as yaml      from 'js-yaml';
 
-import RequestContextService from '../../../../../../ai/mcp/server/shared/services/RequestContextService.mjs';
+import RequestContextService                     from '../../../../../../ai/mcp/server/shared/services/RequestContextService.mjs';
+import {admitClaimedTask, collectLifecycleItems} from '../../../../../../ai/services/graph/lifecycleAdmission.mjs';
+import {isActionableComputedRecommendation}      from '../../../../../../ai/services/graph/computedGoldenPathRouting.mjs';
 
 test.describe('Neo.ai.services.memory-core.CommunityActivityService', () => {
-    let ActivityService, AdmissionService, SourceRegistryService;
+    let ActivityService, AdmissionService, GraphService, MailboxService, SourceRegistryService;
     let Database, registryDb, admissionDb, activityDb, testDbPath, tempRoot;
-    let originalActivityDb, originalAdmissionDb, originalAttentionPolicy, originalLocalSubjectId, originalRegistryDb;
+    let originalActivityDb, originalAdmissionDb, originalAttentionPolicy, originalGraphStorageDb, originalLocalSubjectId, originalRegistryDb;
     let originalEnv;
     let originalContentAdapter;
 
@@ -61,7 +63,8 @@ test.describe('Neo.ai.services.memory-core.CommunityActivityService', () => {
             batchId               = `batch-${Date.now()}-${Math.random()}`,
             nextInventoryHash     = `inventory-${batchId}`,
             coverage              = {complete: true, fromBasis: 'from', toBasis: 'to'},
-            registrationEpoch    = 2
+            registrationEpoch     = 2,
+            resourceFamily        = 'issues'
         } = {}) => ({
             adapterSchemaVersion      : 'github-issue.v1',
             baseCheckpointVersion,
@@ -73,7 +76,7 @@ test.describe('Neo.ai.services.memory-core.CommunityActivityService', () => {
             observations,
             providerStateSchemaVersion: 'github-issue-state.v1',
             registrationEpoch,
-            resourceFamily            : 'issues',
+            resourceFamily,
             schemaVersion             : 'community-activity-batch.v1',
             sourceInstanceId
         });
@@ -112,16 +115,21 @@ test.describe('Neo.ai.services.memory-core.CommunityActivityService', () => {
         SourceRegistryService = (await import('../../../../../../ai/services/memory-core/SourceRegistryService.mjs')).default;
         AdmissionService      = (await import('../../../../../../ai/services/memory-core/CommunityBatchAdmissionService.mjs')).default;
         ActivityService       = (await import('../../../../../../ai/services/memory-core/CommunityActivityService.mjs')).default;
+        GraphService          = (await import('../../../../../../ai/services/memory-core/GraphService.mjs')).default;
+        MailboxService        = (await import('../../../../../../ai/services/memory-core/MailboxService.mjs')).default;
 
         await Promise.all([
             SourceRegistryService.ready(),
             AdmissionService.ready(),
-            ActivityService.ready()
+            ActivityService.ready(),
+            GraphService.ready(),
+            MailboxService.ready()
         ]);
 
         originalActivityDb      = ActivityService.db;
         originalRegistryDb      = SourceRegistryService.db;
         originalAdmissionDb     = AdmissionService.db;
+        originalGraphStorageDb  = GraphService.db?.storage?.db || null;
         originalLocalSubjectId  = SourceRegistryService.localSubjectId;
         originalAttentionPolicy = AdmissionService.attentionPolicy;
         originalContentAdapter  = ActivityService.contentAdapter;
@@ -146,6 +154,12 @@ test.describe('Neo.ai.services.memory-core.CommunityActivityService', () => {
         SourceRegistryService.ensureSchema();
         AdmissionService.ensureSchema();
         ActivityService.ensureSchema();
+        if (GraphService.db?.storage) {
+            GraphService.db.storage.db = activityDb;
+            GraphService.db.nodes.clear();
+            GraphService.db.edges.clear();
+            GraphService.db.adjacency?.clear?.();
+        }
         SourceRegistryService.localSubjectId = SUBJECT;
         AdmissionService.attentionPolicy     = ATTENTION_POLICY;
     });
@@ -154,6 +168,12 @@ test.describe('Neo.ai.services.memory-core.CommunityActivityService', () => {
         ActivityService.set({db: originalActivityDb, contentAdapter: originalContentAdapter});
         SourceRegistryService.set({db: originalRegistryDb, localSubjectId: originalLocalSubjectId});
         AdmissionService.set({db: originalAdmissionDb, attentionPolicy: originalAttentionPolicy});
+        if (GraphService.db?.storage) {
+            GraphService.db.storage.db = originalGraphStorageDb;
+            GraphService.db.nodes.clear();
+            GraphService.db.edges.clear();
+            GraphService.db.adjacency?.clear?.();
+        }
         activityDb.close();
         registryDb.close();
         admissionDb.close();
@@ -581,5 +601,471 @@ test.describe('Neo.ai.services.memory-core.CommunityActivityService', () => {
             cursor: '%%%not-a-cursor%%%',
             limit : 1
         }))).rejects.toThrow('COMMUNITY_CURSOR_INVALID');
+    });
+
+    test('AC1–AC9: binds eligible community events to canonical A2A Tasks with atomic transactions, idempotency, crash safety, and fail-closed RBAC (#102)', async () => {
+        const sourceId = activeSource();
+
+        expect(admit(sourceId, [
+            observation('eligible-comment', '2026-09-19T12:00:00.000Z', {
+                occurrenceKind        : 'issue.comment',
+                parentProviderEntityId: '19129'
+            }),
+            observation('popularity-star', '2026-09-19T12:05:00.000Z'),
+            observation('deleted-comment', '2026-09-19T12:10:00.000Z', {
+                absence         : 'deleted',
+                deletionEvidence: {deletedAt: '2026-09-19T12:11:00.000Z', tombstoneId: 't-1'}
+            })
+        ]).status).toBe('accepted');
+
+        // Corrupt the popularity row to repository.starred + eligible in SQLite so we prove claimTask enforces response-bearing kind checks too.
+        const starRow = activityDb.prepare(`
+            SELECT occurrence_identity FROM mc_community_observation
+            WHERE tenant_id = ? AND provider_entity_id = 'popularity-star'
+        `).get(SUBJECT);
+        const deletedRow = activityDb.prepare(`
+            SELECT occurrence_identity FROM mc_community_observation
+            WHERE tenant_id = ? AND provider_entity_id = 'deleted-comment'
+        `).get(SUBJECT);
+        activityDb.prepare(`
+            UPDATE mc_community_observation
+            SET occurrence_kind = 'repository.starred', attention_disposition = 'eligible'
+            WHERE tenant_id = ? AND occurrence_identity = ?
+        `).run(SUBJECT, starRow.occurrence_identity);
+
+        const listed = await inTenant(() => ActivityService.query({...WINDOW, limit: 10}));
+        expect(new Set(listed.items.map(entry => entry.providerEntityId))).toEqual(new Set(['deleted-comment', 'eligible-comment']));
+        const item = listed.items.find(entry => entry.providerEntityId === 'eligible-comment');
+
+        // AC8: Unclaimed community items remain outside LifecycleFrontier and Golden Path ranking.
+        const unclaimedTasks = await inTenant(() => ActivityService.listClaimedTasks());
+        expect(unclaimedTasks).toEqual([]);
+        expect(collectLifecycleItems({
+            agentId: '@neo-gemini-maryam',
+            tasks  : unclaimedTasks
+        })).toEqual([]);
+        expect(admitClaimedTask({
+            agentId: '@neo-gemini-maryam',
+            task   : item
+        })).toBeNull();
+        expect(isActionableComputedRecommendation({
+            action       : 'community_observation',
+            notAuthority : true,
+            sourceEventId: item.sourceEventId
+        })).toBe(false);
+
+        // AC7: Seen state, count projection, and provider delivery ids cannot authorize claim.
+        await RequestContextService.run({agentIdentityNodeId: '@neo-gemini-maryam', userId: SUBJECT}, async () => {
+            await ActivityService.markSeen({sourceEventId: item.sourceEventId});
+        });
+        expect(activityDb.prepare('SELECT COUNT(*) AS count FROM mc_community_task_binding').get().count).toBe(0);
+
+        const unknownAttempt = await RequestContextService.run({
+            agentIdentityNodeId: '@neo-gemini-maryam',
+            userId             : SUBJECT
+        }, () => ActivityService.claimTask({sourceEventId: 'provider-delivery-id-not-an-occurrence'}));
+        expect(unknownAttempt).toMatchObject({
+            created     : false,
+            notAuthority: true,
+            status      : 'ineligible',
+            task        : null,
+            taskId      : null
+        });
+
+        // AC1: Popularity and tombstoned rows cannot be claimed.
+        const starAttempt = await RequestContextService.run({
+            agentIdentityNodeId: '@neo-gemini-maryam',
+            userId             : SUBJECT
+        }, () => ActivityService.claimTask({sourceEventId: starRow.occurrence_identity}));
+        expect(starAttempt.status).toBe('ineligible');
+        expect(starAttempt.taskId).toBeNull();
+
+        const deletedAttempt = await RequestContextService.run({
+            agentIdentityNodeId: '@neo-gemini-maryam',
+            userId             : SUBJECT
+        }, () => ActivityService.claimTask({sourceEventId: deletedRow.occurrence_identity}));
+        expect(deletedAttempt.status).toBe('deleted');
+        expect(deletedAttempt.taskId).toBeNull();
+
+        // AC4: Every injected crash point rolls back binding, Nodes, Edges, and GraphLog atomically.
+        for (const crashPoint of ['after-binding-insert', 'after-node-insert', 'after-edges-insert', 'before-commit']) {
+            await expect(RequestContextService.run({
+                agentIdentityNodeId: '@neo-gemini-maryam',
+                userId             : SUBJECT
+            }, () => ActivityService.claimTask({
+                crashPoint,
+                sourceEventId: item.sourceEventId
+            }))).rejects.toThrow(/COMMUNITY_CLAIM_CRASH_/);
+
+            expect(activityDb.prepare('SELECT COUNT(*) AS count FROM mc_community_task_binding').get().count, crashPoint).toBe(0);
+            expect(activityDb.prepare("SELECT COUNT(*) AS count FROM Nodes WHERE json_extract(data, '$.label') = 'MESSAGE'").get().count, crashPoint).toBe(0);
+            expect(activityDb.prepare('SELECT COUNT(*) AS count FROM Edges').get().count, crashPoint).toBe(0);
+            expect(activityDb.prepare('SELECT COUNT(*) AS count FROM GraphLog').get().count, crashPoint).toBe(0);
+        }
+
+        // AC3 & AC5: Concurrent claim callers and retries after a lost response receive the same canonical Task.
+        const [firstClaim, concurrentClaim] = await Promise.all([
+            RequestContextService.run({
+                agentIdentityNodeId: '@neo-gemini-maryam',
+                userId             : SUBJECT
+            }, () => ActivityService.claimTask({sourceEventId: item.sourceEventId})),
+            RequestContextService.run({
+                agentIdentityNodeId: '@neo-gpt-euclid',
+                userId             : SUBJECT
+            }, () => ActivityService.claimTask({sourceEventId: item.sourceEventId}))
+        ]);
+
+        expect(firstClaim.status).toBe('claimed');
+        expect(firstClaim.created).toBe(true);
+        expect(firstClaim.notAuthority).toBe(false);
+        expect(firstClaim.taskId).toMatch(/^MESSAGE:/);
+        expect(firstClaim.claimedBy).toBe('@neo-gemini-maryam');
+        expect(firstClaim.task).toEqual({
+            assignee              : '@neo-gemini-maryam',
+            id                    : firstClaim.taskId,
+            occurrenceKind        : 'issue.comment',
+            parentProviderEntityId: '19129',
+            providerEntityId      : 'eligible-comment',
+            sourceEventId         : item.sourceEventId,
+            sourceInstanceId      : sourceId,
+            state                 : 'Working'
+        });
+
+        expect(concurrentClaim).toEqual({
+            ...firstClaim,
+            created: false
+        });
+
+        const retryClaim = await RequestContextService.run({
+            agentIdentityNodeId: '@neo-gemini-maryam',
+            userId             : SUBJECT
+        }, () => ActivityService.claimTask({sourceEventId: item.sourceEventId}));
+        expect(retryClaim).toEqual({
+            ...firstClaim,
+            created: false
+        });
+
+        // AC2: Unique constraints prevent more than one taskId for one scoped sourceEventId or reusing a taskId.
+        expect(() => activityDb.prepare(`
+            INSERT INTO mc_community_task_binding (
+                tenant_id, occurrence_identity, source_instance_id, task_id, claimed_by, claimed_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        `).run(SUBJECT, item.sourceEventId, sourceId, 'MESSAGE:duplicate-task', '@neo-opus-ada', '2026-09-19T12:20:00.000Z'))
+            .toThrow(/UNIQUE constraint failed/);
+
+        expect(() => activityDb.prepare(`
+            INSERT INTO mc_community_task_binding (
+                tenant_id, occurrence_identity, source_instance_id, task_id, claimed_by, claimed_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        `).run(SUBJECT, 'other-occurrence', sourceId, firstClaim.taskId, '@neo-opus-ada', '2026-09-19T12:20:00.000Z'))
+            .toThrow(/UNIQUE constraint failed/);
+
+        // Validate OpenAPI schema compliance for CommunityActivityClaimResponse.
+        const openApiDoc = yaml.load(fs.readFileSync(
+            path.resolve(process.cwd(), 'ai/mcp/server/memory-core/openapi.yaml'),
+            'utf8'
+        ));
+        const ajv = new Ajv({allErrors: true, strict: false, validateFormats: false});
+        for (const [name, schema] of Object.entries(openApiDoc.components.schemas)) {
+            ajv.addSchema(schema, `#/components/schemas/${name}`);
+        }
+        const validateClaim = ajv.getSchema('#/components/schemas/CommunityActivityClaimResponse');
+        expect(validateClaim(firstClaim), JSON.stringify(validateClaim.errors)).toBe(true);
+        expect(validateClaim(unknownAttempt), JSON.stringify(validateClaim.errors)).toBe(true);
+
+        // AC8 (post-claim): Only committed claimed Tasks can enter LifecycleFrontier predicates.
+        const claimedTasks = await inTenant(() => ActivityService.listClaimedTasks({
+            checkedAt: '2026-09-19T12:30:00.000Z'
+        }));
+        expect(claimedTasks).toHaveLength(1);
+        expect(admitClaimedTask({
+            actionableStates: new Set(['Working', 'InputRequired', 'AuthRequired']),
+            agentId         : '@neo-gemini-maryam',
+            task            : claimedTasks[0]
+        })?.subjectId).toBe(firstClaim.taskId);
+
+        // AC6: Existing MailboxService assignment/RBAC/state-transition rules take over after commit.
+        await expect(RequestContextService.run({
+            agentIdentityNodeId: '@neo-gpt-euclid',
+            userId             : SUBJECT
+        }, () => MailboxService.transitionTask({
+            newState: 'Completed',
+            taskId  : firstClaim.taskId
+        }))).rejects.toThrow(/neither originator nor assignee/);
+
+        // AC9: Cross-tenant transition attempts fail closed even when the Task node is in the GraphService cache.
+        await expect(RequestContextService.run({
+            agentIdentityNodeId: '@neo-gemini-maryam',
+            userId             : 'other-tenant'
+        }, () => MailboxService.transitionTask({
+            newState: 'Completed',
+            taskId  : firstClaim.taskId
+        }))).rejects.toThrow(`Task not found: ${firstClaim.taskId}`);
+
+        const transitioned = await RequestContextService.run({
+            agentIdentityNodeId: '@neo-gemini-maryam',
+            userId             : SUBJECT
+        }, () => MailboxService.transitionTask({
+            expectedCurrentState: 'Working',
+            newState            : 'Completed',
+            taskId              : firstClaim.taskId
+        }));
+        expect(transitioned.success).toBe(true);
+        expect(transitioned.task.state).toBe('Completed');
+
+        const reloadedClaim = await RequestContextService.run({
+            agentIdentityNodeId: '@neo-gemini-maryam',
+            userId             : SUBJECT
+        }, () => ActivityService.claimTask({sourceEventId: item.sourceEventId}));
+        expect(reloadedClaim.task.state).toBe('Completed');
+
+        // AC9: Cross-tenant and revoked-source claim attempts fail closed.
+        SourceRegistryService.localSubjectId = null;
+        const crossTenantClaim = await RequestContextService.run({
+            agentIdentityNodeId: '@neo-opus-ada',
+            userId             : 'other-tenant'
+        }, () => ActivityService.claimTask({sourceEventId: item.sourceEventId}));
+        expect(crossTenantClaim).toMatchObject({
+            created     : false,
+            notAuthority: true,
+            status      : 'ineligible',
+            task        : null,
+            taskId      : null
+        });
+
+        SourceRegistryService.localSubjectId = SUBJECT;
+        SourceRegistryService.transitionLifecycle(sourceId, 'REVOKED', {
+            expectedEpoch: 2,
+            expectedState: 'ACTIVE'
+        });
+
+        const revokedClaim = await RequestContextService.run({
+            agentIdentityNodeId: '@neo-gemini-maryam',
+            userId             : SUBJECT
+        }, () => ActivityService.claimTask({sourceEventId: item.sourceEventId}));
+        expect(revokedClaim).toMatchObject({
+            created         : false,
+            notAuthority    : true,
+            sourceInstanceId: sourceId,
+            status          : 'inaccessible',
+            task            : null,
+            taskId          : null
+        });
+    });
+
+    test('projects bounded tenant attention counts query-only per AC6, preserves watermark monotonicity past 56 sources, and isolates popularity noise from human signal (#101)', async () => {
+        const {PROJECTION_CHANNEL_SLOTS} = await import(
+            '../../../../../../ai/services/memory-core/hookProjectionLease.mjs'
+        );
+
+        const serviceSource = fs.readFileSync(
+            path.resolve(process.cwd(), 'ai/services/memory-core/CommunityActivityService.mjs'),
+            'utf8'
+        );
+        expect(serviceSource).not.toMatch(/from\s+['"]node:fs['"]|writeFileSync|renameSync/);
+        expect(Object.keys(PROJECTION_CHANNEL_SLOTS)).toEqual(['lifecycle-frontier', 'computed-route']);
+
+        const noSourceCounts = await inTenant(() => ActivityService.projectAttentionCounts());
+        expect(noSourceCounts.status).toBe('missing');
+        expect(noSourceCounts.count).toBe(0);
+        expect(noSourceCounts.oldestOccurredAt).toBeNull();
+        expect(noSourceCounts.notAuthority).toBe(true);
+        expect(noSourceCounts.coverage.degraded).toBe(true);
+        expect(noSourceCounts.coverage.degradedReasons).toContain('no-registered-sources');
+
+        const sourceA = activeSource({
+                  displayLocator      : 'neomjs/neo-a',
+                  providerCapabilities: {issues: true, pullRequests: true},
+                  providerResourceId  : 'neomjs/neo-a'
+              }),
+              sourceB = activeSource({
+                  displayLocator      : 'neomjs/neo-b',
+                  providerCapabilities: {issues: true, pullRequests: true},
+                  providerResourceId  : 'neomjs/neo-b'
+              });
+
+        SourceRegistryService.localSubjectId = 'foreign-tenant';
+        const foreignSource = activeSource({displayLocator: 'foreign/repo', providerResourceId: 'foreign/repo'});
+        await RequestContextService.run({userId: 'foreign-tenant'}, () => AdmissionService.admitBatch(
+            batchAt(foreignSource, [observation('foreign-1', '2026-09-19T01:00:00.000Z')])
+        ));
+        SourceRegistryService.localSubjectId = SUBJECT;
+
+        await expect(inTenant(() => ActivityService.projectAttentionCounts({
+            sourceInstanceIds: [foreignSource]
+        }))).rejects.toThrow('COMMUNITY_SOURCE_NOT_OWNED');
+
+        await expect(inTenant(() => ActivityService.projectAttentionCounts({
+            sourceInstanceIds: ['']
+        }))).rejects.toThrow('COMMUNITY_SOURCE_FILTER_INVALID');
+
+        await expect(inTenant(() => ActivityService.projectAttentionCounts({
+            sourceInstanceIds: []
+        }))).rejects.toThrow('COMMUNITY_SOURCE_FILTER_INVALID');
+
+        AdmissionService.attentionPolicy = {
+            ...ATTENTION_POLICY,
+            recordedActorDispositions: {'external-repeat-human': 'eligible'}
+        };
+
+        const noiseFlood = Array.from({length: 12}, (_, index) => observation(
+            `noise-${index + 1}`,
+            `2026-09-19T02:${String(index).padStart(2, '0')}:00.000Z`,
+            {
+                occurrenceKind: ['star.created', 'repo.forked', 'watch.started', 'issue.labeled'][index % 4]
+            }
+        ));
+
+        const firstTimeHuman = observation('first-time-human-1', '2026-09-19T03:00:00.000Z', {
+            actorId               : 'external-first-timer',
+            occurrenceKind        : 'issue.comment',
+            parentProviderEntityId: '20119',
+            sourceAssociation     : 'FIRST_TIME_CONTRIBUTOR'
+        });
+
+        const repeatHuman = observation('repeat-human-1', '2026-09-19T04:00:00.000Z', {
+            actorId               : 'external-repeat-human',
+            occurrenceKind        : 'discussion.comment',
+            parentProviderEntityId: '19835',
+            sourceAssociation     : 'NONE'
+        });
+
+        const deletedHuman = observation('deleted-human-1', '2026-09-19T02:30:00.000Z', {
+            absence          : 'deleted',
+            deletionEvidence : {deletedAt: '2026-09-19T02:31:00.000Z', reason: 'user-deleted'},
+            occurrenceKind   : 'issue.comment',
+            sourceAssociation: 'NONE'
+        });
+
+        await inTenant(() => AdmissionService.admitBatch(
+            batchAt(sourceA, [...noiseFlood, firstTimeHuman, repeatHuman, deletedHuman], {
+                batchId       : 'batch-101-issues',
+                resourceFamily: 'issues'
+            })
+        ));
+
+        const degradedMissingFamilies = await inTenant(() => ActivityService.projectAttentionCounts({
+            sourceInstanceIds: [sourceA]
+        }));
+        expect(degradedMissingFamilies.status).toBe('degraded');
+        expect(degradedMissingFamilies.count).toBe(2);
+        expect(degradedMissingFamilies.oldestOccurredAt).toBe('2026-09-19T03:00:00.000Z');
+        expect(degradedMissingFamilies.coverage.degradedReasons).toContain('source-coverage-unknown');
+
+        await inTenant(() => AdmissionService.admitBatch(
+            batchAt(sourceA, [], {batchId: 'batch-101-pulls', resourceFamily: 'pulls'})
+        ));
+        await inTenant(() => AdmissionService.admitBatch(
+            batchAt(sourceA, [], {batchId: 'batch-101-discussions', resourceFamily: 'discussions'})
+        ));
+
+        for (const resourceFamily of ['issues', 'pulls', 'discussions']) {
+            await inTenant(() => AdmissionService.admitBatch(
+                batchAt(sourceB, [], {batchId: `batch-101-b-${resourceFamily}`, resourceFamily})
+            ));
+        }
+
+        const emptySourceB = await inTenant(() => ActivityService.projectAttentionCounts({
+            sourceInstanceIds: [sourceB]
+        }));
+        expect(emptySourceB.status).toBe('empty');
+        expect(emptySourceB.count).toBe(0);
+        expect(emptySourceB.oldestOccurredAt).toBeNull();
+        expect(emptySourceB.coverage.degraded).toBe(false);
+
+        const freshSourceA = await inTenant(() => ActivityService.projectAttentionCounts({
+            sourceInstanceIds: [sourceA]
+        }));
+        expect(freshSourceA.status).toBe('fresh');
+        expect(freshSourceA.notAuthority).toBe(true);
+        expect(freshSourceA.count).toBe(2);
+        expect(freshSourceA.oldestOccurredAt).toBe('2026-09-19T03:00:00.000Z');
+        expect(freshSourceA.coverage.degraded).toBe(false);
+        expect(freshSourceA.measurement).toMatchObject({
+            claimedExcludedCount     : 0,
+            eligibleUnclaimedCount   : 2,
+            ineligibleExcludedCount  : 13,
+            totalAdmittedObservations: 15,
+            attentionAmplification   : {
+                numerator  : 2,
+                denominator: 15,
+                ratio      : 2 / 15
+            }
+        });
+        expect(freshSourceA.measurement.payloadBytes).toBeGreaterThan(100);
+        expect(freshSourceA.measurement.payloadBytes).toBeLessThan(8192);
+
+        const serialized = JSON.stringify(freshSourceA);
+        expect(serialized).not.toContain('external-first-timer');
+        expect(serialized).not.toContain('external-repeat-human');
+        expect(serialized).not.toContain('first-time-human-1');
+        expect(freshSourceA).not.toHaveProperty('items');
+        expect(freshSourceA).not.toHaveProperty('ranking');
+        expect(freshSourceA).not.toHaveProperty('recommendedOwner');
+        expect(freshSourceA).not.toHaveProperty('threshold');
+
+        const openApiDoc = yaml.load(fs.readFileSync(
+            path.resolve(process.cwd(), 'ai/mcp/server/memory-core/openapi.yaml'),
+            'utf8'
+        ));
+        const ajv = new Ajv({allErrors: true, strict: false, validateFormats: false});
+        for (const [name, schema] of Object.entries(openApiDoc.components.schemas)) {
+            ajv.addSchema(schema, `#/components/schemas/${name}`);
+        }
+        const validateCounts = ajv.getSchema('#/components/schemas/CommunityActivityAttentionCountsResponse');
+        expect(validateCounts(freshSourceA), JSON.stringify(validateCounts.errors)).toBe(true);
+        expect(validateCounts(noSourceCounts), JSON.stringify(validateCounts.errors)).toBe(true);
+
+        const page          = await inTenant(() => ActivityService.query({...WINDOW, limit: 10, sourceInstanceIds: [sourceA]}));
+        const firstTimeItem = page.items.find(entry => entry.providerEntityId === 'first-time-human-1');
+        expect(firstTimeItem).toBeDefined();
+
+        await RequestContextService.run({
+            agentIdentityNodeId: '@neo-gemini-maryam',
+            userId             : SUBJECT
+        }, () => ActivityService.markSeen({sourceEventId: firstTimeItem.sourceEventId}));
+
+        const afterSeenCounts = await inTenant(() => ActivityService.projectAttentionCounts({
+            sourceInstanceIds: [sourceA]
+        }));
+        expect(afterSeenCounts).toEqual(freshSourceA);
+
+        await RequestContextService.run({
+            agentIdentityNodeId: '@neo-gemini-maryam',
+            userId             : SUBJECT
+        }, () => ActivityService.claimTask({sourceEventId: firstTimeItem.sourceEventId}));
+
+        const afterClaimCounts = await inTenant(() => ActivityService.projectAttentionCounts({
+            sourceInstanceIds: [sourceA]
+        }));
+        expect(afterClaimCounts.count).toBe(1);
+        expect(afterClaimCounts.oldestOccurredAt).toBe('2026-09-19T04:00:00.000Z');
+        expect(afterClaimCounts.measurement.claimedExcludedCount).toBe(1);
+        expect(afterClaimCounts.sourceWatermark > freshSourceA.sourceWatermark).toBe(true);
+
+        const epochMs = Date.parse('2026-10-26T22:00:00.000Z');
+        while (registryDb.prepare('SELECT COUNT(*) AS count FROM mc_source_registration WHERE tenant_id = ?').get(SUBJECT).count < 55) {
+            const idx = registryDb.prepare('SELECT COUNT(*) AS count FROM mc_source_registration WHERE tenant_id = ?').get(SUBJECT).count + 1;
+            activeSource({
+                displayLocator    : `neomjs/scale-${idx}`,
+                providerResourceId: `neomjs/scale-${idx}`
+            });
+        }
+        registryDb.prepare('UPDATE mc_source_registration SET updated_at = ? WHERE tenant_id = ?').run(epochMs, SUBJECT);
+
+        const countsAt55 = await inTenant(() => ActivityService.projectAttentionCounts());
+        expect(countsAt55.coverage.sourceCount).toBe(55);
+        expect(countsAt55.sourceWatermark).toMatch(/^seq:\d{16}:claims:\d{16}:reg:\d{16}:\d{16}$/);
+
+        activeSource({
+            displayLocator    : 'neomjs/scale-56',
+            providerResourceId: 'neomjs/scale-56'
+        });
+        registryDb.prepare('UPDATE mc_source_registration SET updated_at = ? WHERE tenant_id = ?').run(epochMs, SUBJECT);
+
+        const countsAt56 = await inTenant(() => ActivityService.projectAttentionCounts());
+        expect(countsAt56.coverage.sourceCount).toBe(56);
+        expect(countsAt56.sourceWatermark).toMatch(/^seq:\d{16}:claims:\d{16}:reg:\d{16}:\d{16}$/);
+        expect(countsAt56.sourceWatermark > countsAt55.sourceWatermark).toBe(true);
     });
 });

@@ -60,7 +60,9 @@ import {
 } from './communityBatchTool.mjs';
 import {
     assertCommunityActivityToolBoundary,
+    claimCommunityActivityTask,
     getCommunityActivity,
+    getCommunityActivityAttentionCounts,
     getCommunityActivityContent,
     markCommunityActivitySeen
 } from './communityActivityTool.mjs';
@@ -632,12 +634,13 @@ const serviceMapping = {
     search_nodes                : GraphService           .searchNodes             .bind(GraphService),
     get_memory_core_tool_metrics:
                               MemoryCoreRecorderService.getMemoryCoreToolMetrics.bind(MemoryCoreRecorderService),
-    add_message                   : addMessageTool,
-    get_community_activity        : getCommunityActivity,
-    get_community_activity_content: getCommunityActivityContent,
-    list_messages                 : listMessagesTool,
-    get_message                   : MailboxService         .getMessage              .bind(MailboxService),
-    get_rem_pipeline_state        : HealthService          .getRemPipelineState     .bind(HealthService),
+    add_message                            : addMessageTool,
+    get_community_activity                 : getCommunityActivity,
+    get_community_activity_attention_counts: getCommunityActivityAttentionCounts,
+    get_community_activity_content         : getCommunityActivityContent,
+    list_messages                          : listMessagesTool,
+    get_message                            : MailboxService         .getMessage              .bind(MailboxService),
+    get_rem_pipeline_state                 : HealthService          .getRemPipelineState     .bind(HealthService),
     get_sqlite_holder_diagnostics:
                               HealthService          .getSqliteHolderDiagnostics.bind(HealthService),
     get_deployment_state_snapshot: readDeploymentInspection,
@@ -653,6 +656,7 @@ const serviceMapping = {
     revoke_permission            : PermissionService      .revokePermission        .bind(PermissionService),
     list_permissions             : PermissionService      .listPermissions         .bind(PermissionService),
     manage_wake_subscription     : WakeSubscriptionService.manage                  .bind(WakeSubscriptionService),
+    claim_community_activity_task: claimCommunityActivityTask,
     mark_community_activity_seen : markCommunityActivitySeen,
     record_turn_presence         : TurnPresenceService    .recordTurnPresence      .bind(TurnPresenceService),
     admit_community_batch        : admitCommunityBatch,

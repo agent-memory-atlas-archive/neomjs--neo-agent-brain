@@ -194,6 +194,58 @@ paths:
               schema:
                 $ref: '#/components/schemas/CommunityActivitySeenResponse'
 
+  /community/activity/claim:
+    post:
+      summary: Claim community activity task
+      operationId: claim_community_activity_task
+      x-neo-tool-tier: write
+      x-pass-as-object: true
+      x-neo-tool-summary: Atomically validate an eligible community event and bind it to one canonical A2A Task.
+      description: |
+        Atomically creates or returns the single canonical A2A Task bound to `(tenant_id, sourceEventId)`
+        when the event is admitted, attention-eligible, active, and visible to the authenticated tenant.
+        Seen markers, count projections, and provider delivery ids never authorize claim; tenant and
+        claimant identity are server-derived.
+      tags: [Community Activity]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommunityActivityClaimRequest'
+      responses:
+        '200':
+          description: Canonical community activity task claim outcome.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommunityActivityClaimResponse'
+
+  /community/activity/attention-counts:
+    post:
+      summary: Get community activity attention counts
+      operationId: get_community_activity_attention_counts
+      x-neo-tool-tier: read
+      x-pass-as-object: true
+      x-neo-tool-summary: Read bounded tenant/source community-attention counts, oldest age, coverage, and watermarks without prose.
+      x-annotations:
+        readOnlyHint: true
+      description: Projects bounded tenant/source counts and oldest occurrence timestamps over attention-eligible unclaimed events with explicit coverage and measurement fields; excludes prose, ranking scores, assignment hints, and wake thresholds.
+      tags: [Community Activity]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommunityActivityAttentionCountsRequest'
+      responses:
+        '200':
+          description: Bounded tenant community-attention count projection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommunityActivityAttentionCountsResponse'
+
   /healthcheck:
     get:
       summary: Health Check
@@ -6181,6 +6233,259 @@ components:
         notAuthority:
           type: boolean
           enum: [true]
+
+    CommunityActivityClaimRequest:
+      type: object
+      additionalProperties: false
+      required: [sourceEventId]
+      properties:
+        sourceEventId:
+          type: string
+          minLength: 1
+
+    CommunityActivityClaimResponse:
+      type: object
+      additionalProperties: false
+      required: [status, created, sourceEventId, sourceInstanceId, taskId, claimedBy, claimedAt, notAuthority, task]
+      properties:
+        status:
+          type: string
+          enum: [claimed, deleted, inaccessible, ineligible]
+        created:
+          type: boolean
+        sourceEventId:
+          type: string
+          minLength: 1
+        sourceInstanceId:
+          type: string
+          nullable: true
+        taskId:
+          type: string
+          nullable: true
+        claimedBy:
+          type: string
+          nullable: true
+        claimedAt:
+          type: string
+          format: date-time
+          nullable: true
+        notAuthority:
+          type: boolean
+        task:
+          type: object
+          nullable: true
+          additionalProperties: false
+          required: [id, state, assignee, sourceEventId, sourceInstanceId, providerEntityId, parentProviderEntityId, occurrenceKind]
+          properties:
+            id:
+              type: string
+              pattern: '^MESSAGE:'
+            state:
+              type: string
+              enum: [Submitted, Working, InputRequired, Completed, Canceled, Failed, Rejected, AuthRequired, Unknown, Expired, Blocked]
+            assignee:
+              type: string
+            sourceEventId:
+              type: string
+            sourceInstanceId:
+              type: string
+            providerEntityId:
+              type: string
+            parentProviderEntityId:
+              type: string
+              nullable: true
+            occurrenceKind:
+              type: string
+
+    CommunityActivityAttentionCountsRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        sourceInstanceIds:
+          type: array
+          minItems: 1
+          nullable: true
+          items:
+            type: string
+            minLength: 1
+          description: Optional non-empty source-registration filter resolved under the authenticated tenant.
+
+    CommunityActivityAttentionCountsResponse:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, status, notAuthority, count, oldestOccurredAt, sourceWatermark, coverage, sources, measurement]
+      properties:
+        schemaVersion:
+          type: string
+          enum: [community-attention.v1]
+        status:
+          type: string
+          enum: [fresh, empty, missing, degraded]
+        notAuthority:
+          type: boolean
+          enum: [true]
+        count:
+          type: integer
+          minimum: 0
+        oldestOccurredAt:
+          type: string
+          format: date-time
+          nullable: true
+        sourceWatermark:
+          type: string
+          minLength: 1
+        coverage:
+          type: object
+          additionalProperties: false
+          required: [basis, snapshot, sourceCount, activeSourceCount, completeSourceCount, degraded, degradedReason, degradedReasons, invalidTimes, sources]
+          properties:
+            basis:
+              type: string
+              enum: [admitted-ledger]
+            snapshot:
+              type: integer
+              minimum: 0
+            sourceCount:
+              type: integer
+              minimum: 0
+            activeSourceCount:
+              type: integer
+              minimum: 0
+            completeSourceCount:
+              type: integer
+              minimum: 0
+            degraded:
+              type: boolean
+            degradedReason:
+              type: string
+              nullable: true
+            degradedReasons:
+              type: array
+              items:
+                type: string
+            invalidTimes:
+              type: integer
+              minimum: 0
+            sources:
+              type: array
+              items:
+                type: object
+                additionalProperties: false
+                required: [sourceInstanceId, lifecycleState, registrationEpoch, families, degradedReasons]
+                properties:
+                  sourceInstanceId:
+                    type: string
+                    minLength: 1
+                  lifecycleState:
+                    type: string
+                  registrationEpoch:
+                    type: integer
+                    minimum: 0
+                  families:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [resourceFamily, receiptId, complete, gapCount]
+                      properties:
+                        resourceFamily:
+                          type: string
+                        receiptId:
+                          type: string
+                          nullable: true
+                        complete:
+                          type: boolean
+                        gapCount:
+                          type: integer
+                          minimum: 0
+                          nullable: true
+                  degradedReasons:
+                    type: array
+                    items:
+                      type: string
+        sources:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [sourceInstanceId, lifecycleState, registrationEpoch, count, oldestOccurredAt, sourceWatermark, degraded, degradedReasons, families]
+            properties:
+              sourceInstanceId:
+                type: string
+                minLength: 1
+              lifecycleState:
+                type: string
+              registrationEpoch:
+                type: integer
+                minimum: 0
+              count:
+                type: integer
+                minimum: 0
+              oldestOccurredAt:
+                type: string
+                format: date-time
+                nullable: true
+              sourceWatermark:
+                type: string
+                minLength: 1
+              degraded:
+                type: boolean
+              degradedReasons:
+                type: array
+                items:
+                  type: string
+              families:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [resourceFamily, receiptId, complete, gapCount]
+                  properties:
+                    resourceFamily:
+                      type: string
+                    receiptId:
+                      type: string
+                      nullable: true
+                    complete:
+                      type: boolean
+                    gapCount:
+                      type: integer
+                      minimum: 0
+                      nullable: true
+        measurement:
+          type: object
+          additionalProperties: false
+          required: [eligibleUnclaimedCount, claimedExcludedCount, ineligibleExcludedCount, totalAdmittedObservations, payloadBytes, attentionAmplification]
+          properties:
+            eligibleUnclaimedCount:
+              type: integer
+              minimum: 0
+            claimedExcludedCount:
+              type: integer
+              minimum: 0
+            ineligibleExcludedCount:
+              type: integer
+              minimum: 0
+            totalAdmittedObservations:
+              type: integer
+              minimum: 0
+            payloadBytes:
+              type: integer
+              minimum: 0
+            attentionAmplification:
+              type: object
+              additionalProperties: false
+              required: [numerator, denominator, ratio]
+              properties:
+                numerator:
+                  type: integer
+                  minimum: 0
+                denominator:
+                  type: integer
+                  minimum: 0
+                ratio:
+                  type: number
+                  nullable: true
 
     RequestPublishMediaDescriptor:
       type: object
