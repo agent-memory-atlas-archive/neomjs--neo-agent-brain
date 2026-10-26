@@ -46,6 +46,8 @@ const canonicalDataRoot = resolvePlaneDataRoot({
  * - `buildToolProjectionContext({request, phase, toolName?, args?})` — return an explicit tool
  *   projection context for embedded harness agents. Default `null` preserves the full
  *   developer/operator surface.
+ * - `getServerInstructions()` — return MCP `initialize` instructions (default assumes the server's tool
+ *   service compacts descriptions/schemas and points clients to `get_mcp_tool_handbook({toolId})`; `null` disables).
  * - `logStartupStatus(health)` — per-server startup log formatting.
  * - `buildRequestContext(reqAuth)` — Streamable-HTTP-only hook called by `TransportService.setup()` for per-request
  *   context construction. Default returns `{}`.
@@ -218,6 +220,14 @@ class BaseServer extends Base {
     }
 
     /**
+     * @summary Override: MCP `initialize` instructions directing clients to `get_mcp_tool_handbook(toolId)`.
+     * @returns {String|null}
+     */
+    getServerInstructions() {
+        return 'Tool descriptions and input schemas in tools/list are compacted to save context tokens. Call get_mcp_tool_handbook({toolId}) before invoking an unfamiliar tool to read its full usage guide and parameter descriptions.';
+    }
+
+    /**
      * @summary Override: per-server startup status logging from healthcheck output. Default
      * logs a generic "Server started" line.
      * @param {Object|null} health The healthcheck result, or `null` if no health service.
@@ -360,12 +370,14 @@ class BaseServer extends Base {
      * @protected
      */
     createMcpServer() {
-        const metadata  = this.getServerMetadata();
-        const mcpServer = new McpServer({
+        const metadata     = this.getServerMetadata();
+        const instructions = this.getServerInstructions();
+        const mcpServer    = new McpServer({
             name   : metadata.name,
             version: metadata.version || process.env.npm_package_version || '1.0.0'
         }, {
-            capabilities: metadata.capabilities || {tools: {listChanged: false}}
+            capabilities: metadata.capabilities || {tools: {listChanged: false}},
+            ...(instructions ? {instructions} : {})
         });
 
         this.setupRequestHandlers(mcpServer);
@@ -428,7 +440,8 @@ class BaseServer extends Base {
                 // Throws bubble to the outer catch and route to formatToolError.
                 await this.beforeToolDispatch({toolName: name, args, t0});
 
-                if (healthService && !exemptTools.includes(name)) {
+                // get_mcp_tool_handbook reads static OpenAPI metadata and needs no healthy backend.
+                if (healthService && name !== 'get_mcp_tool_handbook' && !exemptTools.includes(name)) {
                     try {
                         if (healthService.ensureHealthy) {
                             await healthService.ensureHealthy();
