@@ -5226,6 +5226,19 @@ components:
           type: boolean
           default: false
           description: "Opt-in: when true, additionally returns memories reached via a bounded concept-graph walk over the query, appended to the embedding results and deduped, each carrying `via`/`conceptPath` provenance. Default false returns the embedding results only."
+        agentIdentity:
+          type: string
+          description: "Optional author identity filter ('@me', '@<handle>', or 'all'). Resolves canonical and formerLogins aliases."
+          example: "@neo-opus-grace"
+        detail:
+          type: string
+          enum: [summary, full]
+          default: full
+          description: "'full' (default) returns prompt/thought/response; 'summary' omits prompt/thought/response and returns compact metadata plus miniSummary (string|null) and summaryFallback (boolean)."
+        projection:
+          type: string
+          enum: [public, private]
+          description: "'public' omits the private thought field on detail='full'; 'private' preserves thought."
 
     QueryMemoriesResponse:
       type: object
@@ -5455,6 +5468,10 @@ components:
           type: string
           enum: [system, repo-trusted, owner, self, peer-trusted, internal-authored, external, unclassified]
           description: Optional minimum accepted #10292 source-provenance trust tier. Summaries derived from lower-trust or unclassified source memories are excluded.
+        agentIdentity:
+          type: string
+          description: "Optional author identity filter ('@me', '@<handle>', or 'all') matched against sourceAgentIdentities across canonical and formerLogins aliases."
+          example: "@neo-opus-grace"
 
     QuerySummariesResponse:
       type: object

@@ -53,6 +53,16 @@ function createSpyCollection() {
                 metadatas: entries.map(e => e.metadata),
                 documents: entries.map(e => e.document)
             };
+        },
+
+        async query({nResults = 10} = {}) {
+            const entries = Array.from(rows.values()).slice(0, nResults);
+            return {
+                ids      : [entries.map(e => e.id)],
+                distances: [entries.map((_, idx) => idx * 0.1)],
+                metadatas: [entries.map(e => e.metadata)],
+                documents: [entries.map(e => e.document)]
+            };
         }
     };
 }
@@ -157,5 +167,61 @@ test.describe('SummaryService — author-identity scope (#12437)', () => {
         );
         expect(resolved).toBe('neo-opus-4-7');
         expect(() => resolveAuthorScope('@me')).toThrow(/requires a bound caller identity/);
+    });
+
+    test('querySummaries scopes by agentIdentity across canonical and formerLogins aliases', async () => {
+        seedSummary(spy, 's-julia', '@neo-gemini-pro', 500, 'Julia Former Handle Summary');
+
+        const gptView = await SummaryService.querySummaries({
+            query        : 'anything',
+            nResults     : 10,
+            agentIdentity: '@neo-gpt-euclid'
+        });
+        expect(gptView.count).toBe(2);
+        expect(gptView.results.map(r => r.title).sort()).toEqual(['Gpt 1', 'Mixed 1']);
+
+        const juliaView = await SummaryService.querySummaries({
+            query        : 'anything',
+            nResults     : 10,
+            agentIdentity: '@neo-gemini-julia'
+        });
+        expect(juliaView.count).toBe(1);
+        expect(juliaView.results[0].title).toBe('Julia Former Handle Summary');
+
+        const adaView = await RequestContextService.run({agentIdentityNodeId: '@neo-opus-ada'}, () =>
+            SummaryService.querySummaries({
+                query        : 'anything',
+                nResults     : 10,
+                agentIdentity: '@me'
+            })
+        );
+        expect(adaView.count).toBe(3);
+        expect(adaView.results.map(r => r.title).sort()).toEqual(['Mixed 1', 'Opus 1', 'Opus 2']);
+    });
+
+    test('querySummaries widens the candidate window when prolific peers rank ahead of the requested author', async () => {
+        spy.rows.clear();
+        for (let i = 1; i <= 30; i++) {
+            seedSummary(spy, `s-grace-${i}`, '@neo-opus-grace', 100 + i, `Grace Summary ${i}`);
+        }
+        for (let i = 1; i <= 3; i++) {
+            seedSummary(spy, `s-maryam-${i}`, '@neo-gemini-maryam', 200 + i, `Maryam Summary ${i}`);
+        }
+
+        const pageOne = await SummaryService.querySummaries({
+            query        : 'anything',
+            nResults     : 1,
+            agentIdentity: '@neo-gemini-maryam'
+        });
+        expect(pageOne.count).toBe(1);
+        expect(pageOne.results[0].title).toBe('Maryam Summary 1');
+
+        const pageTwo = await SummaryService.querySummaries({
+            query        : 'anything',
+            nResults     : 2,
+            agentIdentity: '@neo-gemini-maryam'
+        });
+        expect(pageTwo.count).toBe(2);
+        expect(pageTwo.results.map(r => r.title)).toEqual(['Maryam Summary 1', 'Maryam Summary 2']);
     });
 });
