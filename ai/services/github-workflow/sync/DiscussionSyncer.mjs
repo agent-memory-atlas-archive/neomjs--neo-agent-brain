@@ -86,6 +86,43 @@ class DiscussionSyncer extends Base {
     }
 
     /**
+     * @summary Removes every copy of a discussion except the rendering just written to `targetPath`.
+     *
+     * Mirrors `IssueSyncer#removeOtherCopies`: active-tier copies go wherever `reconcileActiveChunks`
+     * left them, and so does the metadata path's file; other archived copies are sealed and stay. No
+     * pass archives a closed discussion the delta stopped visiting, so its file stays in the active tier
+     * until a refetch plans it into the archive — and without this the corpus would then hold both.
+     * @param {Number} discussionNumber
+     * @param {String} targetPath The fresh rendering
+     * @param {Map<Number, Array<{absPath: String}>>} inventory Output of `buildContentInventory`
+     * @param {String|null} oldAbsolutePath The metadata path
+     * @returns {Promise<Number>} The count of removed files
+     * @private
+     */
+    async #removeOtherCopies(discussionNumber, targetPath, inventory, oldAbsolutePath) {
+        const archiveRoot = path.resolve(aiConfig.issueSync.archiveRoot),
+              candidates  = new Set((inventory.get(discussionNumber) || [])
+                  .map(copy => path.resolve(copy.absPath))
+                  .filter(absPath => !absPath.startsWith(archiveRoot)));
+
+        if (oldAbsolutePath) candidates.add(path.resolve(oldAbsolutePath));
+        candidates.delete(path.resolve(targetPath));
+
+        let removed = 0;
+
+        for (const absPath of candidates) {
+            try {
+                await fs.unlink(absPath);
+                removed++;
+            } catch (e) {
+                if (e.code !== 'ENOENT') logger.warn(`Could not remove a stale copy of discussion #${discussionNumber} at ${absPath}: ${e.message}`);
+            }
+        }
+
+        return removed;
+    }
+
+    /**
      * Converts an absolute path to a path relative to the project root.
      * @param {string} p The absolute path.
      * @returns {string|null} The relative path.
@@ -258,19 +295,21 @@ class DiscussionSyncer extends Base {
 
     /**
      * Containment gate: is this fetched discussion on the sync denylist (by number or author)?
-     * Denylisted fetched discussions are excluded from emission/indexing. Quarantine of an
-     * already-synced copy is driven separately in `syncDiscussions`: by `number` it removes cached
-     * copies (file + content-index entry) even when GitHub no longer lists them (the hidden /
-     * spam-hammered case); `author` matching is fetch-time only, since `metadata.discussions`
-     * persists `number` but not author login. The empty default denylist makes this a no-op.
+     * Denylisted fetched discussions are excluded from emission/indexing, by the bulk sync and the
+     * force-refetch alike. Quarantine of an already-synced copy is driven separately in
+     * `syncDiscussions`: by `number` it removes cached copies (file + content-index entry) even when
+     * GitHub no longer lists them (the hidden / spam-hammered case); `author` matching is fetch-time
+     * only, since `metadata.discussions` persists `number` but not author login. The empty default
+     * denylist makes this a no-op. `discussionDenylist` is an AiConfig leaf with an object default, so
+     * it is read without a fallback (ADR 0019 [not-ticket-ref: decision record] §3 B3).
      * @param {Object} discussion
      * @returns {Boolean}
      */
     #isDenylisted(discussion) {
-        const issueSyncConfig = aiConfig.issueSync;
-        const denylist        = issueSyncConfig.discussionDenylist || {};
-        return (denylist.numbers || []).includes(discussion.number) ||
-               (denylist.authors || []).includes(discussion.author?.login);
+        const denylist = aiConfig.issueSync.discussionDenylist;
+
+        return denylist.numbers.includes(discussion.number) ||
+               denylist.authors.includes(discussion.author?.login)
     }
 
     /**
@@ -549,9 +588,13 @@ class DiscussionSyncer extends Base {
     /**
      * Fetches discussions from GitHub and syncs them to local markdown.
      * @param {object} metadata The sync metadata containing cached records.
+     * @param {object} [options]
+     * @param {number[]} [options.refetchDiscussions=[]] Discussions to force-refetch in this sync, for local
+     * files that drifted from GitHub without an `updatedAt` change. Each one must come back refetched, or
+     * the sync throws.
      * @returns {Promise<object>} Statistics about the operation.
      */
-    async syncDiscussions(metadata) {
+    async syncDiscussions(metadata, {refetchDiscussions = []} = {}) {
         const issueSyncConfig = aiConfig.issueSync;
 
         logger.info('💭 Fetching discussions from GitHub via GraphQL...');
@@ -629,7 +672,7 @@ class DiscussionSyncer extends Base {
         };
 
         const cachedDiscussions = metadata.discussions || {};
-        const denylistNumbers   = new Set((issueSyncConfig.discussionDenylist?.numbers) || []);
+        const denylistNumbers   = new Set(issueSyncConfig.discussionDenylist.numbers);
 
         // Containment: quarantine denylisted discussions — removing both the file AND the
         // content-index entry — for the current fetch AND for cached copies GitHub no longer lists
@@ -770,7 +813,23 @@ class DiscussionSyncer extends Base {
             }));
         });
 
-        await updateContentIndex(issueSyncConfig, {upsert: indexEntries, remove: quarantineRemovals});
+        const indexMutations = {upsert: indexEntries, remove: quarantineRemovals};
+
+        // Named discussions are refetched whether or not the delta returned them: a named one drifted
+        // without an `updatedAt` change, so the delta's cutoff does not reach it.
+        if (refetchDiscussions.length > 0) {
+            const refetchStats = await this.refetchDiscussionsByNumber(refetchDiscussions, metadata, indexMutations);
+
+            stats.count += refetchStats.refetched.count;
+            stats.synced.push(...refetchStats.refetched.discussions);
+
+            const missing = refetchDiscussions.filter(number => !refetchStats.refetched.discussions.includes(number));
+            if (missing.length > 0) {
+                throw new Error(`Named discussions were not refetched: #${missing.join(', #')}`);
+            }
+        }
+
+        await updateContentIndex(issueSyncConfig, indexMutations);
 
         if (stats.count > 0) {
             logger.info(`✨ Interacted and synced ${stats.count} modified discussions to disk.`);
@@ -791,6 +850,10 @@ class DiscussionSyncer extends Base {
      * re-renders via {@link #renderDiscussionMarkdown}, writes the file, and mutates the passed
      * `metadata` in place. The caller persists metadata afterwards. Mirrors
      * `PullRequestSyncer#refetchPullsByNumber` / `IssueSyncer#refetchIssuesByNumber`.
+     *
+     * A denylisted discussion is never written: like a denylisted issue, it is skipped and its index
+     * entry removed, so a recovery run cannot publish what the bulk sync quarantines. Any other written
+     * rendering is left as the discussion's only active copy (`#removeOtherCopies`).
      *
      * @param {Array<Number>|Set<Number>} numbers The discussion numbers to refetch.
      * @param {Object} metadata The sync metadata object (mutated in place).
@@ -826,6 +889,14 @@ class DiscussionSyncer extends Base {
                     continue;
                 }
 
+                if (this.#isDenylisted(discussion)) {
+                    logger.warn(`🛡️ Discussion #${discussionNumber} is denylisted (containment); not refetched.`);
+                    if (indexMutations) {
+                        indexMutations.remove.push({repoSlug: aiConfig.repo, type: 'discussions', id: discussionNumber});
+                    }
+                    continue;
+                }
+
                 await this.#hydrateDiscussionConversation(discussion);
 
                 const planBuckets = this.#planBuckets(metadata, [discussion], inventory);
@@ -837,11 +908,13 @@ class DiscussionSyncer extends Base {
                     continue;
                 }
 
-                const content     = this.#renderDiscussionMarkdown(discussion);
-                const contentHash = this.#calculateContentHash(content);
+                const content         = this.#renderDiscussionMarkdown(discussion);
+                const contentHash     = this.#calculateContentHash(content);
+                const oldAbsolutePath = this.#resolvePath(metadata.discussions[discussionNumber]?.path);
 
                 await fs.mkdir(path.dirname(targetPath), {recursive: true});
                 await fs.writeFile(targetPath, content, 'utf-8');
+                await this.#removeOtherCopies(discussionNumber, targetPath, inventory, oldAbsolutePath);
 
                 stats.refetched.count++;
                 stats.refetched.discussions.push(discussionNumber);

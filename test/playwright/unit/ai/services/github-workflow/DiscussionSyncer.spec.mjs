@@ -992,6 +992,97 @@ test.describe('Neo.ai.services.github-workflow.sync.DiscussionSyncer', () => {
         expect(metadata.discussions[discussionNumber]).toBeUndefined();
     });
 
+    test('containment: refetchDiscussionsByNumber never writes a denylisted discussion and drops its index entry (#1323)', async () => {
+        const
+            discussionNumber = 24053,
+            indexMutations   = {upsert: [], remove: []},
+            metadata         = {discussions: {}};
+
+        applyConfigSnapshot({discussionDenylist: {numbers: [discussionNumber], authors: []}});
+        GraphqlService.query = async () => ({repository: {discussion: buildDiscussion(discussionNumber)}});
+
+        const stats = await DiscussionSyncer.refetchDiscussionsByNumber([discussionNumber], metadata, indexMutations);
+        const files = (await fs.readdir(tmpRoot, {recursive: true})).filter(file => file.endsWith(`discussion-${discussionNumber}.md`));
+
+        expect(stats.refetched).toEqual({count: 0, discussions: []});
+        expect(files).toEqual([]);
+        expect(metadata.discussions[discussionNumber]).toBeUndefined();
+        expect(indexMutations).toEqual({upsert: [], remove: [{repoSlug: aiConfig.repo, type: 'discussions', id: discussionNumber}]});
+    });
+
+    test('refetchDiscussionsByNumber moves a closed discussion out of the active tier instead of copying it (#1323)', async () => {
+        // No pass archives a closed discussion the delta stopped visiting, so its file is still active;
+        // the refetch plans it into its release bucket, and the stale active copy must not survive beside it.
+        const
+            discussionNumber = 24056,
+            activePath       = path.join(aiConfig.issueSync.discussionsDir, 'chunk-1', `discussion-${discussionNumber}.md`),
+            archivedPath     = path.join(aiConfig.issueSync.archiveRoot, 'discussions', 'v13.0.0', 'chunk-1', `discussion-${discussionNumber}.md`),
+            metadata         = {discussions: {[discussionNumber]: {number: discussionNumber, closed: true, closedAt: '2026-05-01T00:00:00Z', path: path.relative(aiConfig.issueSync.metadataBaseRoot, activePath)}}};
+
+        await fs.ensureDir(path.dirname(activePath));
+        await fs.writeFile(activePath, '# stale active rendering\n');
+        GraphqlService.query = async () => ({repository: {discussion: buildDiscussion(discussionNumber, {closed: true, closedAt: '2026-05-01T00:00:00Z'})}});
+
+        await DiscussionSyncer.refetchDiscussionsByNumber([discussionNumber], metadata);
+        const files = (await fs.readdir(tmpRoot, {recursive: true})).filter(file => file.endsWith(`discussion-${discussionNumber}.md`));
+
+        expect(files).toEqual([path.relative(tmpRoot, archivedPath)]);
+        expect(metadata.discussions[discussionNumber].path).toBe(path.relative(aiConfig.issueSync.metadataBaseRoot, archivedPath));
+    });
+
+    test('refetchDiscussionsByNumber rewrites an archived discussion where it lives (#1323)', async () => {
+        const
+            discussionNumber = 24057,
+            archivedPath     = path.join(aiConfig.issueSync.archiveRoot, 'discussions', 'v13.0.0', 'chunk-1', `discussion-${discussionNumber}.md`);
+
+        await fs.ensureDir(path.dirname(archivedPath));
+        await fs.writeFile(archivedPath, '# stale archived rendering\n');
+        GraphqlService.query = async () => ({repository: {discussion: buildDiscussion(discussionNumber, {closed: true, closedAt: '2026-05-01T00:00:00Z'})}});
+
+        await DiscussionSyncer.refetchDiscussionsByNumber([discussionNumber], {discussions: {}});
+        const files = (await fs.readdir(tmpRoot, {recursive: true})).filter(file => file.endsWith(`discussion-${discussionNumber}.md`));
+
+        expect(files).toEqual([path.relative(tmpRoot, archivedPath)]);
+        expect(matter(await fs.readFile(archivedPath, 'utf8')).data.number).toBe(discussionNumber);
+    });
+
+    test('syncDiscussions rewrites a named discussion the delta does not reach, inside the same index update (#1323)', async () => {
+        const
+            discussionNumber = 24054,
+            stalePath        = path.join(aiConfig.issueSync.discussionsDir, 'chunk-1', `discussion-${discussionNumber}.md`),
+            cachedPath       = path.relative(aiConfig.issueSync.metadataBaseRoot, stalePath),
+            metadata         = {
+                discussions: {[discussionNumber]: {number: discussionNumber, closed: false, closedAt: null, contentHash: 'STALE-HASH', path: cachedPath, updatedAt: '2026-05-02T00:00:00Z'}},
+                lastSync   : '2026-05-03T00:00:00Z'
+            };
+
+        await fs.ensureDir(path.dirname(stalePath));
+        await fs.writeFile(stalePath, '# stale rendering\n');
+
+        // The delta returns nothing: a named discussion is one whose file drifted without an `updatedAt` change.
+        GraphqlService.query = async query => query.includes('FetchSingleDiscussionForSync')
+            ? {repository: {discussion: buildDiscussion(discussionNumber)}}
+            : {repository: {discussions: {nodes: [], pageInfo: {hasNextPage: false, endCursor: null}}}};
+
+        const stats = await DiscussionSyncer.syncDiscussions(metadata, {refetchDiscussions: [discussionNumber]});
+        const index = await fs.readJson(path.join(tmpRoot, '_index.json'));
+
+        expect(stats.synced).toEqual([discussionNumber]);
+        expect(matter(await fs.readFile(stalePath, 'utf8')).data.number).toBe(discussionNumber);
+        expect(metadata.discussions[discussionNumber]).toMatchObject({path: cachedPath, updatedAt: '2026-05-02T00:00:00Z'});
+        expect(metadata.discussions[discussionNumber].contentHash).not.toBe('STALE-HASH');
+        expect(index).toContainEqual(expect.objectContaining({type: 'discussions', id: discussionNumber}));
+    });
+
+    test('syncDiscussions throws when a named discussion does not come back (#1323)', async () => {
+        GraphqlService.query = async query => query.includes('FetchSingleDiscussionForSync')
+            ? {repository: {discussion: null}}
+            : {repository: {discussions: {nodes: [], pageInfo: {hasNextPage: false, endCursor: null}}}};
+
+        await expect(DiscussionSyncer.syncDiscussions({discussions: {}}, {refetchDiscussions: [24055]}))
+            .rejects.toThrow('Named discussions were not refetched: #24055');
+    });
+
     test('refetchDiscussionsByNumber exhausts comment and reply pages before writing', async () => {
         const
             discussionNumber = 24052,
