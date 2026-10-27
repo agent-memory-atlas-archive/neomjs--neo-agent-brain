@@ -264,3 +264,19 @@ file/lock/writer and no prose, ranking scores, assignment hints, or wake thresho
 `HookProjectionChannels` owner admits a community-attention slot.
 
 This section documents the query, claim, and count-projection contract; retire or update it when these five operations change.
+
+## 7. Calibrate operational policy from measured evidence
+
+Run the two-pass calibration runner to combine the 30-day GitHub shadow baseline (`79a6d84d...`) with deterministic substrate fixture checks:
+
+```bash
+node ai/scripts/maintenance/calibrateCommunityActivityPolicy.mjs \
+  --runs 2 \
+  --output .neo-ai-data/community-activity-calibration/report-2026-10-26-v1.json
+```
+
+The calibration report (`community-activity-calibration-report.v1`, recorded alongside [`../measurements/community-activity-shadow-2026-07-18.md`](../measurements/community-activity-shadow-2026-07-18.md) in [`../measurements/community-activity-calibration-2026-10-26.md`](../measurements/community-activity-calibration-2026-10-26.md)) enforces `noHiddenDefaults: true`:
+
+- **Calibrated values from the 30-day shadow baseline:** `reconciliationCadenceMs = 2,131,596` (`4 * 532,899 ms` single-pass provider latency sum), `providerRootPageSize = 50`, and `providerChildPageSize = 100`.
+- **Explicitly `unset` thresholds (`null`):** `maxAdmissionAttempts`, `paginationCap`, `retentionMs`, `archiveThreshold`, `stewardActivation`, `stewardLeaseTtlMs`, `wakeCoalesceWindowMs`, `vacancyFallbackCooldownMs`, `minUnclaimedEligibleCount`, `wakeAmplificationCap`, and `maxWakePayloadBytes` remain `null` (`unset`); Option `J` (`#100`) is authorized only as a shadow-only steward experiment until its observation window measures vacancy and wake cost.
+- **Default `AiConfig` posture:** `orchestrator.communityReconciliation.enabled = false`, `orchestrator.intervals.communityReconciliationMs = null`, `orchestrator.communityReconciliation.maxAdmissionAttempts = null`.

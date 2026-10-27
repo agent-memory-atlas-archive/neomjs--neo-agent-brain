@@ -442,3 +442,13 @@ window question without changing the selected architecture.
 Human merge of this ADR is the implementation-authority transition. This PR remains docs-only.
 The first runtime leaf is shadow instrumentation, and every later leaf remains gated by the live
 Epic dependency graph, the contracts above, and cross-family review.
+
+## 9. Operational calibration record (`2026-10-26`)
+
+Measured policy calibration (`community-activity-calibration-report.v1`, `reportId: dd78a28718cf0db9a526876c271053c674e713c9dc4b0fe99882f410ee7f2664`, recorded in [`../measurements/community-activity-calibration-2026-10-26.md`](../measurements/community-activity-calibration-2026-10-26.md)) combined the 30-day GitHub shadow baseline (`79a6d84d9212d00f0f9ca8db33d517c64f0f90bfd0d2ef68fee88103bcc770dd`) with two deterministic fixture passes (`stateManifestHash: bb6991c36962c6f73451be8219aabf9165212a81553b6ba7a71fe1a305d0a16e`):
+
+- **Calibrated reconciliation & pagination values (disabled by default in `AiConfig`):** `reconciliationCadenceMs = 2,131,596` (`4 * 532,899 ms` single-pass provider latency sum), `providerRootPageSize = 50`, and `providerChildPageSize = 100`.
+- **Explicitly `unset` thresholds (`null`):** `maxAdmissionAttempts = null` (no retained live provider admission conflict/retry window measured yet), `paginationCap = null` (exhaustive reconciliation under `H` forbids silent page truncation), `retentionMs = null`, `archiveThreshold = null` (`126,984.57 bytes/day` metadata growth is below any SQLite compaction floor), and all steward/wake thresholds (`stewardActivation = null`, `stewardLeaseTtlMs = null`, `wakeCoalesceWindowMs = null`, `vacancyFallbackCooldownMs = null`, `minUnclaimedEligibleCount = null`, `wakeAmplificationCap = null`, `maxWakePayloadBytes = null`).
+- **Deferred options (`E`, `F`, `K`, `O`, `V`, `X`):** all six remain `keep-deferred` with recorded `revalidationTrigger` thresholds in `communityActivityPolicyCalibrationCore.mjs`.
+- **Stage-2 `J` (`#100` steward experiment):** recorded as `shadow-only steward experiment authorized; activation thresholds unset until its window` (`wakeChildDecision.mode = 'shadow-only'`, `authorized = true`, `activationAuthorized = false`), motivated by the 30-day attention-eligible density (`22 / 11,253 = 0.1955%`) and two unstewarded 2026-10-26 external contributions (`neomjs/neo#20119` by `drakeboley`, opened `06:00:05Z` -> first comment `13:00:33Z`; `neomjs/neo#19129#issuecomment-6425153408` by `SimonGebru`, posted `19:18:05Z` -> first reply `19:22:58Z`).
+- **Gemini family liveness revalidation (§6):** discharged via non-author `/epic-review` on [`neomjs/neo-agent-brain#106#issuecomment-6426058715`](https://github.com/neomjs/neo-agent-brain/issues/106#issuecomment-6426058715).
