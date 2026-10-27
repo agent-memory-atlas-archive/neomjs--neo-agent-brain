@@ -181,7 +181,7 @@ test.describe('generateKimiSeatConfig (Kimi Code seat scaffold emission, #15612)
         // Link's package cwd moved to the runtime authority.
         // Bumped 2026-10-01: the identity.md naming gate ends at the peer-veto window (the bearer's
         // assent is final); sole differing line, verified passing on origin/dev at 873608c first.
-        expect(digest).toBe('693ce8722ee85e35cd5eb6fd53a20da734d62afbe35ed35477cccdd00b99bba5')
+        expect(digest).toBe('1b1097b1a9de4b34eacb5706c4f7ffe35e944675d262f5e0cce3b87522e609ec')
     });
 
     test('remote map replaces only selected servers with the exact Kimi HTTP adapter grammar', () => {

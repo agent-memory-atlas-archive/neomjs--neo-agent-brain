@@ -86,8 +86,24 @@ test.describe('seatMemoryLayerTemplate — Codex home instruction memory', () =>
             expect(index).not.toMatch(/17KB|24\.6KB|post-compact|post-compact reload/i);
             expect(about).toContain('AGENTS.md');
             expect(about).toContain('complete contents inline');
+            expect(about).toContain("detail: 'summary'");
+            expect(about).toContain("plus `agentIdentity` when author-scoped");
             expect(about).toMatch(/post-compaction\s+reload has not been verified/);
             expect(about).not.toMatch(/17KB|24\.6KB|wc -c/i)
+        }
+    });
+
+    test('Kimi and OpenCode birth files teach summary discovery sweeps and author-scoped agentIdentity on query_raw_memories (#1290)', () => {
+        for (const harness of ['kimi-code', 'opencode']) {
+            const index = renderMemoryIndexMd({harness}),
+                  about = renderAboutThisLayerMd({harness});
+
+            expect(index).toContain("detail: 'summary'");
+            expect(index).toContain("plus `agentIdentity` when author-scoped");
+            expect(index).toContain("detail: 'full'");
+            expect(about).toContain("detail: 'summary'");
+            expect(about).toContain("plus `agentIdentity` when author-scoped");
+            expect(about).toContain("detail: 'full'");
         }
     });
 
@@ -123,6 +139,8 @@ test.describe('seatMemoryLayerTemplate — Antigravity native Markdown memory', 
         expect(about).toContain('@include');
         expect(about).toContain('MEMORY.md');
         expect(about).toContain('identity.md');
+        expect(about).toContain("detail: 'summary'");
+        expect(about).toContain("plus `agentIdentity` when author-scoped");
         expect(`${index}\n${about}`).not.toMatch(/AGENTS\.md|opencode\.jsonc|config\.toml|PostCompact|17KB|24\.6KB|post-compact/i)
     });
 });
