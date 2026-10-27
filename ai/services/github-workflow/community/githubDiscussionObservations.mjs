@@ -83,11 +83,27 @@ function appendReplyObservations(observations, reply, commentId) {
     appendDeletion(observations, reply, 'discussion.reply-deleted', commentId)
 }
 
+/** @summary Emits `discussion.closed` only from reconciled closure facts (`closed`, `closedAt`); closer stays `'unknown'`. */
+function appendClosureState(observations, discussion) {
+    if (discussion.closed === true && typeof discussion.closedAt === 'string' && discussion.closedAt) {
+        observations.push({
+            providerEntityId    : discussion.id,
+            occurrenceKind      : 'discussion.closed',
+            occurrenceCoordinate: `${discussion.id}:closed:${discussion.closedAt}`,
+            occurredAt          : discussion.closedAt,
+            actorId             : null,
+            actorKind           : 'unknown',
+            sourceAssociation   : null
+        })
+    }
+}
+
 /**
  * @summary Maps one fully reconciled Discussion to stable, metadata-only occurrence observations.
- * Root, comment, reply, and revision identities remain distinct; a root revision that lacks a
- * granular source fact becomes an explicitly unattributed snapshot marker, never invented state
- * history. Attention remains server policy, not adapter policy.
+ * Root, comment, reply, closure (`discussion.closed` from reconciled `closed`/`closedAt`), and revision
+ * identities remain distinct; a root revision that lacks a granular source fact becomes an
+ * explicitly unattributed snapshot marker, never invented state history or a reopen inferred from
+ * `updatedAt`, and an unnamed closer stays `'unknown'`. Attention remains server policy, not adapter policy.
  * @param {Object} discussion Reconciled root with flat `comments` and flat nested `replies` arrays.
  * @returns {Object[]}
  */
@@ -107,6 +123,7 @@ export function discussionToObservations(discussion) {
         ...projectActor(discussion.author, discussion.authorAssociation ?? null)
     });
     appendEdits(observations, discussion, 'discussion.edited', rootRevision);
+    appendClosureState(observations, discussion);
 
     for (const comment of discussion.comments ?? []) {
         if (!comment?.id || !Array.isArray(comment.replies)) {
