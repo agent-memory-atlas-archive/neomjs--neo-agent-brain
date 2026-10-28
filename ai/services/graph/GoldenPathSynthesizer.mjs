@@ -98,9 +98,10 @@ import {
     scoreCurrentFocusIssue as scoreIssueFocusCurrentIssue
 } from './issueFocusSections.mjs';
 import {
+    CLOUD_PLANE_HOST_EDGE_ABSENT_REASON,
     createFocusV1HostEdgeReader,
+    createFocusV1ProjectionReader,
     evaluateViewReceipts      as evaluateFocusV1ViewReceipts,
-    makeRefusingFocusV1Reader,
     parseRowStateLine         as parseFocusV1RowStateLine,
     projectPublicBusinessRows as projectFocusV1PublicBusinessRows,
     renderFocusV1Section      as renderFocusV1HandoffSection
@@ -1864,13 +1865,17 @@ DO NOT output markdown, \`\`\`json blocks, or any other explanations. Provide pu
         // --- Focus (v1): v1 rows, views, reach and outbound, what waits for the operator's word ---
         let focusV1Append = '';
         try {
-            const capturedAt    = now instanceof Date ? now : new Date(now);
-            let   resolvedFocus = focusV1Inputs && typeof focusV1Inputs === 'object' ? focusV1Inputs : null;
+            const capturedAt      = now instanceof Date ? now : new Date(now);
+            let   resolvedFocus   = focusV1Inputs && typeof focusV1Inputs === 'object' ? focusV1Inputs : null;
+            const effectiveReader = focusV1Reader ?? createFocusV1ProjectionReader({
+                projectionPath: aiConfig.focusV1ProjectionPath,
+                ...(repoEnrichmentEnabled === false ? {absentReason: CLOUD_PLANE_HOST_EDGE_ABSENT_REASON} : {})
+            });
 
-            if (!resolvedFocus && typeof focusV1Reader === 'function') {
-                resolvedFocus = await focusV1Reader({now: capturedAt});
-            } else if (!resolvedFocus && typeof focusV1Reader?.readFocusV1Inputs === 'function') {
-                resolvedFocus = await focusV1Reader.readFocusV1Inputs({now: capturedAt});
+            if (!resolvedFocus && typeof effectiveReader === 'function') {
+                resolvedFocus = await effectiveReader({now: capturedAt});
+            } else if (!resolvedFocus && typeof effectiveReader?.readFocusV1Inputs === 'function') {
+                resolvedFocus = await effectiveReader.readFocusV1Inputs({now: capturedAt});
             }
 
             focusV1Append = '\n' + this.constructor.renderFocusV1Section({
