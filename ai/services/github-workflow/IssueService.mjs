@@ -434,12 +434,26 @@ class IssueService extends Base {
 
         try {
             // Divergent ID Lookup
-            const query  = isPR ? GET_PULL_REQUEST_ID : GET_ISSUE_ID;
-            const idData = await GraphqlService.query(query, idVariables);
+            const query      = isPR ? GET_PULL_REQUEST_ID : GET_ISSUE_ID;
+            const idData     = await GraphqlService.query(query, idVariables);
+            const targetNode = isPR
+                ? idData.repository.pullRequest
+                : idData.repository.issue;
 
-            const subjectId = isPR
-                ? idData.repository.pullRequest.id
-                : idData.repository.issue.id;
+            const maxComments  = aiConfig.pullRequest.maxCommentsPerPullRequest;
+            const commentCount = targetNode.comments?.totalCount ?? 0;
+
+            if (commentCount >= maxComments) {
+                return {
+                    error  : 'Comment Cap Exceeded',
+                    code   : 'COMMENT_CAP_EXCEEDED',
+                    commentCount,
+                    maxComments,
+                    message: `${isPR ? 'Pull request' : 'Issue'} #${number} already has ${commentCount} comments (hard ceiling: ${maxComments}). Update an existing comment in place via action: 'update' + comment_id, fold state into the ticket/PR body, or open a narrowly scoped follow-up ticket.`
+                };
+            }
+
+            const subjectId = targetNode.id;
 
             // Shared Mutation — capture response so we can surface the canonical comment
             // identifier. Enables the A2A propagation pattern: posting
@@ -1507,7 +1521,7 @@ class IssueService extends Base {
         }
 
         // `filterBy: {assignee: null}` routes GitHub's issues connection to a stale, hours-lagged
-        // read path (measured live 2026-07-22, #15603; ticket-ref-ok: measured-quirk evidence ledger): a controlled assignment stayed invisible on
+        // read path (measured live 2026-07-22): a controlled assignment stayed invisible on
         // the unfiltered first page 10+ minutes — 1.5h+ in the original incident — while the same
         // connection without `filterBy` returned the live page). An unfiltered list must omit the
         // argument AND the variable entirely, so the query constant is selected by assignee

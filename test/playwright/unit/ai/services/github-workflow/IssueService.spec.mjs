@@ -166,7 +166,7 @@ test.describe('Neo.ai.services.github-workflow.IssueService — listIssues proje
 
         const result = await IssueService.listIssues({limit: 10, state: 'open'});
 
-        // Measured live 2026-07-22 (#15603; ticket-ref-ok: measured-quirk evidence ledger): `filterBy: {assignee: null}` is served from a stale,
+        // Measured live 2026-07-22: `filterBy: {assignee: null}` is served from a stale,
         // hours-lagged read path — a controlled assignment stayed invisible on the unfiltered first
         // page 10+ minutes (1.5h+ in the original incident) while the connection without `filterBy`
         // returned the live page. The old null pass-through was complete but stale; the unfiltered
@@ -183,7 +183,7 @@ test.describe('Neo.ai.services.github-workflow.IssueService — listIssues proje
 
         const result = await IssueService.listIssues({limit: 10, state: 'open', sort: 'created'});
 
-        // Measured live 2026-07-22 (#15603; ticket-ref-ok: measured-quirk evidence ledger): an updated-descending page buries an untouched fresh
+        // Measured live 2026-07-22: an updated-descending page buries an untouched fresh
         // filing below older issues with mere recent activity (4 of the latest-20 filings
         // displaced). The duplicate sweep's evidence bar is creation order; the default stays
         // UPDATED_AT, so the created path must build its query per call.
@@ -510,6 +510,110 @@ test.describe('Neo.ai.services.github-workflow.IssueService — manageIssueComme
             expect(result.error).toBe('GraphQL API request failed');
             expect(result.code).toBe('GRAPHQL_API_ERROR');
             expect(result.message).toContain('rate limit');
+        });
+
+        test('refuses issue-comment creation with COMMENT_CAP_EXCEEDED when comments.totalCount >= 25 (#1325)', async () => {
+            let callCount = 0;
+
+            GraphqlService.query = async (query) => {
+                callCount++;
+                expect(query).toContain('comments');
+                expect(query).toContain('totalCount');
+                return {
+                    repository: {
+                        issue: {
+                            id      : 'I_kwDOABcD1234567890',
+                            comments: {totalCount: 25}
+                        }
+                    }
+                };
+            };
+
+            const result = await IssueService.manageIssueComment({
+                issue_number: 10272,
+                body        : 'Comment #26 that would exceed the 25-comment ceiling',
+                action      : 'create'
+            });
+
+            expect(result).toMatchObject({
+                error       : 'Comment Cap Exceeded',
+                code        : 'COMMENT_CAP_EXCEEDED',
+                commentCount: 25,
+                maxComments : 25
+            });
+            expect(result.message).toContain('Issue #10272 already has 25 comments (hard ceiling: 25)');
+            expect(callCount).toBe(1);
+        });
+
+        test('refuses PR-comment creation with COMMENT_CAP_EXCEEDED when comments.totalCount >= 25 (#1325)', async () => {
+            let callCount = 0;
+
+            GraphqlService.query = async (query) => {
+                callCount++;
+                expect(query).toContain('comments');
+                expect(query).toContain('totalCount');
+                return {
+                    repository: {
+                        pullRequest: {
+                            id      : 'PR_kwDOABcD1234567890',
+                            comments: {totalCount: 70}
+                        }
+                    }
+                };
+            };
+
+            const result = await IssueService.manageIssueComment({
+                pr_number: 10268,
+                body     : 'Comment #71 on an overloaded PR thread',
+                action   : 'create'
+            });
+
+            expect(result).toMatchObject({
+                error       : 'Comment Cap Exceeded',
+                code        : 'COMMENT_CAP_EXCEEDED',
+                commentCount: 70,
+                maxComments : 25
+            });
+            expect(result.message).toContain('Pull request #10268 already has 70 comments (hard ceiling: 25)');
+            expect(callCount).toBe(1);
+        });
+
+        test('admits comment creation at the 24-comment boundary (#1325)', async () => {
+            let callCount = 0;
+
+            GraphqlService.query = async () => {
+                callCount++;
+                if (callCount === 1) {
+                    return {
+                        repository: {
+                            issue: {
+                                id      : 'I_kwDOABcD_boundary24',
+                                comments: {totalCount: 24}
+                            }
+                        }
+                    };
+                }
+                return {
+                    addComment: {
+                        commentEdge: {
+                            node: {
+                                id       : 'IC_25th',
+                                url      : 'https://github.com/neomjs/neo/issues/10272#issuecomment-25',
+                                createdAt: '2026-10-28T00:00:00Z'
+                            }
+                        }
+                    }
+                };
+            };
+
+            const result = await IssueService.manageIssueComment({
+                issue_number: 10272,
+                body        : '25th comment (index 24 -> 25)',
+                action      : 'create'
+            });
+
+            expect(result.commentId).toBe('IC_25th');
+            expect(callCount).toBe(2);
         });
     });
 
@@ -979,13 +1083,13 @@ test.describe('Neo.ai.services.github-workflow.IssueService — manageIssueProje
                 callCount++;
                 // 1: GET_ISSUE_ID
                 if (callCount === 1) return {repository: {issue: {id: ISSUE_NODE_ID}}};
-                // 2: GET_PROJECT_V2_METADATA for #12 → exists
+                // 2: GET_PROJECT_V2_METADATA for project 12 → exists
                 if (callCount === 2) {
                     return {organization: {projectV2: {id: VALID_PROJECT, title: 'v13 Release', fields: {nodes: []}}}};
                 }
-                // 3: ADD_PROJECT_V2_ITEM for #12 → succeeds
+                // 3: ADD_PROJECT_V2_ITEM for project 12 → succeeds
                 if (callCount === 3) return {addProjectV2ItemById: {item: {id: NEW_ITEM_ID}}};
-                // 4: GET_PROJECT_V2_METADATA for #999 → not found
+                // 4: GET_PROJECT_V2_METADATA for project 999 → not found
                 if (callCount === 4) return {organization: {projectV2: null}};
                 throw new Error(`Unexpected additional GraphqlService.query call: ${callCount}`);
             };
@@ -1502,8 +1606,18 @@ test.describe('Neo.ai.services.github-workflow.IssueService — getConversation 
     });
 
     test('returns full conversation when no selector is passed (backward-compat default)', async () => {
+        let capturedQuery, capturedVars;
+        GraphqlService.query = async (query, vars) => {
+            capturedQuery = query;
+            capturedVars  = vars;
+            return {repository: {issue: ISSUE_FIXTURE}};
+        };
+
         const result = await IssueService.getConversation({issue_number: 10702});
 
+        expect(capturedVars.maxComments).toBe(25);
+        expect(capturedQuery).toContain('comments(last: $maxComments)');
+        expect(capturedQuery).toContain('totalCount');
         expect(result.title).toBe('Test Issue');
         expect(result.comments.nodes).toHaveLength(4);
         expect(result.comments.nodes[0].id).toBe('IC_a1111');
